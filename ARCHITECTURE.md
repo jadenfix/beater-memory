@@ -52,6 +52,9 @@ edges are projections that can be rebuilt.
    - Tier 0: lexical cue seeding through `cue_index`
    - Tier 1: LLM-free graph activation using personalized PageRank-style
      propagation, ACT-R-like base-level activation, edge weights, and freshness
+   - `as_of_unix_ms` is a validity boundary: future memories and facts
+     invalidated by that time are excluded from evidence, while contradiction
+     edges still surface stale assumptions when the newer fact is visible
    - Tier 2: reserved API slot for budgeted active reconstruction
    - Return type: `MemoryAnswer`, not raw chunks.
 

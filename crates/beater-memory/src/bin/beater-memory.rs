@@ -146,6 +146,8 @@ enum Command {
         max_tokens: u32,
         #[arg(long)]
         fresh: bool,
+        #[arg(long)]
+        as_of_unix_ms: Option<i64>,
         #[arg(long, value_delimiter = ',')]
         modes: Vec<ModeArg>,
         #[arg(long)]
@@ -445,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
             environment,
             max_tokens,
             fresh,
+            as_of_unix_ms,
             modes,
             json,
             question,
@@ -454,6 +457,9 @@ async fn main() -> anyhow::Result<()> {
             let mut scope = MemoryScope::new(tenant, project);
             if let Some(environment) = environment {
                 scope = scope.with_environment(environment);
+            }
+            if let Some(as_of_unix_ms) = as_of_unix_ms {
+                scope = scope.as_of_unix_ms(as_of_unix_ms);
             }
             let mut query = MemoryQuery::new(question, scope).with_max_tokens(max_tokens);
             if fresh {
