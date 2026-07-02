@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use beater_memory::{
     BeaterJsJournal, LedgerEvent, MemoryEngine, MemoryMode, MemoryNodeKind, MemoryQuery,
-    MemoryScope, import_canonical_jsonl,
+    MemoryScope, MemoryServerConfig, import_canonical_jsonl, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -75,6 +75,23 @@ enum Command {
         #[arg(long)]
         vacuum: bool,
     },
+    /// Run the authenticated HTTP API.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: SocketAddr,
+        #[arg(long)]
+        bearer_token: Option<String>,
+        #[arg(long, default_value = "BEATER_MEMORY_TOKEN")]
+        bearer_token_env: String,
+        #[arg(long)]
+        allow_no_auth: bool,
+        #[arg(long, default_value_t = 1024 * 1024)]
+        max_body_bytes: usize,
+        #[arg(long, default_value_t = 10_000)]
+        max_project_limit: usize,
+        #[arg(long, default_value_t = 8_000)]
+        max_query_tokens: u32,
+    },
     /// Query memory and return an answer-shaped context bundle.
     Query {
         #[arg(long, default_value = "local")]
@@ -143,7 +160,8 @@ impl From<ModeArg> for MemoryMode {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init => {
@@ -275,6 +293,34 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("open {}", cli.db.display()))?;
             let report = engine.store().maintenance(vacuum)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Serve {
+            bind,
+            bearer_token,
+            bearer_token_env,
+            allow_no_auth,
+            max_body_bytes,
+            max_project_limit,
+            max_query_tokens,
+        } => {
+            let token = bearer_token
+                .or_else(|| std::env::var(&bearer_token_env).ok())
+                .filter(|token| !token.trim().is_empty());
+            if token.is_none() && !allow_no_auth {
+                anyhow::bail!(
+                    "refusing to start without auth; set --bearer-token, set {bearer_token_env}, or pass --allow-no-auth"
+                );
+            }
+            let mut config = MemoryServerConfig::new(&cli.db, bind).with_limits(
+                max_body_bytes,
+                max_project_limit,
+                max_query_tokens,
+            );
+            if let Some(token) = token {
+                config = config.with_bearer_token(token);
+            }
+            println!("serving beater-memory on http://{bind}");
+            serve(config).await?;
         }
         Command::Query {
             tenant,

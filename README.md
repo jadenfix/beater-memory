@@ -28,6 +28,7 @@ The current implementation includes:
 - `beater.js` journal import from `.beater/journal.db`
 - canonical span JSONL import aligned with `beater-agents` span kinds
 - CLI commands for `init`, `remember`, `project`, `query`, and import flows
+- authenticated HTTP API for service deployments
 - production operations for schema/integrity health checks and SQLite
   maintenance
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
@@ -48,6 +49,17 @@ cargo run -p beater-memory -- query \
 
 cargo run -p beater-memory -- health --json
 ```
+
+Run the HTTP API:
+
+```bash
+export BEATER_MEMORY_TOKEN='dev-secret'
+cargo run -p beater-memory -- serve --bind 127.0.0.1:8765
+```
+
+The server refuses to start without a bearer token unless `--allow-no-auth` is
+passed. All `/v1/*` routes require `Authorization: Bearer <token>`; `/livez` is
+the unauthenticated liveness endpoint.
 
 Import a `beater.js` journal:
 
@@ -79,12 +91,30 @@ cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --vacuum
 ```
 
+HTTP equivalents:
+
+```bash
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+  http://127.0.0.1:8765/v1/health
+
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"local","project_id":"demo","kind":"gotcha","text":"Checkout fails when DATABASE_URL is missing."}' \
+  http://127.0.0.1:8765/v1/remember
+
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"checkout database failure","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null}}' \
+  http://127.0.0.1:8765/v1/query
+```
+
 ## Crate API
 
 The public API exports:
 
 - `MemoryEngine`
 - `SqliteMemoryStore`
+- `MemoryServerConfig`, `memory_router`, and `serve`
 - `StoreHealth`, `StoreStats`, and `MaintenanceReport`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`

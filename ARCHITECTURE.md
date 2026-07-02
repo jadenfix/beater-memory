@@ -46,6 +46,16 @@ edges are projections that can be rebuilt.
    - Tier 2: reserved API slot for budgeted active reconstruction
    - Return type: `MemoryAnswer`, not raw chunks.
 
+5. **Service API**
+   - CLI command: `beater-memory serve`
+   - Public endpoint: `GET /livez`
+   - Authenticated endpoints: `/v1/health`, `/v1/stats`, `/v1/remember`,
+     `/v1/project`, `/v1/query`, `/v1/maintenance`
+   - Auth: bearer token from `--bearer-token` or `BEATER_MEMORY_TOKEN` by
+     default; unauthenticated serving requires explicit `--allow-no-auth`
+   - Limits: max request body bytes, max projection batch size, and max query
+     token budget are configurable at startup.
+
 ## Why No Embeddings In The MVP
 
 The first-principles read path needs typed structure, temporal validity, and
@@ -87,6 +97,7 @@ cargo run -p beater-memory -- query --tenant local --project demo \
   "How do I fix checkout database failures?"
 cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance
+BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
 ```
 
 Import sibling repo data:
