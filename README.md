@@ -42,6 +42,8 @@ The current implementation includes:
   token budgets before retrieval
 - projection limit validation that rejects zero-sized project and rebuild
   batches before mutating derived graph state
+- checked SQLite limit binding so oversized embedded read or retention limits
+  cannot become unbounded queries
 - guarded projection rebuild from the append-only ledger
 - explicit audit retention pruning by age or newest-row count
 - database identity checks that reject unrelated SQLite files instead of

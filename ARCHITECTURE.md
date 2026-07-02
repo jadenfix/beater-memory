@@ -138,6 +138,8 @@ Production safeguards:
   confirmation flag
 - projection batch sizes and optional rebuild event caps must be positive so a
   rebuild cannot clear projections and replay zero events
+- store APIs check SQLite `LIMIT` parameters before binding them so oversized
+  embedded limits cannot wrap into unbounded reads or retention operations
 - service audit events are persisted in SQLite so backup/restore includes the
   operational trail for the memory database
 
