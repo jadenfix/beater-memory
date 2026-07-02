@@ -789,6 +789,14 @@ async fn project(
 ) -> Result<Json<ProjectReport>, ApiError> {
     let ctx = begin_request(&state, &headers, "project", "/v1/project").await?;
     let limit = request.limit.unwrap_or(1000);
+    if limit == 0 {
+        return fail_request(
+            &state,
+            &ctx,
+            ApiError::bad_request("project limit must be greater than 0"),
+        )
+        .await;
+    }
     if limit > state.config.max_project_limit {
         return fail_request(
             &state,
@@ -1747,6 +1755,25 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn project_rejects_zero_limit_over_http() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let project = serde_json::json!({ "limit": 0 });
+
+        let response = app
+            .oneshot(json_request("/v1/project", project))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "bad_request");
+        assert!(error.error.message.contains("project limit"));
     }
 
     #[tokio::test]

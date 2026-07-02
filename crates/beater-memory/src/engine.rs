@@ -83,6 +83,9 @@ impl<D: Distiller> MemoryEngine<D> {
     }
 
     pub fn project_pending(&self, limit: usize) -> MemoryResult<ProjectReport> {
+        if limit == 0 {
+            return Err(MemoryError::invalid("project limit must be greater than 0"));
+        }
         let events = self.store.pending_events(limit)?;
         let mut report = ProjectReport::default();
         for event in events {
@@ -145,6 +148,9 @@ impl<D: Distiller> MemoryEngine<D> {
     ) -> MemoryResult<ProjectionRebuildReport> {
         if batch_size == 0 {
             return Err(MemoryError::invalid("batch_size must be greater than 0"));
+        }
+        if max_events.is_some_and(|max_events| max_events == 0) {
+            return Err(MemoryError::invalid("max_events must be greater than 0"));
         }
         let reset = self.store.reset_projection()?;
         let mut project = ProjectReport::default();
@@ -440,6 +446,16 @@ mod tests {
     }
 
     #[test]
+    fn project_pending_rejects_zero_limit() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+
+        let err = engine.project_pending(0).unwrap_err();
+
+        assert!(err.to_string().contains("project limit"));
+        Ok(())
+    }
+
+    #[test]
     fn rebuild_projection_replays_ledger_and_preserves_audit() -> MemoryResult<()> {
         let engine = MemoryEngine::in_memory()?;
         engine.store().append_audit(&crate::AuditRecord {
@@ -484,6 +500,28 @@ mod tests {
             MemoryScope::new("tenant", "project"),
         ))?;
         assert!(answer.answer.contains("DATABASE_URL"));
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_rejects_zero_max_events_before_reset() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        ))?;
+        engine.project_pending(100)?;
+        let before = engine.store().stats()?;
+
+        let err = engine.rebuild_projection(10, Some(0)).unwrap_err();
+        let after = engine.store().stats()?;
+
+        assert!(err.to_string().contains("max_events"));
+        assert_eq!(after.pending_events, before.pending_events);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.edges, before.edges);
         Ok(())
     }
 
