@@ -22,6 +22,7 @@ The current implementation includes:
 
 - SQLite ledger/projection store
 - deterministic `ADD / UPDATE / INVALIDATE / NOOP` distiller
+- distiller output validation before graph projection writes
 - typed nodes and edges for facts, episodes, procedures, state, gotchas, and
   anti-memory
 - lexical cue seeding plus graph activation ranking

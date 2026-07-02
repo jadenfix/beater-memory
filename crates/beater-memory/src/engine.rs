@@ -113,6 +113,12 @@ impl<D: Distiller> MemoryEngine<D> {
                 let memories = self.distiller.distill(&event, &neighbors);
                 let mut projected_nodes = Vec::new();
                 for memory in memories {
+                    memory.validate().map_err(|err| {
+                        MemoryError::invalid(format!(
+                            "invalid distilled memory for event trace_id={} span_id={} seq={}: {err}",
+                            event.trace_id, event.span_id, event.seq
+                        ))
+                    })?;
                     match self.apply_distilled(&event, memory, &neighbors)? {
                         ApplyOutcome::Added(node) => {
                             event_report.memories_added += 1;
@@ -452,6 +458,46 @@ mod tests {
         let err = engine.project_pending(0).unwrap_err();
 
         assert!(err.to_string().contains("project limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn project_pending_rejects_invalid_distilled_memory_and_rolls_back() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct InvalidDistiller;
+
+        impl Distiller for InvalidDistiller {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                _neighbors: &[MemoryNode],
+            ) -> Vec<DistilledMemory> {
+                vec![
+                    DistilledMemory::add(
+                        MemoryNodeKind::Fact,
+                        "Checkout uses DATABASE_URL.",
+                        event.cited_span(),
+                    ),
+                    DistilledMemory::add(MemoryNodeKind::Fact, " ", event.cited_span()),
+                ]
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, InvalidDistiller);
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        ))?;
+
+        let err = engine.project_pending(100).unwrap_err();
+        let stats = engine.store().stats()?;
+
+        assert!(err.to_string().contains("invalid distilled memory"));
+        assert_eq!(stats.pending_events, 1);
+        assert_eq!(stats.nodes, 0);
+        assert_eq!(stats.edges, 0);
         Ok(())
     }
 
