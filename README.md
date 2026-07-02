@@ -217,6 +217,7 @@ Run checks:
 ```bash
 cargo fmt --all --check
 cargo test
+scripts/e2e-memory.sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
