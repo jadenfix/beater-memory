@@ -48,7 +48,7 @@ edges are projections that can be rebuilt.
 
 5. **Service API**
    - CLI command: `beater-memory serve`
-   - Public endpoint: `GET /livez`
+   - Public endpoints: `GET /livez`, `GET /readyz`
    - Authenticated endpoints: `/v1/health`, `/v1/stats`, `/v1/remember`,
      `/v1/project`, `/v1/query`, `/v1/maintenance`, `/v1/metrics`,
      `/v1/audit`
@@ -97,6 +97,8 @@ Production safeguards:
 - `health` also reports graph projection orphan counts for edges, citations,
   and cue index rows because the current projection tables are not SQLite-FK
   constrained
+- `readyz` uses the same DB concurrency and timeout guard as normal DB-backed
+  requests, but returns only coarse readiness state
 - `maintenance` runs SQLite optimize and WAL checkpointing, with optional vacuum
   and explicit orphan repair
 - `maintenance` also owns explicit audit retention, either by Unix millisecond
@@ -126,6 +128,7 @@ cargo run -p beater-memory -- maintenance --retain-audit-events 10000
 cargo run -p beater-memory -- rebuild-projection --yes-clear-projections
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
+curl http://127.0.0.1:8765/readyz
 ```
 
 Useful service reads:

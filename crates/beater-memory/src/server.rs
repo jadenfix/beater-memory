@@ -126,6 +126,13 @@ pub struct LiveResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyResponse {
+    pub status: String,
+    pub database: String,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RememberHttpRequest {
     pub tenant_id: String,
     pub project_id: String,
@@ -185,6 +192,7 @@ pub struct ServiceMetricsSnapshot {
     pub successful_requests: u64,
     pub failed_requests: u64,
     pub live_requests: u64,
+    pub ready_requests: u64,
     pub health_requests: u64,
     pub stats_requests: u64,
     pub remember_requests: u64,
@@ -208,6 +216,7 @@ impl ServiceMetricsSnapshot {
             successful_requests: 0,
             failed_requests: 0,
             live_requests: 0,
+            ready_requests: 0,
             health_requests: 0,
             stats_requests: 0,
             remember_requests: 0,
@@ -223,6 +232,7 @@ impl ServiceMetricsSnapshot {
         self.total_requests += 1;
         match action {
             "livez" => self.live_requests += 1,
+            "readyz" => self.ready_requests += 1,
             "health" => self.health_requests += 1,
             "stats" => self.stats_requests += 1,
             "remember" => self.remember_requests += 1,
@@ -435,6 +445,7 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
 
     Router::new()
         .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/v1/health", get(health))
         .route("/v1/stats", get(stats))
         .route("/v1/metrics", get(metrics))
@@ -466,6 +477,40 @@ async fn livez(State(state): State<MemoryServerState>) -> Json<LiveResponse> {
     Json(LiveResponse {
         status: "ok".to_string(),
     })
+}
+
+async fn readyz(State(state): State<MemoryServerState>) -> Response {
+    record_request_started(&state, "readyz");
+    match run_db_task(state.clone(), |engine| engine.store().health()).await {
+        Ok(health) if health_is_ready(&health) => {
+            record_request_success(&state);
+            (
+                StatusCode::OK,
+                Json(ReadyResponse {
+                    status: "ok".to_string(),
+                    database: "ok".to_string(),
+                    message: None,
+                }),
+            )
+                .into_response()
+        }
+        Ok(_) => {
+            record_request_failure(&state);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ReadyResponse {
+                    status: "not_ready".to_string(),
+                    database: "unhealthy".to_string(),
+                    message: Some("database health check failed".to_string()),
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            record_request_failure(&state);
+            ready_error_response(err)
+        }
+    }
 }
 
 async fn health(
@@ -681,6 +726,16 @@ async fn with_engine<T>(
 where
     T: Serialize + Send + 'static,
 {
+    run_db_task(state, f).await.map(Json)
+}
+
+async fn run_db_task<T>(
+    state: MemoryServerState,
+    f: impl FnOnce(MemoryEngine) -> MemoryResult<T> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+{
     let db_path = state.config.db_path.clone();
     let permit = match state.db_permits.clone().try_acquire_owned() {
         Ok(permit) => permit,
@@ -706,7 +761,7 @@ where
             return Err(ApiError::service_timeout(state.config.db_task_timeout_ms));
         }
     };
-    result.map(Json).map_err(Into::into)
+    result.map_err(Into::into)
 }
 
 async fn begin_request(
@@ -946,6 +1001,39 @@ fn record_db_timeout(state: &MemoryServerState) {
         .db_timeout_requests += 1;
 }
 
+fn health_is_ready(health: &StoreHealth) -> bool {
+    health.application_id == health.expected_application_id
+        && health.schema_version == health.expected_schema_version
+        && health.integrity_ok
+        && health.foreign_key_violations == 0
+        && health.graph_integrity_ok
+}
+
+fn ready_error_response(err: ApiError) -> Response {
+    let (database, message) = match err.code {
+        "service_busy" => ("busy", "database work queue is full"),
+        "service_timeout" => ("timeout", "database readiness check timed out"),
+        _ => ("unavailable", "database readiness check failed"),
+    };
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ReadyResponse {
+            status: "not_ready".to_string(),
+            database: database.to_string(),
+            message: Some(message.to_string()),
+        }),
+    )
+        .into_response();
+    if let Some(retry_after_seconds) = err.retry_after_seconds {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            header::HeaderValue::from_str(&retry_after_seconds.to_string())
+                .unwrap_or_else(|_| header::HeaderValue::from_static("60")),
+        );
+    }
+    response
+}
+
 fn error_detail(err: &ApiError) -> serde_json::Value {
     serde_json::json!({
         "code": err.code,
@@ -1019,6 +1107,25 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn readyz_checks_database_without_auth() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+
+        let response = app
+            .oneshot(unauthenticated_get_request("/readyz"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let ready: ReadyResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(ready.status, "ok");
+        assert_eq!(ready.database, "ok");
     }
 
     #[tokio::test]
@@ -1181,6 +1288,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readyz_reports_db_queue_saturation() {
+        let app = memory_router(
+            test_config()
+                .with_bearer_token("secret")
+                .with_db_concurrency_limit(0),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(unauthenticated_get_request("/readyz"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let ready: ReadyResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(ready.status, "not_ready");
+        assert_eq!(ready.database, "busy");
+
+        let response = app
+            .oneshot(get_request("/v1/metrics"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let metrics: ServiceMetricsSnapshot =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(metrics.ready_requests, 1);
+        assert_eq!(metrics.db_busy_requests, 1);
+        assert_eq!(metrics.failed_requests, 1);
+        assert_eq!(metrics.unauthorized_requests, 0);
+    }
+
+    #[tokio::test]
     async fn db_task_timeout_returns_gateway_timeout() {
         let app = memory_router(
             test_config()
@@ -1215,6 +1362,30 @@ mod tests {
         assert_eq!(metrics.db_timeout_requests, 1);
         assert_eq!(metrics.failed_requests, 1);
         assert_eq!(metrics.successful_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_unhealthy_graph_integrity() {
+        let config = test_config().with_bearer_token("secret");
+        let store =
+            crate::SqliteMemoryStore::open(&config.db_path).unwrap_or_else(|err| panic!("{err}"));
+        insert_orphan_projection_rows(&store);
+        drop(store);
+        let app = memory_router(config);
+
+        let response = app
+            .oneshot(unauthenticated_get_request("/readyz"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let ready: ReadyResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(ready.status, "not_ready");
+        assert_eq!(ready.database, "unhealthy");
     }
 
     #[tokio::test]
@@ -1316,6 +1487,14 @@ mod tests {
             .method("GET")
             .uri(path)
             .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    fn unauthenticated_get_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
             .body(Body::empty())
             .unwrap_or_else(|err| panic!("{err}"))
     }

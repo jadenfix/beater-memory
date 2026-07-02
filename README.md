@@ -67,15 +67,17 @@ cargo run -p beater-memory -- serve --bind 127.0.0.1:8765
 
 The server refuses to start without a bearer token unless `--allow-no-auth` is
 passed. All `/v1/*` routes require `Authorization: Bearer <token>`; `/livez` is
-the unauthenticated liveness endpoint. The service defaults to 600 authenticated
-requests per actor per minute; use `--max-requests-per-minute 0` to disable the
-fixed-window limiter for a trusted local deployment. DB-backed HTTP requests are
-also capped at 32 concurrent blocking SQLite tasks by default; use
-`--max-concurrent-db-tasks` to tune this. When saturated, DB-backed routes return
-`503 service_busy` with `Retry-After`, while `/livez` and `/v1/metrics` remain
-available. Each DB-backed task also has a 30s wall-time budget by default;
-adjust it with `--db-task-timeout-ms`. Timed-out DB routes return
-`504 service_timeout` and increment `db_timeout_requests`.
+the unauthenticated liveness endpoint, and `/readyz` is the unauthenticated
+readiness endpoint for DB-backed traffic. The service defaults to 600
+authenticated requests per actor per minute; use `--max-requests-per-minute 0`
+to disable the fixed-window limiter for a trusted local deployment. DB-backed
+HTTP requests are also capped at 32 concurrent blocking SQLite tasks by default;
+use `--max-concurrent-db-tasks` to tune this. When saturated, DB-backed routes
+return `503 service_busy` with `Retry-After`, while `/livez` and `/v1/metrics`
+remain available; `/readyz` returns `503` until the database work queue is
+available and health checks pass. Each DB-backed task also has a 30s wall-time
+budget by default; adjust it with `--db-task-timeout-ms`. Timed-out DB routes
+return `504 service_timeout` and increment `db_timeout_requests`.
 
 Import a `beater.js` journal:
 
@@ -133,6 +135,8 @@ HTTP equivalents:
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   http://127.0.0.1:8765/v1/health
 
+curl http://127.0.0.1:8765/readyz
+
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   http://127.0.0.1:8765/v1/metrics
 
@@ -167,7 +171,7 @@ The public API exports:
   `GraphIntegrityReport`, `GraphRepairReport`, `AuditPruneReport`,
   `ProjectionResetReport`, `BackupReport`, `RestoreReport`, `AuditRecord`, and
   `AuditEvent`
-- `ServiceMetricsSnapshot`
+- `LiveResponse`, `ReadyResponse`, and `ServiceMetricsSnapshot`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`
 - `MemoryQuery` and `MemoryAnswer`

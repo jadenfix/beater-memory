@@ -27,7 +27,7 @@ pub use model::{
 };
 pub use server::{
     AuditHttpQuery, AuditHttpResponse, LiveResponse, MaintenanceHttpRequest, MemoryServerConfig,
-    ProjectHttpRequest, QueryHttpRequest, RememberHttpRequest, RememberHttpResponse,
+    ProjectHttpRequest, QueryHttpRequest, ReadyResponse, RememberHttpRequest, RememberHttpResponse,
     ServiceMetricsSnapshot, memory_router, serve,
 };
 pub use store::{
