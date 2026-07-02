@@ -3,13 +3,17 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -37,6 +41,9 @@ const DEFAULT_MAX_CONCURRENT_DB_TASKS: usize = 32;
 const DEFAULT_DB_TASK_TIMEOUT_MS: u64 = 30_000;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const REQUEST_ID_HEADER: &str = "x-request-id";
+const MAX_REQUEST_ID_LEN: usize = 128;
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// HTTP server configuration.
 #[derive(Clone, Debug)]
@@ -364,6 +371,7 @@ struct RequestContext {
     actor: String,
     action: &'static str,
     route: &'static str,
+    request_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -459,6 +467,7 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/maintenance", post(maintenance))
         .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
 
@@ -512,6 +521,45 @@ async fn shutdown_signal() {
     {
         ctrl_c.await;
     }
+}
+
+async fn request_id_middleware(mut request: Request, next: Next) -> Response {
+    let request_id = request_id_from_headers(request.headers()).unwrap_or_else(generate_request_id);
+    let header_value = header::HeaderValue::from_str(&request_id)
+        .unwrap_or_else(|_| header::HeaderValue::from_static("req_invalid"));
+    request
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, header_value.clone());
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, header_value);
+    response
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| is_valid_request_id(value))
+        .map(ToOwned::to_owned)
+}
+
+fn is_valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REQUEST_ID_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn generate_request_id() -> String {
+    let now = now_unix_ms().to_string();
+    let sequence = REQUEST_ID_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
+    stable_id("req", &[&now, &sequence])
 }
 
 async fn livez(State(state): State<MemoryServerState>) -> Json<LiveResponse> {
@@ -848,6 +896,7 @@ async fn begin_request(
     route: &'static str,
 ) -> Result<RequestContext, ApiError> {
     record_request_started(state, action);
+    let request_id = request_id_from_headers(headers).unwrap_or_else(generate_request_id);
     match authorize(&state.config, headers) {
         Ok(actor) => {
             record_request_authorized(state);
@@ -855,6 +904,7 @@ async fn begin_request(
                 actor,
                 action,
                 route,
+                request_id: request_id.clone(),
             };
             if let Err(err) = check_rate_limit(state, &ctx.actor) {
                 record_request_rejected(state, false, true);
@@ -866,7 +916,7 @@ async fn begin_request(
                         outcome: "rate_limited".to_string(),
                         route: Some(route.to_string()),
                         status_code: Some(err.status.as_u16()),
-                        detail: error_detail(&err),
+                        detail: request_detail(&ctx, error_detail(&err)),
                     },
                 )
                 .await;
@@ -879,18 +929,19 @@ async fn begin_request(
                 actor: "unauthenticated".to_string(),
                 action,
                 route,
+                request_id,
             };
             if let Err(rate_limit_err) = check_rate_limit(state, &ctx.actor) {
                 record_request_rejected(state, true, true);
                 append_audit_event(
                     state,
                     AuditRecord {
-                        actor: ctx.actor,
+                        actor: ctx.actor.clone(),
                         action: action.to_string(),
                         outcome: "rate_limited".to_string(),
                         route: Some(route.to_string()),
                         status_code: Some(rate_limit_err.status.as_u16()),
-                        detail: error_detail(&rate_limit_err),
+                        detail: request_detail(&ctx, error_detail(&rate_limit_err)),
                     },
                 )
                 .await;
@@ -900,12 +951,12 @@ async fn begin_request(
             append_audit_event(
                 state,
                 AuditRecord {
-                    actor: ctx.actor,
+                    actor: ctx.actor.clone(),
                     action: action.to_string(),
                     outcome: "denied".to_string(),
                     route: Some(route.to_string()),
                     status_code: Some(err.status.as_u16()),
-                    detail: error_detail(&err),
+                    detail: request_detail(&ctx, error_detail(&err)),
                 },
             )
             .await;
@@ -953,7 +1004,7 @@ async fn finish_success(
             outcome: "success".to_string(),
             route: Some(ctx.route.to_string()),
             status_code: Some(status.as_u16()),
-            detail,
+            detail: request_detail(ctx, detail),
         },
     )
     .await;
@@ -969,7 +1020,7 @@ async fn finish_failure(state: &MemoryServerState, ctx: &RequestContext, err: &A
             outcome: "failure".to_string(),
             route: Some(ctx.route.to_string()),
             status_code: Some(err.status.as_u16()),
-            detail: error_detail(err),
+            detail: request_detail(ctx, error_detail(err)),
         },
     )
     .await;
@@ -1284,6 +1335,22 @@ fn ready_error_response(err: ApiError) -> Response {
     response
 }
 
+fn request_detail(ctx: &RequestContext, detail: serde_json::Value) -> serde_json::Value {
+    match detail {
+        serde_json::Value::Object(mut object) => {
+            object.insert(
+                "request_id".to_string(),
+                serde_json::Value::String(ctx.request_id.clone()),
+            );
+            serde_json::Value::Object(object)
+        }
+        other => serde_json::json!({
+            "request_id": ctx.request_id.clone(),
+            "detail": other
+        }),
+    }
+}
+
 fn error_detail(err: &ApiError) -> serde_json::Value {
     serde_json::json!({
         "code": err.code,
@@ -1345,11 +1412,14 @@ mod tests {
     #[tokio::test]
     async fn v1_routes_require_bearer_auth() {
         let app = memory_router(test_config().with_bearer_token("secret"));
+        let request_id = "denied-req-1";
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/stats")
+                    .header(REQUEST_ID_HEADER, request_id)
                     .body(Body::empty())
                     .unwrap_or_else(|err| panic!("{err}")),
             )
@@ -1357,6 +1427,29 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id)
+        );
+
+        let response = app
+            .oneshot(get_request("/v1/audit?limit=10"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let audit: AuditHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(audit.events.iter().any(|event| {
+            event.action == "stats"
+                && event.outcome == "denied"
+                && event.detail["request_id"] == request_id
+        }));
     }
 
     #[tokio::test]
@@ -1376,6 +1469,70 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(ready.status, "ok");
         assert_eq!(ready.database, "ok");
+    }
+
+    #[tokio::test]
+    async fn responses_include_generated_request_id() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+
+        let response = app
+            .oneshot(unauthenticated_get_request("/livez"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| panic!("missing request id"));
+        assert!(request_id.starts_with("req_"));
+        assert!(is_valid_request_id(request_id));
+    }
+
+    #[tokio::test]
+    async fn client_request_id_is_echoed_and_audited() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let request_id = "client-req-1";
+        let remember = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "kind": "fact",
+            "text": "Checkout uses DATABASE_URL."
+        });
+
+        let response = app
+            .clone()
+            .oneshot(json_request_with_request_id(
+                "/v1/remember",
+                remember,
+                request_id,
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id)
+        );
+
+        let response = app
+            .oneshot(get_request("/v1/audit?limit=10"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let audit: AuditHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(audit.events.iter().any(|event| {
+            event.action == "remember" && event.detail["request_id"] == request_id
+        }));
     }
 
     #[tokio::test]
@@ -1835,6 +1992,21 @@ mod tests {
             .uri(path)
             .header(header::AUTHORIZATION, "Bearer secret")
             .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    fn json_request_with_request_id(
+        path: &str,
+        body: serde_json::Value,
+        request_id: &str,
+    ) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(REQUEST_ID_HEADER, request_id)
             .body(Body::from(body.to_string()))
             .unwrap_or_else(|err| panic!("{err}"))
     }
