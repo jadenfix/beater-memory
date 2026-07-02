@@ -818,16 +818,6 @@ async fn query(
     Json(request): Json<QueryHttpRequest>,
 ) -> Result<Json<MemoryAnswer>, ApiError> {
     let ctx = begin_request(&state, &headers, "query", "/v1/query").await?;
-    if let Err(err) = validate_nonempty("question", &request.question) {
-        return fail_request(&state, &ctx, err).await;
-    }
-    if let Err(err) = validate_nonempty("tenant_id", &request.scope.tenant_id) {
-        return fail_request(&state, &ctx, err).await;
-    }
-    if let Err(err) = validate_nonempty("project_id", &request.scope.project_id) {
-        return fail_request(&state, &ctx, err).await;
-    }
-
     let max_tokens = request.max_tokens.unwrap_or(1_200);
     if max_tokens > state.config.max_query_tokens {
         return fail_request(
@@ -848,6 +838,9 @@ async fn query(
     }
     if let Some(modes) = request.modes {
         query = query.with_modes(modes);
+    }
+    if let Err(err) = query.validate() {
+        return fail_request(&state, &ctx, ApiError::from(err)).await;
     }
     let result = with_engine(state.clone(), move |engine| engine.query(&query)).await;
     finish_request(
@@ -1818,6 +1811,74 @@ mod tests {
         let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(error.error.code, "bad_request");
         assert!(error.error.message.contains("max_tokens"));
+    }
+
+    #[tokio::test]
+    async fn query_rejects_malformed_scope_over_http_before_retrieval() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let malformed_queries = [
+            (
+                serde_json::json!({
+                    "question": "anything",
+                    "scope": {"tenant_id": " tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null}
+                }),
+                "tenant_id",
+            ),
+            (
+                serde_json::json!({
+                    "question": "anything",
+                    "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": " ", "as_of_unix_ms": null}
+                }),
+                "environment_id",
+            ),
+            (
+                serde_json::json!({
+                    "question": "anything",
+                    "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": -1}
+                }),
+                "as_of_unix_ms",
+            ),
+        ];
+
+        for (query, expected_field) in malformed_queries {
+            let response = app
+                .clone()
+                .oneshot(json_request("/v1/query", query))
+                .await
+                .unwrap_or_else(|err| panic!("{err}"));
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap_or_else(|err| panic!("{err}"));
+            let error: ErrorBody =
+                serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(error.error.code, "bad_request");
+            assert!(error.error.message.contains(expected_field));
+        }
+    }
+
+    #[tokio::test]
+    async fn query_rejects_empty_modes_over_http_before_retrieval() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let query = serde_json::json!({
+            "question": "anything",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "modes": []
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "bad_request");
+        assert!(error.error.message.contains("modes"));
     }
 
     #[tokio::test]

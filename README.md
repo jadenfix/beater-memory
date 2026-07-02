@@ -40,6 +40,8 @@ The current implementation includes:
   append-only log
 - query validation that rejects malformed scopes, empty questions, and unusable
   token budgets before retrieval
+- HTTP query requests are validated through the same `MemoryQuery` contract used
+  by the engine before any retrieval task runs
 - projection limit validation that rejects zero-sized project and rebuild
   batches before mutating derived graph state
 - checked SQLite limit binding so oversized embedded read or retention limits
