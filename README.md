@@ -27,6 +27,7 @@ The current implementation includes:
 - lexical cue seeding plus graph activation ranking
 - `beater.js` journal import from `.beater/journal.db`
 - canonical span JSONL import aligned with `beater-agents` span kinds
+- atomic imports that roll back malformed batches and report the bad source row
 - CLI commands for `init`, `remember`, `project`, `query`, and import flows
 - authenticated HTTP API for service deployments
 - optional idempotency keys for retry-safe direct `remember` writes

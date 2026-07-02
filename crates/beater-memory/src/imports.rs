@@ -7,7 +7,7 @@ use std::{
 use rusqlite::{Connection, OpenFlags};
 
 use crate::{
-    error::MemoryResult,
+    error::{MemoryError, MemoryResult},
     store::{LedgerEvent, SqliteMemoryStore},
     text::{concise, json_text, now_unix_ms, stable_id},
 };
@@ -76,18 +76,26 @@ impl BeaterJsJournal {
             })
         })?;
 
-        let mut report = BeaterJsImportReport::default();
-        for row in rows {
-            let step = row?;
-            report.rows_seen += 1;
-            let event = step.into_event(tenant_id, project_id, environment_id)?;
-            if store.append_event(&event)? {
-                report.events_inserted += 1;
-            } else {
-                report.events_duplicate += 1;
+        store.with_immediate_transaction(|store| {
+            let mut report = BeaterJsImportReport::default();
+            for row in rows {
+                let step = row?;
+                report.rows_seen += 1;
+                let event = step.into_event(tenant_id, project_id, environment_id)?;
+                event.validate().map_err(|err| {
+                    MemoryError::invalid(format!(
+                        "invalid beater.js journal row run_id={} seq={}: {err}",
+                        event.trace_id, event.seq
+                    ))
+                })?;
+                if store.append_event(&event)? {
+                    report.events_inserted += 1;
+                } else {
+                    report.events_duplicate += 1;
+                }
             }
-        }
-        Ok(report)
+            Ok(report)
+        })
     }
 }
 
@@ -100,23 +108,33 @@ pub fn import_canonical_jsonl(
 ) -> MemoryResult<CanonicalJsonlImportReport> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let mut report = CanonicalJsonlImportReport::default();
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    store.with_immediate_transaction(|store| {
+        let mut report = CanonicalJsonlImportReport::default();
+        for (index, line) in reader.lines().enumerate() {
+            let line_number = index + 1;
+            let line = line.map_err(|err| {
+                MemoryError::invalid(format!("failed reading JSONL line {line_number}: {err}"))
+            })?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            report.rows_seen += 1;
+            let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+                MemoryError::invalid(format!("invalid canonical JSONL line {line_number}: {err}"))
+            })?;
+            let event = canonical_json_event(&value, tenant_id, project_id, environment_id);
+            event.validate().map_err(|err| {
+                MemoryError::invalid(format!("invalid canonical JSONL line {line_number}: {err}"))
+            })?;
+            if store.append_event(&event)? {
+                report.events_inserted += 1;
+            } else {
+                report.events_duplicate += 1;
+            }
         }
-        report.rows_seen += 1;
-        let value: serde_json::Value = serde_json::from_str(trimmed)?;
-        let event = canonical_json_event(&value, tenant_id, project_id, environment_id);
-        if store.append_event(&event)? {
-            report.events_inserted += 1;
-        } else {
-            report.events_duplicate += 1;
-        }
-    }
-    Ok(report)
+        Ok(report)
+    })
 }
 
 #[derive(Debug)]
@@ -145,13 +163,13 @@ impl BeaterJsStep {
         project_id: &str,
         environment_id: Option<&str>,
     ) -> MemoryResult<LedgerEvent> {
-        let request: serde_json::Value = serde_json::from_str(&self.request_json)?;
-        let result: serde_json::Value = self
-            .result_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?
-            .unwrap_or(serde_json::Value::Null);
+        let request: serde_json::Value = serde_json::from_str(&self.request_json)
+            .map_err(|err| self.invalid_json_error("request", err))?;
+        let result: serde_json::Value = match self.result_json.as_deref() {
+            Some(result_json) => serde_json::from_str(result_json)
+                .map_err(|err| self.invalid_json_error("result", err))?,
+            None => serde_json::Value::Null,
+        };
         let span_kind = match self.kind.as_str() {
             "llm_call" => "llm.call",
             "tool_call" => match self.tool_name.as_deref() {
@@ -203,6 +221,13 @@ impl BeaterJsStep {
             ingested_at_unix_ms: now_unix_ms(),
             projected_at_unix_ms: None,
         })
+    }
+
+    fn invalid_json_error(&self, field: &str, err: serde_json::Error) -> MemoryError {
+        MemoryError::invalid(format!(
+            "invalid beater.js journal {field} JSON for run_id={} seq={}: {err}",
+            self.run_id, self.seq
+        ))
     }
 }
 
@@ -328,6 +353,69 @@ mod tests {
     }
 
     #[test]
+    fn beater_js_import_is_atomic_on_invalid_row() -> MemoryResult<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "beater-memory-test-invalid-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir)?;
+        let journal_path = dir.join("journal.db");
+        let conn = Connection::open(&journal_path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE runs(
+               id TEXT PRIMARY KEY, agent TEXT NOT NULL, status TEXT NOT NULL,
+               input TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE steps(
+               run_id TEXT NOT NULL, seq INTEGER NOT NULL,
+               kind TEXT NOT NULL, status TEXT NOT NULL,
+               request TEXT NOT NULL, result TEXT,
+               tool_name TEXT, tool_use_id TEXT,
+               attempt INTEGER NOT NULL DEFAULT 1,
+               started_at INTEGER NOT NULL, finished_at INTEGER,
+               PRIMARY KEY(run_id, seq));
+            ",
+        )?;
+        conn.execute(
+            "INSERT INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params!["run-1", "support", "completed", "remember checkout", 1_i64],
+        )?;
+        conn.execute(
+            "INSERT INTO steps VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 1, ?7, ?8)",
+            params![
+                "run-1",
+                1_i64,
+                "llm_call",
+                "completed",
+                serde_json::json!({"messages": [{"role": "user", "content": "checkout fails"}]})
+                    .to_string(),
+                serde_json::json!({"content": [{"type": "text", "text": "Set DATABASE_URL"}]})
+                    .to_string(),
+                2_i64,
+                3_i64,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO steps VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, 1, ?6, NULL)",
+            params!["run-1", 2_i64, "llm_call", "failed", "{not-json", 4_i64,],
+        )?;
+        drop(conn);
+
+        let store = SqliteMemoryStore::in_memory()?;
+        let err = BeaterJsJournal::new(&journal_path)
+            .import_into(&store, "tenant", "project", None)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("run_id=run-1 seq=2"));
+        assert_eq!(store.stats()?.ledger_events, 0);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn canonical_jsonl_uses_beater_span_kind_attrs() -> MemoryResult<()> {
         let dir = std::env::temp_dir().join(format!(
             "beater-memory-jsonl-test-{}",
@@ -358,6 +446,38 @@ mod tests {
         assert_eq!(report.events_inserted, 1);
         let events = store.pending_events(10)?;
         assert_eq!(events[0].span_kind, "memory.write");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_jsonl_import_is_atomic_on_invalid_line() -> MemoryResult<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "beater-memory-jsonl-invalid-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("spans.jsonl");
+        let valid = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "trace_id": "trace",
+            "span_id": "span",
+            "seq": 1,
+            "attributes": {"beater.span.kind": "memory.write"},
+            "name": "fact",
+            "output": "Checkout uses DATABASE_URL"
+        });
+        fs::write(&path, format!("{valid}\n{{not-json\n"))?;
+        let store = SqliteMemoryStore::in_memory()?;
+
+        let err = import_canonical_jsonl(&path, &store, None, None, None).unwrap_err();
+
+        assert!(err.to_string().contains("line 2"));
+        assert_eq!(store.stats()?.ledger_events, 0);
         fs::remove_dir_all(dir)?;
         Ok(())
     }
