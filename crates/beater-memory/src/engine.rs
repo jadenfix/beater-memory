@@ -1,12 +1,12 @@
 use crate::{
     distill::{Distiller, HeuristicDistiller},
-    error::MemoryResult,
+    error::{MemoryError, MemoryResult},
     graph::answer_query,
     model::{
         ActivationWeights, BeliefRevisionOp, DistilledMemory, MemoryAnswer, MemoryEdgeKind,
         MemoryNodeKind, MemoryQuery,
     },
-    store::{LedgerEvent, MemoryNode, SqliteMemoryStore, StoreScope},
+    store::{LedgerEvent, MemoryNode, ProjectionResetReport, SqliteMemoryStore, StoreScope},
     text::{now_unix_ms, overlap_score, top_terms},
 };
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,16 @@ pub struct ProjectReport {
     pub memories_invalidated: usize,
     pub memories_nooped: usize,
     pub edges_added: usize,
+}
+
+/// Result of resetting derived projections and replaying the ledger.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionRebuildReport {
+    pub reset: ProjectionResetReport,
+    pub project: ProjectReport,
+    pub batch_size: usize,
+    pub max_events: Option<usize>,
+    pub completed: bool,
 }
 
 /// Memory engine facade: ledger import, projection, and answer-shaped reads.
@@ -126,6 +136,42 @@ impl<D: Distiller> MemoryEngine<D> {
             report.absorb(event_report);
         }
         Ok(report)
+    }
+
+    pub fn rebuild_projection(
+        &self,
+        batch_size: usize,
+        max_events: Option<usize>,
+    ) -> MemoryResult<ProjectionRebuildReport> {
+        if batch_size == 0 {
+            return Err(MemoryError::invalid("batch_size must be greater than 0"));
+        }
+        let reset = self.store.reset_projection()?;
+        let mut project = ProjectReport::default();
+        let mut remaining = max_events.unwrap_or(usize::MAX);
+        let completed;
+        loop {
+            if remaining == 0 {
+                completed = self.store.stats()?.pending_events == 0;
+                break;
+            }
+            let limit = batch_size.min(remaining);
+            let batch = self.project_pending(limit)?;
+            let projected = batch.events_projected;
+            project.absorb(batch);
+            if projected == 0 {
+                completed = true;
+                break;
+            }
+            remaining = remaining.saturating_sub(projected);
+        }
+        Ok(ProjectionRebuildReport {
+            reset,
+            project,
+            batch_size,
+            max_events,
+            completed,
+        })
     }
 
     pub fn query(&self, query: &MemoryQuery) -> MemoryResult<MemoryAnswer> {
@@ -377,6 +423,79 @@ mod tests {
         assert_eq!(first.events_projected, 1);
         assert_eq!(second.events_seen, 0);
         assert_eq!(engine.store().stats()?.pending_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_replays_ledger_and_preserves_audit() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.store().append_audit(&crate::AuditRecord {
+            actor: "test".to_string(),
+            action: "setup".to_string(),
+            outcome: "success".to_string(),
+            route: None,
+            status_code: None,
+            detail: serde_json::json!({}),
+        })?;
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "The support API health route is /api/health.",
+        ))?;
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Gotcha,
+            "Checkout requires DATABASE_URL before running migrations.",
+        ))?;
+        engine.project_pending(100)?;
+        let before = engine.store().stats()?;
+        assert_eq!(before.ledger_events, 2);
+        assert_eq!(before.pending_events, 0);
+        assert!(before.nodes > 0);
+
+        let report = engine.rebuild_projection(1, None)?;
+
+        let after = engine.store().stats()?;
+        assert_eq!(report.reset.ledger_events_reset, 2);
+        assert!(report.reset.nodes_removed > 0);
+        assert_eq!(report.project.events_projected, 2);
+        assert!(report.completed);
+        assert_eq!(after.ledger_events, 2);
+        assert_eq!(after.audit_events, 1);
+        assert_eq!(after.pending_events, 0);
+        assert!(after.nodes > 0);
+        let answer = engine.query(&MemoryQuery::new(
+            "checkout migrations database",
+            MemoryScope::new("tenant", "project"),
+        ))?;
+        assert!(answer.answer.contains("DATABASE_URL"));
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_can_stop_after_max_events() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "First deploy step sets DATABASE_URL.",
+        ))?;
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Second deploy step runs migrations.",
+        ))?;
+        engine.project_pending(100)?;
+
+        let report = engine.rebuild_projection(10, Some(1))?;
+
+        assert_eq!(report.project.events_projected, 1);
+        assert!(!report.completed);
+        assert_eq!(engine.store().stats()?.pending_events, 1);
         Ok(())
     }
 

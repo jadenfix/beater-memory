@@ -65,6 +65,15 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
+    /// Clear derived projections and replay the append-only ledger.
+    RebuildProjection {
+        #[arg(long)]
+        yes_clear_projections: bool,
+        #[arg(long, default_value_t = 1000)]
+        batch_size: usize,
+        #[arg(long)]
+        max_events: Option<usize>,
+    },
     /// Run integrity, schema, and count checks.
     Health {
         #[arg(long)]
@@ -286,6 +295,21 @@ async fn main() -> anyhow::Result<()> {
             let engine = MemoryEngine::open(&cli.db)
                 .with_context(|| format!("open {}", cli.db.display()))?;
             let report = engine.project_pending(limit)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::RebuildProjection {
+            yes_clear_projections,
+            batch_size,
+            max_events,
+        } => {
+            if !yes_clear_projections {
+                anyhow::bail!(
+                    "rebuild clears derived projections; pass --yes-clear-projections to continue"
+                );
+            }
+            let engine = MemoryEngine::open(&cli.db)
+                .with_context(|| format!("open {}", cli.db.display()))?;
+            let report = engine.rebuild_projection(batch_size, max_events)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Health { json } => {

@@ -103,6 +103,9 @@ Production safeguards:
   backup path
 - `restore` replaces the active database only behind an explicit confirmation
   flag and re-runs schema/health checks after restore
+- `rebuild-projection` clears only derived projection tables and ledger
+  projection markers, then replays the append-only ledger behind an explicit
+  confirmation flag
 - service audit events are persisted in SQLite so backup/restore includes the
   operational trail for the memory database
 
@@ -117,6 +120,7 @@ cargo run -p beater-memory -- query --tenant local --project demo \
 cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --repair-orphans
+cargo run -p beater-memory -- rebuild-projection --yes-clear-projections
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
 ```

@@ -230,6 +230,16 @@ pub struct RestoreReport {
     pub stats: StoreStats,
 }
 
+/// Rows removed or reset when rebuilding derived projections from the ledger.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionResetReport {
+    pub ledger_events_reset: i64,
+    pub nodes_removed: i64,
+    pub edges_removed: i64,
+    pub node_spans_removed: i64,
+    pub cue_index_entries_removed: i64,
+}
+
 /// A durable service audit event.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -1046,6 +1056,28 @@ impl SqliteMemoryStore {
             orphan_edges_to,
             orphan_node_spans,
             orphan_cue_index_entries,
+        })
+    }
+
+    pub fn reset_projection(&self) -> MemoryResult<ProjectionResetReport> {
+        self.with_immediate_transaction(|store| store.reset_projection_in_transaction())
+    }
+
+    fn reset_projection_in_transaction(&self) -> MemoryResult<ProjectionResetReport> {
+        let edges_removed = self.conn.execute("DELETE FROM memory_edges", [])? as i64;
+        let node_spans_removed = self.conn.execute("DELETE FROM node_spans", [])? as i64;
+        let cue_index_entries_removed = self.conn.execute("DELETE FROM cue_index", [])? as i64;
+        let nodes_removed = self.conn.execute("DELETE FROM memory_nodes", [])? as i64;
+        let ledger_events_reset = self.conn.execute(
+            "UPDATE ledger_events SET projected_at_unix_ms = NULL WHERE projected_at_unix_ms IS NOT NULL",
+            [],
+        )? as i64;
+        Ok(ProjectionResetReport {
+            ledger_events_reset,
+            nodes_removed,
+            edges_removed,
+            node_spans_removed,
+            cue_index_entries_removed,
         })
     }
 
