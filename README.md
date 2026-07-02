@@ -40,6 +40,7 @@ The current implementation includes:
   silently migrating them
 - service metrics, persisted audit events, fixed-window request limiting, and
   bounded DB work concurrency
+- `x-request-id` propagation for HTTP responses and durable audit rows
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
 
@@ -74,14 +75,16 @@ process managers. All `/v1/*` routes require `Authorization: Bearer <token>`;
 unauthenticated readiness endpoint for DB-backed traffic. The service defaults
 to 600 authenticated requests per actor per minute; use
 `--max-requests-per-minute 0` to disable the fixed-window limiter for a trusted
-local deployment. DB-backed HTTP requests are also capped at 32 concurrent
-blocking SQLite tasks by default; use `--max-concurrent-db-tasks` to tune this.
-When saturated, DB-backed routes return `503 service_busy` with `Retry-After`,
-while `/livez`, JSON `/v1/metrics`, and Prometheus `/v1/metrics/prometheus`
-remain available; `/readyz` returns `503` until the database work queue is
-available and health checks pass. Each DB-backed task also has a 30s wall-time
-budget by default; adjust it with `--db-task-timeout-ms`. Timed-out DB routes
-return `504 service_timeout` and increment `db_timeout_requests`.
+local deployment. Every response includes `x-request-id`; client-supplied valid
+request IDs are echoed, and generated IDs are written into durable audit detail.
+DB-backed HTTP requests are also capped at 32 concurrent blocking SQLite tasks
+by default; use `--max-concurrent-db-tasks` to tune this. When saturated,
+DB-backed routes return `503 service_busy` with `Retry-After`, while `/livez`,
+JSON `/v1/metrics`, and Prometheus `/v1/metrics/prometheus` remain available;
+`/readyz` returns `503` until the database work queue is available and health
+checks pass. Each DB-backed task also has a 30s wall-time budget by default;
+adjust it with `--db-task-timeout-ms`. Timed-out DB routes return
+`504 service_timeout` and increment `db_timeout_requests`.
 
 Import a `beater.js` journal:
 

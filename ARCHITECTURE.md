@@ -61,6 +61,8 @@ edges are projections that can be rebuilt.
      JSON and Prometheus service metrics expose request totals, DB saturation,
      and DB timeouts; durable audit rows record successes, failures, denied
      auth, and throttled attempts.
+   - Correlation: every HTTP response carries `x-request-id`; valid incoming
+     request IDs are echoed and audit details include the same ID.
    - Writes: direct `remember` calls can carry an idempotency key so client
      retries map to the same ledger event.
    - Shutdown: `serve` uses Axum graceful shutdown on Ctrl-C and SIGTERM on
@@ -108,6 +110,8 @@ Production safeguards:
   requests, but returns only coarse readiness state
 - service shutdown drains through Axum graceful shutdown on Ctrl-C and Unix
   SIGTERM
+- `x-request-id` is generated or echoed for every HTTP response and included in
+  durable audit detail for authenticated, denied, failed, and throttled calls
 - `maintenance` runs SQLite optimize and WAL checkpointing, with optional vacuum
   and explicit orphan repair
 - `maintenance` also owns explicit audit retention, either by Unix millisecond
