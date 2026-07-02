@@ -77,11 +77,11 @@ to 600 authenticated requests per actor per minute; use
 local deployment. DB-backed HTTP requests are also capped at 32 concurrent
 blocking SQLite tasks by default; use `--max-concurrent-db-tasks` to tune this.
 When saturated, DB-backed routes return `503 service_busy` with `Retry-After`,
-while `/livez` and `/v1/metrics` remain available; `/readyz` returns `503` until
-the database work queue is available and health checks pass. Each DB-backed task
-also has a 30s wall-time budget by default; adjust it with
-`--db-task-timeout-ms`. Timed-out DB routes return `504 service_timeout` and
-increment `db_timeout_requests`.
+while `/livez`, JSON `/v1/metrics`, and Prometheus `/v1/metrics/prometheus`
+remain available; `/readyz` returns `503` until the database work queue is
+available and health checks pass. Each DB-backed task also has a 30s wall-time
+budget by default; adjust it with `--db-task-timeout-ms`. Timed-out DB routes
+return `504 service_timeout` and increment `db_timeout_requests`.
 
 Import a `beater.js` journal:
 
@@ -148,6 +148,9 @@ curl http://127.0.0.1:8765/readyz
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   http://127.0.0.1:8765/v1/metrics
+
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+  http://127.0.0.1:8765/v1/metrics/prometheus
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   'http://127.0.0.1:8765/v1/audit?limit=50'
