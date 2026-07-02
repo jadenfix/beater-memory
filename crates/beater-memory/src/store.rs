@@ -104,6 +104,43 @@ impl LedgerEvent {
         }
     }
 
+    pub fn validate(&self) -> MemoryResult<()> {
+        validate_required_identifier("source", &self.source)?;
+        validate_required_identifier("tenant_id", &self.tenant_id)?;
+        validate_required_identifier("project_id", &self.project_id)?;
+        if let Some(environment_id) = self.environment_id.as_deref() {
+            validate_required_identifier("environment_id", environment_id)?;
+        }
+        validate_required_identifier("trace_id", &self.trace_id)?;
+        validate_required_identifier("span_id", &self.span_id)?;
+        validate_required_identifier("span_kind", &self.span_kind)?;
+        validate_required_identifier("name", &self.name)?;
+        validate_required_identifier("status", &self.status)?;
+        validate_required_text("text", &self.text)?;
+        if self.seq == 0 {
+            return Err(MemoryError::invalid("seq must be greater than 0"));
+        }
+        if self.observed_at_unix_ms < 0 {
+            return Err(MemoryError::invalid(
+                "observed_at_unix_ms must be non-negative",
+            ));
+        }
+        if self.ingested_at_unix_ms < 0 {
+            return Err(MemoryError::invalid(
+                "ingested_at_unix_ms must be non-negative",
+            ));
+        }
+        if self
+            .projected_at_unix_ms
+            .is_some_and(|projected_at| projected_at < 0)
+        {
+            return Err(MemoryError::invalid(
+                "projected_at_unix_ms must be non-negative",
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn cited_span(&self) -> CitedSpan {
         CitedSpan {
@@ -496,6 +533,7 @@ impl SqliteMemoryStore {
     }
 
     pub fn append_event(&self, event: &LedgerEvent) -> MemoryResult<bool> {
+        event.validate()?;
         let inserted = self.conn.execute(
             "
             INSERT OR IGNORE INTO ledger_events(
@@ -1322,6 +1360,26 @@ fn merge_node_text(existing: &str, incoming: &str) -> String {
     }
 }
 
+fn validate_required_identifier(field: &str, value: &str) -> MemoryResult<()> {
+    if value.trim().is_empty() {
+        return Err(MemoryError::invalid(format!("{field} must not be empty")));
+    }
+    if value.trim() != value {
+        return Err(MemoryError::invalid(format!(
+            "{field} must not have leading or trailing whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_required_text(field: &str, value: &str) -> MemoryResult<()> {
+    if value.trim().is_empty() {
+        Err(MemoryError::invalid(format!("{field} must not be empty")))
+    } else {
+        Ok(())
+    }
+}
+
 fn configure_connection(conn: &Connection) -> MemoryResult<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(
@@ -1503,6 +1561,47 @@ mod tests {
         assert!(store.append_event(&event)?);
         assert!(!store.append_event(&event)?);
         assert_eq!(store.stats()?.ledger_events, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn append_event_rejects_malformed_ledger_events() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+
+        assert_invalid_event(
+            &store,
+            |event| event.tenant_id = " ".to_string(),
+            "tenant_id",
+        )?;
+        assert_invalid_event(
+            &store,
+            |event| event.trace_id = " trace".to_string(),
+            "trace_id",
+        )?;
+        assert_invalid_event(
+            &store,
+            |event| event.environment_id = Some(String::new()),
+            "environment_id",
+        )?;
+        assert_invalid_event(&store, |event| event.text = "\t".to_string(), "text")?;
+        assert_invalid_event(&store, |event| event.seq = 0, "seq")?;
+        assert_invalid_event(
+            &store,
+            |event| event.observed_at_unix_ms = -1,
+            "observed_at_unix_ms",
+        )?;
+        assert_invalid_event(
+            &store,
+            |event| event.ingested_at_unix_ms = -1,
+            "ingested_at_unix_ms",
+        )?;
+        assert_invalid_event(
+            &store,
+            |event| event.projected_at_unix_ms = Some(-1),
+            "projected_at_unix_ms",
+        )?;
+
+        assert_eq!(store.stats()?.ledger_events, 0);
         Ok(())
     }
 
@@ -1889,6 +1988,26 @@ mod tests {
                 .as_nanos(),
             name
         ))
+    }
+
+    fn assert_invalid_event(
+        store: &SqliteMemoryStore,
+        edit: impl FnOnce(&mut LedgerEvent),
+        expected_message: &str,
+    ) -> MemoryResult<()> {
+        let mut event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        edit(&mut event);
+        let err = store.append_event(&event).unwrap_err();
+        assert!(
+            err.to_string().contains(expected_message),
+            "expected error containing {expected_message:?}, got {err}"
+        );
+        Ok(())
     }
 
     fn insert_audit_event(
