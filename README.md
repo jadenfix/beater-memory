@@ -117,4 +117,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 For each coherent feature slice: implement, self-review the diff, run focused
 tests plus the workspace checks, commit only intended files, open a PR, and
-merge only after the checks are clean.
+merge only after local checks and GitHub CI are clean.

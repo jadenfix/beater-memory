@@ -111,4 +111,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Before publishing a slice, inspect the diff, commit only intended files, open a
-PR, and merge only after the checks are clean.
+PR, and merge only after local checks and GitHub CI are clean.
