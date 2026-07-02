@@ -191,11 +191,19 @@ pub struct GraphRepairReport {
     pub cue_index_entries_removed: i64,
 }
 
+/// Rows removed by audit retention maintenance.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditPruneReport {
+    pub audit_events_removed: i64,
+}
+
 /// Options for a local maintenance pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceOptions {
     pub vacuum: bool,
     pub repair_orphans: bool,
+    pub prune_audit_before_unix_ms: Option<i64>,
+    pub retain_latest_audit_events: Option<usize>,
 }
 
 /// Result of a local maintenance pass.
@@ -207,9 +215,11 @@ pub struct MaintenanceReport {
     pub wal_checkpoint_checkpointed_frames: i64,
     pub vacuumed: bool,
     pub repaired_orphans: bool,
+    pub pruned_audit_events: bool,
     pub graph_integrity_before: GraphIntegrityReport,
     pub graph_integrity_after: GraphIntegrityReport,
     pub graph_repair: GraphRepairReport,
+    pub audit_prune: AuditPruneReport,
 }
 
 /// Result of writing a SQLite backup file.
@@ -973,7 +983,7 @@ impl SqliteMemoryStore {
     pub fn maintenance(&self, vacuum: bool) -> MemoryResult<MaintenanceReport> {
         self.maintenance_with_options(MaintenanceOptions {
             vacuum,
-            repair_orphans: false,
+            ..MaintenanceOptions::default()
         })
     }
 
@@ -987,6 +997,18 @@ impl SqliteMemoryStore {
             self.with_immediate_transaction(|store| store.repair_graph_orphans())?
         } else {
             GraphRepairReport::default()
+        };
+        let pruned_audit_events = options.prune_audit_before_unix_ms.is_some()
+            || options.retain_latest_audit_events.is_some();
+        let audit_prune = if pruned_audit_events {
+            self.with_immediate_transaction(|store| {
+                store.prune_audit_events_in_transaction(
+                    options.prune_audit_before_unix_ms,
+                    options.retain_latest_audit_events,
+                )
+            })?
+        } else {
+            AuditPruneReport::default()
         };
         let graph_integrity_after = self.graph_integrity()?;
         let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
@@ -1004,9 +1026,11 @@ impl SqliteMemoryStore {
             wal_checkpoint_checkpointed_frames: checkpointed_frames,
             vacuumed: options.vacuum,
             repaired_orphans: options.repair_orphans,
+            pruned_audit_events,
             graph_integrity_before,
             graph_integrity_after,
             graph_repair,
+            audit_prune,
         })
     }
 
@@ -1108,6 +1132,50 @@ impl SqliteMemoryStore {
             memory_edges_removed,
             node_spans_removed,
             cue_index_entries_removed,
+        })
+    }
+
+    pub fn prune_audit_events(
+        &self,
+        before_unix_ms: Option<i64>,
+        retain_latest: Option<usize>,
+    ) -> MemoryResult<AuditPruneReport> {
+        if before_unix_ms.is_none() && retain_latest.is_none() {
+            return Ok(AuditPruneReport::default());
+        }
+        self.with_immediate_transaction(|store| {
+            store.prune_audit_events_in_transaction(before_unix_ms, retain_latest)
+        })
+    }
+
+    fn prune_audit_events_in_transaction(
+        &self,
+        before_unix_ms: Option<i64>,
+        retain_latest: Option<usize>,
+    ) -> MemoryResult<AuditPruneReport> {
+        let mut audit_events_removed = 0_i64;
+        if let Some(cutoff) = before_unix_ms {
+            audit_events_removed += self.conn.execute(
+                "DELETE FROM audit_events WHERE occurred_at_unix_ms < ?1",
+                params![cutoff],
+            )? as i64;
+        }
+        if let Some(limit) = retain_latest {
+            audit_events_removed += self.conn.execute(
+                "
+                DELETE FROM audit_events
+                WHERE id NOT IN (
+                    SELECT id
+                    FROM audit_events
+                    ORDER BY occurred_at_unix_ms DESC, id DESC
+                    LIMIT ?1
+                )
+                ",
+                params![limit as i64],
+            )? as i64;
+        }
+        Ok(AuditPruneReport {
+            audit_events_removed,
         })
     }
 
@@ -1570,6 +1638,7 @@ mod tests {
         let dry_run = store.maintenance_with_options(MaintenanceOptions {
             vacuum: false,
             repair_orphans: false,
+            ..MaintenanceOptions::default()
         })?;
         assert!(!dry_run.repaired_orphans);
         assert!(!dry_run.graph_integrity_after.is_clean());
@@ -1577,6 +1646,7 @@ mod tests {
         let repaired = store.maintenance_with_options(MaintenanceOptions {
             vacuum: false,
             repair_orphans: true,
+            ..MaintenanceOptions::default()
         })?;
 
         assert!(repaired.repaired_orphans);
@@ -1685,6 +1755,59 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn audit_pruning_removes_old_rows_and_retains_newest() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        insert_audit_event(&store, 1_000, "oldest")?;
+        insert_audit_event(&store, 2_000, "old")?;
+        insert_audit_event(&store, 3_000, "new")?;
+        insert_audit_event(&store, 4_000, "newest")?;
+
+        let cutoff_report = store.prune_audit_events(Some(2_500), None)?;
+
+        assert_eq!(cutoff_report.audit_events_removed, 2);
+        assert_eq!(store.stats()?.audit_events, 2);
+        let events = store.recent_audit_events(10)?;
+        assert_eq!(events[0].action, "newest");
+        assert_eq!(events[1].action, "new");
+
+        let retain_report = store.prune_audit_events(None, Some(1))?;
+
+        assert_eq!(retain_report.audit_events_removed, 1);
+        assert_eq!(store.stats()?.audit_events, 1);
+        let events = store.recent_audit_events(10)?;
+        assert_eq!(events[0].action, "newest");
+
+        let clear_report = store.prune_audit_events(None, Some(0))?;
+
+        assert_eq!(clear_report.audit_events_removed, 1);
+        assert_eq!(store.stats()?.audit_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_reports_audit_pruning() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        insert_audit_event(&store, 1_000, "oldest")?;
+        insert_audit_event(&store, 2_000, "old")?;
+        insert_audit_event(&store, 3_000, "new")?;
+        insert_audit_event(&store, 4_000, "newest")?;
+
+        let report = store.maintenance_with_options(MaintenanceOptions {
+            vacuum: false,
+            repair_orphans: false,
+            prune_audit_before_unix_ms: Some(2_500),
+            retain_latest_audit_events: Some(1),
+        })?;
+
+        assert!(report.pruned_audit_events);
+        assert_eq!(report.audit_prune.audit_events_removed, 3);
+        assert_eq!(store.stats()?.audit_events, 1);
+        let events = store.recent_audit_events(10)?;
+        assert_eq!(events[0].action, "newest");
+        Ok(())
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "beater-memory-{}-{}",
@@ -1694,6 +1817,22 @@ mod tests {
                 .as_nanos(),
             name
         ))
+    }
+
+    fn insert_audit_event(
+        store: &SqliteMemoryStore,
+        occurred_at_unix_ms: i64,
+        action: &str,
+    ) -> MemoryResult<i64> {
+        store.connection().execute(
+            "
+            INSERT INTO audit_events(
+                occurred_at_unix_ms, actor, action, outcome, route, status_code, detail_json
+            ) VALUES (?1, 'test-actor', ?2, 'success', '/test', 200, '{}')
+            ",
+            params![occurred_at_unix_ms, action],
+        )?;
+        Ok(store.connection().last_insert_rowid())
     }
 
     fn insert_orphan_projection_rows(store: &SqliteMemoryStore) -> MemoryResult<()> {

@@ -159,6 +159,8 @@ pub struct QueryHttpRequest {
 pub struct MaintenanceHttpRequest {
     pub vacuum: Option<bool>,
     pub repair_orphans: Option<bool>,
+    pub prune_audit_before_unix_ms: Option<i64>,
+    pub retain_latest_audit_events: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,6 +652,8 @@ async fn maintenance(
     let options = MaintenanceOptions {
         vacuum: request.vacuum.unwrap_or(false),
         repair_orphans: request.repair_orphans.unwrap_or(false),
+        prune_audit_before_unix_ms: request.prune_audit_before_unix_ms,
+        retain_latest_audit_events: request.retain_latest_audit_events,
     };
     let detail_options = options.clone();
     let result = with_engine(state.clone(), move |engine| {
@@ -662,7 +666,9 @@ async fn maintenance(
         result,
         serde_json::json!({
             "vacuum": detail_options.vacuum,
-            "repair_orphans": detail_options.repair_orphans
+            "repair_orphans": detail_options.repair_orphans,
+            "prune_audit_before_unix_ms": detail_options.prune_audit_before_unix_ms,
+            "retain_latest_audit_events": detail_options.retain_latest_audit_events
         }),
     )
     .await
@@ -1249,6 +1255,52 @@ mod tests {
         assert_eq!(report.graph_repair.cue_index_entries_removed, 1);
     }
 
+    #[tokio::test]
+    async fn maintenance_prunes_audit_events_over_http() {
+        let config = test_config().with_bearer_token("secret");
+        let db_path = config.db_path.clone();
+        let store =
+            crate::SqliteMemoryStore::open(&config.db_path).unwrap_or_else(|err| panic!("{err}"));
+        insert_audit_event(&store, 1_000, "oldest");
+        insert_audit_event(&store, 2_000, "old");
+        insert_audit_event(&store, 3_000, "new");
+        insert_audit_event(&store, 4_000, "newest");
+        drop(store);
+        let app = memory_router(config);
+        let request = serde_json::json!({
+            "prune_audit_before_unix_ms": 2_500,
+            "retain_latest_audit_events": 1
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/maintenance", request))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let report: MaintenanceReport =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(report.pruned_audit_events);
+        assert_eq!(report.audit_prune.audit_events_removed, 3);
+
+        let store = crate::SqliteMemoryStore::open(&db_path).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            store
+                .stats()
+                .unwrap_or_else(|err| panic!("{err}"))
+                .audit_events,
+            2
+        );
+        let events = store
+            .recent_audit_events(10)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(events[0].action, "maintenance");
+        assert_eq!(events[1].action, "newest");
+    }
+
     fn json_request(path: &str, body: serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -1280,6 +1332,24 @@ mod tests {
             db_path,
             "127.0.0.1:0".parse().unwrap_or_else(|err| panic!("{err}")),
         )
+    }
+
+    fn insert_audit_event(
+        store: &crate::SqliteMemoryStore,
+        occurred_at_unix_ms: i64,
+        action: &str,
+    ) {
+        store
+            .connection()
+            .execute(
+                "
+                INSERT INTO audit_events(
+                    occurred_at_unix_ms, actor, action, outcome, route, status_code, detail_json
+                ) VALUES (?1, 'test-actor', ?2, 'success', '/test', 200, '{}')
+                ",
+                rusqlite::params![occurred_at_unix_ms, action],
+            )
+            .unwrap_or_else(|err| panic!("{err}"));
     }
 
     fn insert_orphan_projection_rows(store: &crate::SqliteMemoryStore) {

@@ -31,7 +31,7 @@ pub use server::{
     ServiceMetricsSnapshot, memory_router, serve,
 };
 pub use store::{
-    AuditEvent, AuditRecord, BackupReport, GraphIntegrityReport, GraphRepairReport, LedgerEvent,
-    MaintenanceOptions, MaintenanceReport, MemoryEdge, MemoryNode, ProjectionResetReport,
-    RestoreReport, SqliteMemoryStore, StoreHealth, StoreStats,
+    AuditEvent, AuditPruneReport, AuditRecord, BackupReport, GraphIntegrityReport,
+    GraphRepairReport, LedgerEvent, MaintenanceOptions, MaintenanceReport, MemoryEdge, MemoryNode,
+    ProjectionResetReport, RestoreReport, SqliteMemoryStore, StoreHealth, StoreStats,
 };

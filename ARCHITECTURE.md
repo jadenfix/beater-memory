@@ -99,6 +99,8 @@ Production safeguards:
   constrained
 - `maintenance` runs SQLite optimize and WAL checkpointing, with optional vacuum
   and explicit orphan repair
+- `maintenance` also owns explicit audit retention, either by Unix millisecond
+  cutoff, newest-row count, or both
 - `backup` uses SQLite's online backup API and refuses to overwrite an existing
   backup path
 - `restore` replaces the active database only behind an explicit confirmation
@@ -120,6 +122,7 @@ cargo run -p beater-memory -- query --tenant local --project demo \
 cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --repair-orphans
+cargo run -p beater-memory -- maintenance --retain-audit-events 10000
 cargo run -p beater-memory -- rebuild-projection --yes-clear-projections
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
