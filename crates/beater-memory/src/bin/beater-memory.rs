@@ -85,6 +85,12 @@ enum Command {
         vacuum: bool,
         #[arg(long)]
         repair_orphans: bool,
+        /// Remove audit events older than this Unix millisecond timestamp.
+        #[arg(long)]
+        prune_audit_before_unix_ms: Option<i64>,
+        /// Keep only the newest N audit events after any timestamp pruning.
+        #[arg(long)]
+        retain_audit_events: Option<usize>,
     },
     /// Create an online SQLite backup of the memory database.
     Backup {
@@ -352,6 +358,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Maintenance {
             vacuum,
             repair_orphans,
+            prune_audit_before_unix_ms,
+            retain_audit_events,
         } => {
             let engine = MemoryEngine::open(&cli.db)
                 .with_context(|| format!("open {}", cli.db.display()))?;
@@ -360,6 +368,8 @@ async fn main() -> anyhow::Result<()> {
                 .maintenance_with_options(MaintenanceOptions {
                     vacuum,
                     repair_orphans,
+                    prune_audit_before_unix_ms,
+                    retain_latest_audit_events: retain_audit_events,
                 })?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }

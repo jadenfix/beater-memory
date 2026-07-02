@@ -34,6 +34,7 @@ The current implementation includes:
 - graph projection integrity checks and orphan repair for edges, citations, and
   cue index entries
 - guarded projection rebuild from the append-only ledger
+- explicit audit retention pruning by age or newest-row count
 - database identity checks that reject unrelated SQLite files instead of
   silently migrating them
 - service metrics, persisted audit events, fixed-window request limiting, and
@@ -107,6 +108,8 @@ cargo run -p beater-memory -- health
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --vacuum
 cargo run -p beater-memory -- maintenance --repair-orphans
+cargo run -p beater-memory -- maintenance --retain-audit-events 10000
+cargo run -p beater-memory -- maintenance --prune-audit-before-unix-ms 1782864000000
 cargo run -p beater-memory -- rebuild-projection --yes-clear-projections
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 cargo run -p beater-memory -- restore --path ./backups/memory.db --yes-replace-current-db
@@ -119,7 +122,10 @@ maintenance reports graph integrity before and after the pass, and only removes
 orphan projection rows when `--repair-orphans` or HTTP `repair_orphans: true` is
 set. Projection rebuild clears only derived memory nodes, edges, citations, cue
 indexes, and projection markers, then replays the append-only ledger; audit rows
-and ledger events remain intact.
+and ledger events remain intact. Audit retention is explicit: maintenance can
+drop rows older than a Unix millisecond cutoff and/or keep only the newest N
+audit rows. If both are set, age pruning runs first and newest-row retention is
+applied to the remaining audit trail.
 
 HTTP equivalents:
 
@@ -135,7 +141,7 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"repair_orphans":true}' \
+  -d '{"repair_orphans":true,"retain_latest_audit_events":10000}' \
   http://127.0.0.1:8765/v1/maintenance
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
@@ -158,8 +164,9 @@ The public API exports:
 - `SqliteMemoryStore`
 - `MemoryServerConfig`, `memory_router`, and `serve`
 - `StoreHealth`, `StoreStats`, `MaintenanceOptions`, `MaintenanceReport`,
-  `GraphIntegrityReport`, `GraphRepairReport`, `ProjectionResetReport`,
-  `BackupReport`, `RestoreReport`, `AuditRecord`, and `AuditEvent`
+  `GraphIntegrityReport`, `GraphRepairReport`, `AuditPruneReport`,
+  `ProjectionResetReport`, `BackupReport`, `RestoreReport`, `AuditRecord`, and
+  `AuditEvent`
 - `ServiceMetricsSnapshot`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`
