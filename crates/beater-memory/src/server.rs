@@ -1771,6 +1771,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_rejects_zero_token_budget_over_http() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let query = serde_json::json!({
+            "question": "anything",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "max_tokens": 0
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "bad_request");
+        assert!(error.error.message.contains("max_tokens"));
+    }
+
+    #[tokio::test]
     async fn metrics_and_audit_are_available_over_http() {
         let app = memory_router(test_config().with_bearer_token("secret"));
         let remember = serde_json::json!({
