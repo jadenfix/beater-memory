@@ -10,6 +10,7 @@ mod error;
 mod graph;
 mod imports;
 mod model;
+mod server;
 mod store;
 mod text;
 
@@ -23,6 +24,10 @@ pub use model::{
     ActivationWeights, BeliefRevisionOp, CitedSpan, Contradiction, DistilledMemory, Evidence,
     MemoryAnswer, MemoryEdgeKind, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier,
     StaleAssumption, blend_activation, budget_evidence, estimate_tokens,
+};
+pub use server::{
+    LiveResponse, MaintenanceHttpRequest, MemoryServerConfig, ProjectHttpRequest, QueryHttpRequest,
+    RememberHttpRequest, RememberHttpResponse, memory_router, serve,
 };
 pub use store::{
     LedgerEvent, MaintenanceReport, MemoryEdge, MemoryNode, SqliteMemoryStore, StoreHealth,
