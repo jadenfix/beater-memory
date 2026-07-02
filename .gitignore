@@ -1,3 +1,4 @@
 /target/
+.beater-memory/
 **/*.rs.bk
 .DS_Store
