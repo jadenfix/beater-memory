@@ -175,6 +175,7 @@ impl<D: Distiller> MemoryEngine<D> {
     }
 
     pub fn query(&self, query: &MemoryQuery) -> MemoryResult<MemoryAnswer> {
+        query.validate()?;
         answer_query(&self.store, query, self.activation_weights)
     }
 
@@ -404,6 +405,18 @@ mod tests {
         assert!(answer.answer.contains("DATABASE_URL"));
         assert!(!answer.evidence.is_empty());
         assert!(!answer.cited_spans.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn query_rejects_invalid_request_before_retrieval() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        let query = MemoryQuery::new("what changed?", MemoryScope::new("tenant", "project"))
+            .with_max_tokens(0);
+
+        let err = engine.query(&query).unwrap_err();
+
+        assert!(err.to_string().contains("max_tokens"));
         Ok(())
     }
 

@@ -2,6 +2,8 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{MemoryError, MemoryResult};
+
 /// Which memory substores a query is allowed to consult.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +247,18 @@ impl MemoryScope {
         self.as_of_unix_ms = Some(as_of_unix_ms);
         self
     }
+
+    pub fn validate(&self) -> MemoryResult<()> {
+        validate_required_identifier("tenant_id", &self.tenant_id)?;
+        validate_required_identifier("project_id", &self.project_id)?;
+        if let Some(environment_id) = self.environment_id.as_deref() {
+            validate_required_identifier("environment_id", environment_id)?;
+        }
+        if self.as_of_unix_ms.is_some_and(|as_of| as_of < 0) {
+            return Err(MemoryError::invalid("as_of_unix_ms must be non-negative"));
+        }
+        Ok(())
+    }
 }
 
 /// Answer-shaped memory request.
@@ -290,6 +304,38 @@ impl MemoryQuery {
     #[must_use]
     pub fn accepts_kind(&self, kind: MemoryNodeKind) -> bool {
         self.modes.iter().any(|mode| mode.accepts(kind))
+    }
+
+    pub fn validate(&self) -> MemoryResult<()> {
+        self.scope.validate()?;
+        validate_required_text("question", &self.question)?;
+        if self.max_tokens == 0 {
+            return Err(MemoryError::invalid("max_tokens must be greater than 0"));
+        }
+        if self.modes.is_empty() {
+            return Err(MemoryError::invalid("modes must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+fn validate_required_identifier(field: &str, value: &str) -> MemoryResult<()> {
+    if value.trim().is_empty() {
+        return Err(MemoryError::invalid(format!("{field} must not be empty")));
+    }
+    if value.trim() != value {
+        return Err(MemoryError::invalid(format!(
+            "{field} must not have leading or trailing whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_required_text(field: &str, value: &str) -> MemoryResult<()> {
+    if value.trim().is_empty() {
+        Err(MemoryError::invalid(format!("{field} must not be empty")))
+    } else {
+        Ok(())
     }
 }
 
@@ -484,6 +530,50 @@ mod tests {
         assert!(query.modes.contains(&MemoryMode::Semantic));
         assert!(query.modes.contains(&MemoryMode::Gotcha));
         assert!(!query.require_fresh);
+        query.validate().unwrap_or_else(|err| panic!("{err}"));
+    }
+
+    #[test]
+    fn scope_validation_rejects_malformed_identifiers() {
+        let err = MemoryScope::new(" tenant", "project")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("tenant_id"));
+
+        let err = MemoryScope::new("tenant", "").validate().unwrap_err();
+        assert!(err.to_string().contains("project_id"));
+
+        let err = MemoryScope::new("tenant", "project")
+            .with_environment(" ")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("environment_id"));
+
+        let err = MemoryScope::new("tenant", "project")
+            .as_of_unix_ms(-1)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("as_of_unix_ms"));
+    }
+
+    #[test]
+    fn query_validation_rejects_unusable_requests() {
+        let scope = MemoryScope::new("tenant", "project");
+
+        let err = MemoryQuery::new(" ", scope.clone()).validate().unwrap_err();
+        assert!(err.to_string().contains("question"));
+
+        let err = MemoryQuery::new("what changed?", scope.clone())
+            .with_max_tokens(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_tokens"));
+
+        let err = MemoryQuery::new("what changed?", scope)
+            .with_modes(Vec::new())
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("modes"));
     }
 
     #[test]

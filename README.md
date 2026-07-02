@@ -37,6 +37,8 @@ The current implementation includes:
   cue index entries
 - ledger validation that rejects malformed events before they enter the
   append-only log
+- query validation that rejects malformed scopes, empty questions, and unusable
+  token budgets before retrieval
 - guarded projection rebuild from the append-only ledger
 - explicit audit retention pruning by age or newest-row count
 - database identity checks that reject unrelated SQLite files instead of

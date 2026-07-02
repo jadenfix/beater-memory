@@ -43,6 +43,8 @@ edges are projections that can be rebuilt.
      deleted.
 
 4. **Read Path**
+   - Validate query scope, question text, token budget, and enabled memory modes
+     before retrieval begins.
    - Tier 0: lexical cue seeding through `cue_index`
    - Tier 1: LLM-free graph activation using personalized PageRank-style
      propagation, ACT-R-like base-level activation, edge weights, and freshness
