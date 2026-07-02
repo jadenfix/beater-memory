@@ -9,7 +9,7 @@ use crate::{
     text::{canonical_key, now_unix_ms, stable_id, terms},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const SQLITE_APPLICATION_ID: i64 = 0x424D_454D;
 
 /// An append-only observation imported from a journal, span store, or direct write.
@@ -146,6 +146,7 @@ pub struct StoreStats {
     pub nodes: i64,
     pub active_nodes: i64,
     pub edges: i64,
+    pub audit_events: i64,
 }
 
 /// Health snapshot suitable for CLI output and service health endpoints.
@@ -185,6 +186,30 @@ pub struct RestoreReport {
     pub schema_version: u32,
     pub integrity_ok: bool,
     pub stats: StoreStats,
+}
+
+/// A durable service audit event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: i64,
+    pub occurred_at_unix_ms: i64,
+    pub actor: String,
+    pub action: String,
+    pub outcome: String,
+    pub route: Option<String>,
+    pub status_code: Option<u16>,
+    pub detail: serde_json::Value,
+}
+
+/// Input for writing a durable service audit event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub actor: String,
+    pub action: String,
+    pub outcome: String,
+    pub route: Option<String>,
+    pub status_code: Option<u16>,
+    pub detail: serde_json::Value,
 }
 
 /// SQLite-backed local memory store.
@@ -319,7 +344,23 @@ impl SqliteMemoryStore {
             CREATE INDEX IF NOT EXISTS idx_cue_scope
                 ON cue_index(tenant_id, project_id, environment_id, term);
 
-            PRAGMA user_version = 1;
+            CREATE TABLE IF NOT EXISTS audit_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_unix_ms INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                route TEXT,
+                status_code INTEGER,
+                detail_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_audit_events_time
+                ON audit_events(occurred_at_unix_ms, id);
+            CREATE INDEX IF NOT EXISTS idx_audit_events_action
+                ON audit_events(action, outcome, occurred_at_unix_ms);
+
+            PRAGMA user_version = 2;
             ",
         )?;
         Ok(())
@@ -786,13 +827,50 @@ impl SqliteMemoryStore {
         let edges: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0))?;
+        let audit_events: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))?;
         Ok(StoreStats {
             ledger_events,
             pending_events,
             nodes,
             active_nodes,
             edges,
+            audit_events,
         })
+    }
+
+    pub fn append_audit(&self, record: &AuditRecord) -> MemoryResult<i64> {
+        self.conn.execute(
+            "
+            INSERT INTO audit_events(
+                occurred_at_unix_ms, actor, action, outcome, route, status_code, detail_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                now_unix_ms(),
+                record.actor,
+                record.action,
+                record.outcome,
+                record.route,
+                record.status_code,
+                serde_json::to_string(&record.detail)?,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn recent_audit_events(&self, limit: usize) -> MemoryResult<Vec<AuditEvent>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, occurred_at_unix_ms, actor, action, outcome, route, status_code, detail_json
+            FROM audit_events
+            ORDER BY occurred_at_unix_ms DESC, id DESC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], read_audit_event)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn schema_version(&self) -> MemoryResult<u32> {
@@ -1029,6 +1107,23 @@ fn read_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEdge> {
     })
 }
 
+fn read_audit_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
+    let detail_json: String = row.get(7)?;
+    let detail = serde_json::from_str(&detail_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(AuditEvent {
+        id: row.get(0)?,
+        occurred_at_unix_ms: row.get(1)?,
+        actor: row.get(2)?,
+        action: row.get(3)?,
+        outcome: row.get(4)?,
+        route: row.get(5)?,
+        status_code: row.get(6)?,
+        detail,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
@@ -1138,6 +1233,35 @@ mod tests {
         assert_eq!(report.stats.ledger_events, 1);
         assert_eq!(report.stats.nodes, 1);
         let _ = std::fs::remove_file(backup_path);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_events_are_durable_and_recent_first() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        store.append_audit(&AuditRecord {
+            actor: "bearer:test".to_string(),
+            action: "remember".to_string(),
+            outcome: "success".to_string(),
+            route: Some("/v1/remember".to_string()),
+            status_code: Some(200),
+            detail: serde_json::json!({"projected": true}),
+        })?;
+        store.append_audit(&AuditRecord {
+            actor: "bearer:test".to_string(),
+            action: "query".to_string(),
+            outcome: "failure".to_string(),
+            route: Some("/v1/query".to_string()),
+            status_code: Some(400),
+            detail: serde_json::json!({"code": "bad_request"}),
+        })?;
+
+        let events = store.recent_audit_events(10)?;
+
+        assert_eq!(store.stats()?.audit_events, 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, "query");
+        assert_eq!(events[0].detail["code"], "bad_request");
         Ok(())
     }
 

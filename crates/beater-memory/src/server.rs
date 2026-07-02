@@ -1,8 +1,13 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -13,12 +18,16 @@ use crate::{
     MemoryEngine, ProjectReport,
     error::{MemoryError, MemoryResult},
     model::{MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope},
-    store::{LedgerEvent, MaintenanceReport, StoreHealth, StoreStats},
+    store::{AuditEvent, AuditRecord, LedgerEvent, MaintenanceReport, StoreHealth, StoreStats},
+    text::{now_unix_ms, stable_id},
 };
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_PROJECT_LIMIT: usize = 10_000;
 const DEFAULT_MAX_QUERY_TOKENS: u32 = 8_000;
+const DEFAULT_MAX_AUDIT_LIMIT: usize = 500;
+const DEFAULT_MAX_REQUESTS_PER_MINUTE: u32 = 600;
+const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
 
 /// HTTP server configuration.
 #[derive(Clone, Debug)]
@@ -29,6 +38,8 @@ pub struct MemoryServerConfig {
     pub max_body_bytes: usize,
     pub max_project_limit: usize,
     pub max_query_tokens: u32,
+    pub max_audit_limit: usize,
+    pub max_requests_per_minute: u32,
 }
 
 impl MemoryServerConfig {
@@ -41,6 +52,8 @@ impl MemoryServerConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_project_limit: DEFAULT_MAX_PROJECT_LIMIT,
             max_query_tokens: DEFAULT_MAX_QUERY_TOKENS,
+            max_audit_limit: DEFAULT_MAX_AUDIT_LIMIT,
+            max_requests_per_minute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
         }
     }
 
@@ -62,11 +75,25 @@ impl MemoryServerConfig {
         self.max_query_tokens = max_query_tokens;
         self
     }
+
+    #[must_use]
+    pub fn with_audit_limit(mut self, max_audit_limit: usize) -> Self {
+        self.max_audit_limit = max_audit_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rate_limit(mut self, max_requests_per_minute: u32) -> Self {
+        self.max_requests_per_minute = max_requests_per_minute;
+        self
+    }
 }
 
 #[derive(Clone)]
 struct MemoryServerState {
     config: Arc<MemoryServerConfig>,
+    metrics: Arc<Mutex<ServiceMetricsSnapshot>>,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +137,75 @@ pub struct MaintenanceHttpRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditHttpQuery {
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuditHttpResponse {
+    pub events: Vec<AuditEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceMetricsSnapshot {
+    pub started_at_unix_ms: i64,
+    pub total_requests: u64,
+    pub authorized_requests: u64,
+    pub unauthorized_requests: u64,
+    pub rate_limited_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub live_requests: u64,
+    pub health_requests: u64,
+    pub stats_requests: u64,
+    pub remember_requests: u64,
+    pub project_requests: u64,
+    pub query_requests: u64,
+    pub maintenance_requests: u64,
+    pub metrics_requests: u64,
+    pub audit_requests: u64,
+}
+
+impl ServiceMetricsSnapshot {
+    fn new() -> Self {
+        Self {
+            started_at_unix_ms: now_unix_ms(),
+            total_requests: 0,
+            authorized_requests: 0,
+            unauthorized_requests: 0,
+            rate_limited_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            live_requests: 0,
+            health_requests: 0,
+            stats_requests: 0,
+            remember_requests: 0,
+            project_requests: 0,
+            query_requests: 0,
+            maintenance_requests: 0,
+            metrics_requests: 0,
+            audit_requests: 0,
+        }
+    }
+
+    fn record_started(&mut self, action: &str) {
+        self.total_requests += 1;
+        match action {
+            "livez" => self.live_requests += 1,
+            "health" => self.health_requests += 1,
+            "stats" => self.stats_requests += 1,
+            "remember" => self.remember_requests += 1,
+            "project" => self.project_requests += 1,
+            "query" => self.query_requests += 1,
+            "maintenance" => self.maintenance_requests += 1,
+            "metrics" => self.metrics_requests += 1,
+            "audit" => self.audit_requests += 1,
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ErrorBody {
     error: ErrorDetail,
 }
@@ -125,6 +221,7 @@ struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiError {
@@ -133,6 +230,16 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthorized",
             message: "missing or invalid bearer token".to_string(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn rate_limited(retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            message: format!("rate limit exceeded; retry after {retry_after_seconds} seconds"),
+            retry_after_seconds: Some(retry_after_seconds),
         }
     }
 
@@ -141,6 +248,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "bad_request",
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -149,6 +257,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 }
@@ -177,7 +286,88 @@ impl IntoResponse for ApiError {
                 header::HeaderValue::from_static("Bearer"),
             );
         }
+        if let Some(retry_after_seconds) = self.retry_after_seconds {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_str(&retry_after_seconds.to_string())
+                    .unwrap_or_else(|_| header::HeaderValue::from_static("60")),
+            );
+        }
         response
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RequestContext {
+    actor: String,
+    action: &'static str,
+    route: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct RateDecision {
+    allowed: bool,
+    retry_after_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RateWindow {
+    window_started_at_unix_ms: i64,
+    count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct RateLimiter {
+    max_requests: u32,
+    window_ms: i64,
+    windows: HashMap<String, RateWindow>,
+}
+
+impl RateLimiter {
+    fn new(max_requests: u32, window_ms: i64) -> Self {
+        Self {
+            max_requests,
+            window_ms,
+            windows: HashMap::new(),
+        }
+    }
+
+    fn check(&mut self, actor: &str, now_unix_ms: i64) -> RateDecision {
+        if self.max_requests == 0 {
+            return RateDecision {
+                allowed: true,
+                retry_after_seconds: 0,
+            };
+        }
+        if self.windows.len() > 4096 {
+            let oldest_live_window = now_unix_ms - (self.window_ms * 2);
+            self.windows
+                .retain(|_, window| window.window_started_at_unix_ms >= oldest_live_window);
+        }
+        let window = self
+            .windows
+            .entry(actor.to_string())
+            .or_insert_with(|| RateWindow {
+                window_started_at_unix_ms: now_unix_ms,
+                count: 0,
+            });
+        if now_unix_ms - window.window_started_at_unix_ms >= self.window_ms {
+            window.window_started_at_unix_ms = now_unix_ms;
+            window.count = 0;
+        }
+        if window.count >= self.max_requests {
+            let elapsed_ms = now_unix_ms - window.window_started_at_unix_ms;
+            let remaining_ms = (self.window_ms - elapsed_ms).max(1);
+            return RateDecision {
+                allowed: false,
+                retry_after_seconds: ((remaining_ms + 999) / 1000) as u64,
+            };
+        }
+        window.count += 1;
+        RateDecision {
+            allowed: true,
+            retry_after_seconds: 0,
+        }
     }
 }
 
@@ -185,6 +375,11 @@ impl IntoResponse for ApiError {
 pub fn memory_router(config: MemoryServerConfig) -> Router {
     let max_body_bytes = config.max_body_bytes;
     let state = MemoryServerState {
+        metrics: Arc::new(Mutex::new(ServiceMetricsSnapshot::new())),
+        rate_limiter: Arc::new(Mutex::new(RateLimiter::new(
+            config.max_requests_per_minute,
+            RATE_LIMIT_WINDOW_MS,
+        ))),
         config: Arc::new(config),
     };
 
@@ -192,6 +387,8 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
         .route("/livez", get(livez))
         .route("/v1/health", get(health))
         .route("/v1/stats", get(stats))
+        .route("/v1/metrics", get(metrics))
+        .route("/v1/audit", get(audit))
         .route("/v1/remember", post(remember))
         .route("/v1/project", post(project))
         .route("/v1/query", post(query))
@@ -213,7 +410,9 @@ pub async fn serve(config: MemoryServerConfig) -> MemoryResult<()> {
     Ok(())
 }
 
-async fn livez() -> Json<LiveResponse> {
+async fn livez(State(state): State<MemoryServerState>) -> Json<LiveResponse> {
+    record_request_started(&state, "livez");
+    record_request_success(&state);
     Json(LiveResponse {
         status: "ok".to_string(),
     })
@@ -223,16 +422,55 @@ async fn health(
     State(state): State<MemoryServerState>,
     headers: HeaderMap,
 ) -> Result<Json<StoreHealth>, ApiError> {
-    authorize(&state.config, &headers)?;
-    with_engine(state, |engine| engine.store().health()).await
+    let ctx = begin_request(&state, &headers, "health", "/v1/health").await?;
+    let result = with_engine(state.clone(), |engine| engine.store().health()).await;
+    finish_request(state, ctx, result, serde_json::json!({})).await
 }
 
 async fn stats(
     State(state): State<MemoryServerState>,
     headers: HeaderMap,
 ) -> Result<Json<StoreStats>, ApiError> {
-    authorize(&state.config, &headers)?;
-    with_engine(state, |engine| engine.store().stats()).await
+    let ctx = begin_request(&state, &headers, "stats", "/v1/stats").await?;
+    let result = with_engine(state.clone(), |engine| engine.store().stats()).await;
+    finish_request(state, ctx, result, serde_json::json!({})).await
+}
+
+async fn metrics(
+    State(state): State<MemoryServerState>,
+    headers: HeaderMap,
+) -> Result<Json<ServiceMetricsSnapshot>, ApiError> {
+    let ctx = begin_request(&state, &headers, "metrics", "/v1/metrics").await?;
+    finish_success(&state, &ctx, StatusCode::OK, serde_json::json!({})).await;
+    Ok(Json(metrics_snapshot(&state)))
+}
+
+async fn audit(
+    State(state): State<MemoryServerState>,
+    headers: HeaderMap,
+    Query(request): Query<AuditHttpQuery>,
+) -> Result<Json<AuditHttpResponse>, ApiError> {
+    let ctx = begin_request(&state, &headers, "audit", "/v1/audit").await?;
+    let limit = request.limit.unwrap_or(100);
+    if limit > state.config.max_audit_limit {
+        return fail_request(
+            &state,
+            &ctx,
+            ApiError::bad_request(format!(
+                "audit limit {limit} exceeds configured max {}",
+                state.config.max_audit_limit
+            )),
+        )
+        .await;
+    }
+    let result = with_engine(state.clone(), move |engine| {
+        engine
+            .store()
+            .recent_audit_events(limit)
+            .map(|events| AuditHttpResponse { events })
+    })
+    .await;
+    finish_request(state, ctx, result, serde_json::json!({ "limit": limit })).await
 }
 
 async fn remember(
@@ -240,12 +478,20 @@ async fn remember(
     headers: HeaderMap,
     Json(request): Json<RememberHttpRequest>,
 ) -> Result<Json<RememberHttpResponse>, ApiError> {
-    authorize(&state.config, &headers)?;
-    validate_nonempty("tenant_id", &request.tenant_id)?;
-    validate_nonempty("project_id", &request.project_id)?;
-    validate_nonempty("text", &request.text)?;
+    let ctx = begin_request(&state, &headers, "remember", "/v1/remember").await?;
+    if let Err(err) = validate_nonempty("tenant_id", &request.tenant_id) {
+        return fail_request(&state, &ctx, err).await;
+    }
+    if let Err(err) = validate_nonempty("project_id", &request.project_id) {
+        return fail_request(&state, &ctx, err).await;
+    }
+    if let Err(err) = validate_nonempty("text", &request.text) {
+        return fail_request(&state, &ctx, err).await;
+    }
 
-    with_engine(state, move |engine| {
+    let tenant_id = request.tenant_id.clone();
+    let project_id = request.project_id.clone();
+    let result = with_engine(state.clone(), move |engine| {
         let mut event = LedgerEvent::direct_memory_write(
             &request.tenant_id,
             &request.project_id,
@@ -261,6 +507,16 @@ async fn remember(
         };
         Ok(RememberHttpResponse { ingested, project })
     })
+    .await;
+    finish_request(
+        state,
+        ctx,
+        result,
+        serde_json::json!({
+            "tenant_id": tenant_id,
+            "project_id": project_id
+        }),
+    )
     .await
 }
 
@@ -269,15 +525,21 @@ async fn project(
     headers: HeaderMap,
     Json(request): Json<ProjectHttpRequest>,
 ) -> Result<Json<ProjectReport>, ApiError> {
-    authorize(&state.config, &headers)?;
+    let ctx = begin_request(&state, &headers, "project", "/v1/project").await?;
     let limit = request.limit.unwrap_or(1000);
     if limit > state.config.max_project_limit {
-        return Err(ApiError::bad_request(format!(
-            "project limit {limit} exceeds configured max {}",
-            state.config.max_project_limit
-        )));
+        return fail_request(
+            &state,
+            &ctx,
+            ApiError::bad_request(format!(
+                "project limit {limit} exceeds configured max {}",
+                state.config.max_project_limit
+            )),
+        )
+        .await;
     }
-    with_engine(state, move |engine| engine.project_pending(limit)).await
+    let result = with_engine(state.clone(), move |engine| engine.project_pending(limit)).await;
+    finish_request(state, ctx, result, serde_json::json!({ "limit": limit })).await
 }
 
 async fn query(
@@ -285,18 +547,31 @@ async fn query(
     headers: HeaderMap,
     Json(request): Json<QueryHttpRequest>,
 ) -> Result<Json<MemoryAnswer>, ApiError> {
-    authorize(&state.config, &headers)?;
-    validate_nonempty("question", &request.question)?;
-    validate_nonempty("tenant_id", &request.scope.tenant_id)?;
-    validate_nonempty("project_id", &request.scope.project_id)?;
+    let ctx = begin_request(&state, &headers, "query", "/v1/query").await?;
+    if let Err(err) = validate_nonempty("question", &request.question) {
+        return fail_request(&state, &ctx, err).await;
+    }
+    if let Err(err) = validate_nonempty("tenant_id", &request.scope.tenant_id) {
+        return fail_request(&state, &ctx, err).await;
+    }
+    if let Err(err) = validate_nonempty("project_id", &request.scope.project_id) {
+        return fail_request(&state, &ctx, err).await;
+    }
 
     let max_tokens = request.max_tokens.unwrap_or(1_200);
     if max_tokens > state.config.max_query_tokens {
-        return Err(ApiError::bad_request(format!(
-            "query max_tokens {max_tokens} exceeds configured max {}",
-            state.config.max_query_tokens
-        )));
+        return fail_request(
+            &state,
+            &ctx,
+            ApiError::bad_request(format!(
+                "query max_tokens {max_tokens} exceeds configured max {}",
+                state.config.max_query_tokens
+            )),
+        )
+        .await;
     }
+    let tenant_id = request.scope.tenant_id.clone();
+    let project_id = request.scope.project_id.clone();
     let mut query = MemoryQuery::new(request.question, request.scope).with_max_tokens(max_tokens);
     if request.require_fresh.unwrap_or(false) {
         query = query.requiring_fresh();
@@ -304,7 +579,18 @@ async fn query(
     if let Some(modes) = request.modes {
         query = query.with_modes(modes);
     }
-    with_engine(state, move |engine| engine.query(&query)).await
+    let result = with_engine(state.clone(), move |engine| engine.query(&query)).await;
+    finish_request(
+        state,
+        ctx,
+        result,
+        serde_json::json!({
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "max_tokens": max_tokens
+        }),
+    )
+    .await
 }
 
 async fn maintenance(
@@ -312,11 +598,13 @@ async fn maintenance(
     headers: HeaderMap,
     Json(request): Json<MaintenanceHttpRequest>,
 ) -> Result<Json<MaintenanceReport>, ApiError> {
-    authorize(&state.config, &headers)?;
-    with_engine(state, move |engine| {
-        engine.store().maintenance(request.vacuum.unwrap_or(false))
+    let ctx = begin_request(&state, &headers, "maintenance", "/v1/maintenance").await?;
+    let vacuum = request.vacuum.unwrap_or(false);
+    let result = with_engine(state.clone(), move |engine| {
+        engine.store().maintenance(vacuum)
     })
-    .await
+    .await;
+    finish_request(state, ctx, result, serde_json::json!({ "vacuum": vacuum })).await
 }
 
 async fn with_engine<T>(
@@ -336,9 +624,229 @@ where
     result.map(Json).map_err(Into::into)
 }
 
-fn authorize(config: &MemoryServerConfig, headers: &HeaderMap) -> Result<(), ApiError> {
+async fn begin_request(
+    state: &MemoryServerState,
+    headers: &HeaderMap,
+    action: &'static str,
+    route: &'static str,
+) -> Result<RequestContext, ApiError> {
+    record_request_started(state, action);
+    match authorize(&state.config, headers) {
+        Ok(actor) => {
+            record_request_authorized(state);
+            let ctx = RequestContext {
+                actor,
+                action,
+                route,
+            };
+            if let Err(err) = check_rate_limit(state, &ctx.actor) {
+                record_request_rejected(state, false, true);
+                append_audit_event(
+                    state,
+                    AuditRecord {
+                        actor: ctx.actor.clone(),
+                        action: action.to_string(),
+                        outcome: "rate_limited".to_string(),
+                        route: Some(route.to_string()),
+                        status_code: Some(err.status.as_u16()),
+                        detail: error_detail(&err),
+                    },
+                )
+                .await;
+                return Err(err);
+            }
+            Ok(ctx)
+        }
+        Err(err) => {
+            let ctx = RequestContext {
+                actor: "unauthenticated".to_string(),
+                action,
+                route,
+            };
+            if let Err(rate_limit_err) = check_rate_limit(state, &ctx.actor) {
+                record_request_rejected(state, true, true);
+                append_audit_event(
+                    state,
+                    AuditRecord {
+                        actor: ctx.actor,
+                        action: action.to_string(),
+                        outcome: "rate_limited".to_string(),
+                        route: Some(route.to_string()),
+                        status_code: Some(rate_limit_err.status.as_u16()),
+                        detail: error_detail(&rate_limit_err),
+                    },
+                )
+                .await;
+                return Err(rate_limit_err);
+            }
+            record_request_rejected(state, true, false);
+            append_audit_event(
+                state,
+                AuditRecord {
+                    actor: ctx.actor,
+                    action: action.to_string(),
+                    outcome: "denied".to_string(),
+                    route: Some(route.to_string()),
+                    status_code: Some(err.status.as_u16()),
+                    detail: error_detail(&err),
+                },
+            )
+            .await;
+            Err(err)
+        }
+    }
+}
+
+async fn finish_request<T>(
+    state: MemoryServerState,
+    ctx: RequestContext,
+    result: Result<Json<T>, ApiError>,
+    success_detail: serde_json::Value,
+) -> Result<Json<T>, ApiError> {
+    match result {
+        Ok(response) => {
+            finish_success(&state, &ctx, StatusCode::OK, success_detail).await;
+            Ok(response)
+        }
+        Err(err) => fail_request(&state, &ctx, err).await,
+    }
+}
+
+async fn fail_request<T>(
+    state: &MemoryServerState,
+    ctx: &RequestContext,
+    err: ApiError,
+) -> Result<T, ApiError> {
+    finish_failure(state, ctx, &err).await;
+    Err(err)
+}
+
+async fn finish_success(
+    state: &MemoryServerState,
+    ctx: &RequestContext,
+    status: StatusCode,
+    detail: serde_json::Value,
+) {
+    record_request_success(state);
+    append_audit_event(
+        state,
+        AuditRecord {
+            actor: ctx.actor.clone(),
+            action: ctx.action.to_string(),
+            outcome: "success".to_string(),
+            route: Some(ctx.route.to_string()),
+            status_code: Some(status.as_u16()),
+            detail,
+        },
+    )
+    .await;
+}
+
+async fn finish_failure(state: &MemoryServerState, ctx: &RequestContext, err: &ApiError) {
+    record_request_failure(state);
+    append_audit_event(
+        state,
+        AuditRecord {
+            actor: ctx.actor.clone(),
+            action: ctx.action.to_string(),
+            outcome: "failure".to_string(),
+            route: Some(ctx.route.to_string()),
+            status_code: Some(err.status.as_u16()),
+            detail: error_detail(err),
+        },
+    )
+    .await;
+}
+
+async fn append_audit_event(state: &MemoryServerState, record: AuditRecord) {
+    let db_path = state.config.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let engine = MemoryEngine::open(db_path)?;
+        engine.store().append_audit(&record)?;
+        Ok::<_, MemoryError>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("failed to write audit event: {err}"),
+        Err(err) => eprintln!("failed to join audit task: {err}"),
+    }
+}
+
+fn check_rate_limit(state: &MemoryServerState, actor: &str) -> Result<(), ApiError> {
+    let mut limiter = state
+        .rate_limiter
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let decision = limiter.check(actor, now_unix_ms());
+    if decision.allowed {
+        Ok(())
+    } else {
+        Err(ApiError::rate_limited(decision.retry_after_seconds))
+    }
+}
+
+fn metrics_snapshot(state: &MemoryServerState) -> ServiceMetricsSnapshot {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+fn record_request_started(state: &MemoryServerState, action: &str) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .record_started(action);
+}
+
+fn record_request_authorized(state: &MemoryServerState) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .authorized_requests += 1;
+}
+
+fn record_request_success(state: &MemoryServerState) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .successful_requests += 1;
+}
+
+fn record_request_failure(state: &MemoryServerState) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .failed_requests += 1;
+}
+
+fn record_request_rejected(state: &MemoryServerState, unauthorized: bool, rate_limited: bool) {
+    let mut metrics = state.metrics.lock().unwrap_or_else(|err| err.into_inner());
+    metrics.failed_requests += 1;
+    if unauthorized {
+        metrics.unauthorized_requests += 1;
+    }
+    if rate_limited {
+        metrics.rate_limited_requests += 1;
+    }
+}
+
+fn error_detail(err: &ApiError) -> serde_json::Value {
+    serde_json::json!({
+        "code": err.code,
+        "message": err.message
+    })
+}
+
+fn authorize(config: &MemoryServerConfig, headers: &HeaderMap) -> Result<String, ApiError> {
     let Some(expected) = config.bearer_token.as_deref() else {
-        return Ok(());
+        return Ok("anonymous".to_string());
     };
     let Some(value) = headers
         .get(header::AUTHORIZATION)
@@ -350,7 +858,7 @@ fn authorize(config: &MemoryServerConfig, headers: &HeaderMap) -> Result<(), Api
         return Err(ApiError::unauthorized());
     };
     if constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
-        Ok(())
+        Ok(stable_id("bearer", &[actual]))
     } else {
         Err(ApiError::unauthorized())
     }
@@ -462,6 +970,75 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn metrics_and_audit_are_available_over_http() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let remember = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "kind": "fact",
+            "text": "The public health route is /livez."
+        });
+
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/remember", remember))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/v1/metrics"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let metrics: ServiceMetricsSnapshot =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(metrics.remember_requests, 1);
+        assert_eq!(metrics.metrics_requests, 1);
+        assert_eq!(metrics.successful_requests, 2);
+
+        let response = app
+            .oneshot(get_request("/v1/audit?limit=10"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let audit: AuditHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(audit.events.iter().any(|event| {
+            event.action == "remember"
+                && event.outcome == "success"
+                && event.status_code == Some(200)
+        }));
+    }
+
+    #[tokio::test]
+    async fn per_actor_rate_limit_is_enforced() {
+        let app = memory_router(test_config().with_bearer_token("secret").with_rate_limit(1));
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/v1/stats"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get_request("/v1/stats"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
     fn json_request(path: &str, body: serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -469,6 +1046,15 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearer secret")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    fn get_request(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
             .unwrap_or_else(|err| panic!("{err}"))
     }
 

@@ -103,6 +103,11 @@ enum Command {
         max_project_limit: usize,
         #[arg(long, default_value_t = 8_000)]
         max_query_tokens: u32,
+        #[arg(long, default_value_t = 500)]
+        max_audit_limit: usize,
+        /// Maximum authenticated `/v1/*` requests per actor per minute. Set 0 to disable.
+        #[arg(long, default_value_t = 600)]
+        max_requests_per_minute: u32,
     },
     /// Query memory and return an answer-shaped context bundle.
     Query {
@@ -334,6 +339,8 @@ async fn main() -> anyhow::Result<()> {
             max_body_bytes,
             max_project_limit,
             max_query_tokens,
+            max_audit_limit,
+            max_requests_per_minute,
         } => {
             let token = bearer_token
                 .or_else(|| std::env::var(&bearer_token_env).ok())
@@ -343,11 +350,10 @@ async fn main() -> anyhow::Result<()> {
                     "refusing to start without auth; set --bearer-token, set {bearer_token_env}, or pass --allow-no-auth"
                 );
             }
-            let mut config = MemoryServerConfig::new(&cli.db, bind).with_limits(
-                max_body_bytes,
-                max_project_limit,
-                max_query_tokens,
-            );
+            let mut config = MemoryServerConfig::new(&cli.db, bind)
+                .with_limits(max_body_bytes, max_project_limit, max_query_tokens)
+                .with_audit_limit(max_audit_limit)
+                .with_rate_limit(max_requests_per_minute);
             if let Some(token) = token {
                 config = config.with_bearer_token(token);
             }
