@@ -13,6 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::{
     MemoryEngine, ProjectReport,
@@ -30,6 +31,7 @@ const DEFAULT_MAX_PROJECT_LIMIT: usize = 10_000;
 const DEFAULT_MAX_QUERY_TOKENS: u32 = 8_000;
 const DEFAULT_MAX_AUDIT_LIMIT: usize = 500;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: u32 = 600;
+const DEFAULT_MAX_CONCURRENT_DB_TASKS: usize = 32;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
 
 /// HTTP server configuration.
@@ -43,6 +45,7 @@ pub struct MemoryServerConfig {
     pub max_query_tokens: u32,
     pub max_audit_limit: usize,
     pub max_requests_per_minute: u32,
+    pub max_concurrent_db_tasks: usize,
 }
 
 impl MemoryServerConfig {
@@ -57,6 +60,7 @@ impl MemoryServerConfig {
             max_query_tokens: DEFAULT_MAX_QUERY_TOKENS,
             max_audit_limit: DEFAULT_MAX_AUDIT_LIMIT,
             max_requests_per_minute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
+            max_concurrent_db_tasks: DEFAULT_MAX_CONCURRENT_DB_TASKS,
         }
     }
 
@@ -90,6 +94,12 @@ impl MemoryServerConfig {
         self.max_requests_per_minute = max_requests_per_minute;
         self
     }
+
+    #[must_use]
+    pub fn with_db_concurrency_limit(mut self, max_concurrent_db_tasks: usize) -> Self {
+        self.max_concurrent_db_tasks = max_concurrent_db_tasks;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -97,6 +107,7 @@ struct MemoryServerState {
     config: Arc<MemoryServerConfig>,
     metrics: Arc<Mutex<ServiceMetricsSnapshot>>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    db_permits: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +168,7 @@ pub struct ServiceMetricsSnapshot {
     pub authorized_requests: u64,
     pub unauthorized_requests: u64,
     pub rate_limited_requests: u64,
+    pub db_busy_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
     pub live_requests: u64,
@@ -178,6 +190,7 @@ impl ServiceMetricsSnapshot {
             authorized_requests: 0,
             unauthorized_requests: 0,
             rate_limited_requests: 0,
+            db_busy_requests: 0,
             successful_requests: 0,
             failed_requests: 0,
             live_requests: 0,
@@ -244,6 +257,15 @@ impl ApiError {
             code: "rate_limited",
             message: format!("rate limit exceeded; retry after {retry_after_seconds} seconds"),
             retry_after_seconds: Some(retry_after_seconds),
+        }
+    }
+
+    fn service_busy() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "service_busy",
+            message: "database work queue is full; retry later".to_string(),
+            retry_after_seconds: Some(1),
         }
     }
 
@@ -384,6 +406,7 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
             config.max_requests_per_minute,
             RATE_LIMIT_WINDOW_MS,
         ))),
+        db_permits: Arc::new(Semaphore::new(config.max_concurrent_db_tasks)),
         config: Arc::new(config),
     };
 
@@ -632,7 +655,15 @@ where
     T: Serialize + Send + 'static,
 {
     let db_path = state.config.db_path.clone();
+    let permit = match state.db_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            record_db_busy(&state);
+            return Err(ApiError::service_busy());
+        }
+    };
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let engine = MemoryEngine::open(db_path)?;
         f(engine)
     })
@@ -777,7 +808,15 @@ async fn finish_failure(state: &MemoryServerState, ctx: &RequestContext, err: &A
 
 async fn append_audit_event(state: &MemoryServerState, record: AuditRecord) {
     let db_path = state.config.db_path.clone();
+    let permit = match state.db_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            eprintln!("skipping audit event because database work queue is full");
+            return;
+        }
+    };
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let engine = MemoryEngine::open(db_path)?;
         engine.store().append_audit(&record)?;
         Ok::<_, MemoryError>(())
@@ -852,6 +891,14 @@ fn record_request_rejected(state: &MemoryServerState, unauthorized: bool, rate_l
     if rate_limited {
         metrics.rate_limited_requests += 1;
     }
+}
+
+fn record_db_busy(state: &MemoryServerState) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .db_busy_requests += 1;
 }
 
 fn error_detail(err: &ApiError) -> serde_json::Value {
@@ -1054,6 +1101,38 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn db_concurrency_limit_returns_service_busy() {
+        let app = memory_router(
+            test_config()
+                .with_bearer_token("secret")
+                .with_db_concurrency_limit(0),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/v1/stats"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+
+        let response = app
+            .oneshot(get_request("/v1/metrics"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let metrics: ServiceMetricsSnapshot =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(metrics.db_busy_requests, 1);
+        assert_eq!(metrics.failed_requests, 1);
+        assert_eq!(metrics.successful_requests, 1);
     }
 
     #[tokio::test]

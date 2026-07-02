@@ -35,7 +35,8 @@ The current implementation includes:
   cue index entries
 - database identity checks that reject unrelated SQLite files instead of
   silently migrating them
-- service metrics, persisted audit events, and fixed-window request limiting
+- service metrics, persisted audit events, fixed-window request limiting, and
+  bounded DB work concurrency
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
 
@@ -66,7 +67,11 @@ The server refuses to start without a bearer token unless `--allow-no-auth` is
 passed. All `/v1/*` routes require `Authorization: Bearer <token>`; `/livez` is
 the unauthenticated liveness endpoint. The service defaults to 600 authenticated
 requests per actor per minute; use `--max-requests-per-minute 0` to disable the
-fixed-window limiter for a trusted local deployment.
+fixed-window limiter for a trusted local deployment. DB-backed HTTP requests are
+also capped at 32 concurrent blocking SQLite tasks by default; use
+`--max-concurrent-db-tasks` to tune this. When saturated, DB-backed routes return
+`503 service_busy` with `Retry-After`, while `/livez` and `/v1/metrics` remain
+available.
 
 Import a `beater.js` journal:
 

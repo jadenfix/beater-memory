@@ -110,6 +110,9 @@ enum Command {
         /// Maximum authenticated `/v1/*` requests per actor per minute. Set 0 to disable.
         #[arg(long, default_value_t = 600)]
         max_requests_per_minute: u32,
+        /// Maximum concurrent blocking SQLite tasks. Set 0 to reject DB-backed requests.
+        #[arg(long, default_value_t = 32)]
+        max_concurrent_db_tasks: usize,
     },
     /// Query memory and return an answer-shaped context bundle.
     Query {
@@ -363,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
             max_query_tokens,
             max_audit_limit,
             max_requests_per_minute,
+            max_concurrent_db_tasks,
         } => {
             let token = bearer_token
                 .or_else(|| std::env::var(&bearer_token_env).ok())
@@ -375,7 +379,8 @@ async fn main() -> anyhow::Result<()> {
             let mut config = MemoryServerConfig::new(&cli.db, bind)
                 .with_limits(max_body_bytes, max_project_limit, max_query_tokens)
                 .with_audit_limit(max_audit_limit)
-                .with_rate_limit(max_requests_per_minute);
+                .with_rate_limit(max_requests_per_minute)
+                .with_db_concurrency_limit(max_concurrent_db_tasks);
             if let Some(token) = token {
                 config = config.with_bearer_token(token);
             }
