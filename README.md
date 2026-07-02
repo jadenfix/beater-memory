@@ -31,6 +31,8 @@ The current implementation includes:
 - authenticated HTTP API for service deployments
 - production operations for schema/integrity health checks and SQLite
   maintenance, backup, and restore
+- graph projection integrity checks and orphan repair for edges, citations, and
+  cue index entries
 - database identity checks that reject unrelated SQLite files instead of
   silently migrating them
 - service metrics, persisted audit events, and fixed-window request limiting
@@ -96,13 +98,17 @@ schema migration runs.
 cargo run -p beater-memory -- health
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --vacuum
+cargo run -p beater-memory -- maintenance --repair-orphans
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 cargo run -p beater-memory -- restore --path ./backups/memory.db --yes-replace-current-db
 ```
 
 Backups use SQLite's online backup API and refuse to overwrite an existing
 backup path. Restore replaces the active database and requires the explicit
-`--yes-replace-current-db` flag.
+`--yes-replace-current-db` flag. Health reports graph projection orphan counts;
+maintenance reports graph integrity before and after the pass, and only removes
+orphan projection rows when `--repair-orphans` or HTTP `repair_orphans: true` is
+set.
 
 HTTP equivalents:
 
@@ -115,6 +121,11 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   'http://127.0.0.1:8765/v1/audit?limit=50'
+
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"repair_orphans":true}' \
+  http://127.0.0.1:8765/v1/maintenance
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   -H "Content-Type: application/json" \
@@ -134,8 +145,9 @@ The public API exports:
 - `MemoryEngine`
 - `SqliteMemoryStore`
 - `MemoryServerConfig`, `memory_router`, and `serve`
-- `StoreHealth`, `StoreStats`, `MaintenanceReport`, `BackupReport`,
-  `RestoreReport`, `AuditRecord`, and `AuditEvent`
+- `StoreHealth`, `StoreStats`, `MaintenanceOptions`, `MaintenanceReport`,
+  `GraphIntegrityReport`, `GraphRepairReport`, `BackupReport`, `RestoreReport`,
+  `AuditRecord`, and `AuditEvent`
 - `ServiceMetricsSnapshot`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`

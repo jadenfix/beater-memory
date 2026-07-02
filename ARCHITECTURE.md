@@ -92,7 +92,11 @@ Production safeguards:
 - projection rechecks `projected_at_unix_ms IS NULL` inside the transaction so
   concurrent workers cannot double-count a stale pending row
 - `health` runs schema, integrity, foreign-key, and count checks
+- `health` also reports graph projection orphan counts for edges, citations,
+  and cue index rows because the current projection tables are not SQLite-FK
+  constrained
 - `maintenance` runs SQLite optimize and WAL checkpointing, with optional vacuum
+  and explicit orphan repair
 - `backup` uses SQLite's online backup API and refuses to overwrite an existing
   backup path
 - `restore` replaces the active database only behind an explicit confirmation
@@ -110,6 +114,7 @@ cargo run -p beater-memory -- query --tenant local --project demo \
   "How do I fix checkout database failures?"
 cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance
+cargo run -p beater-memory -- maintenance --repair-orphans
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
 ```
