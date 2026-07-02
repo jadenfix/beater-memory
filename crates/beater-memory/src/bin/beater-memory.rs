@@ -420,7 +420,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let token = bearer_token
                 .or_else(|| std::env::var(&bearer_token_env).ok())
-                .filter(|token| !token.trim().is_empty());
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty());
             if token.is_none() && !allow_no_auth {
                 anyhow::bail!(
                     "refusing to start without auth; set --bearer-token, set {bearer_token_env}, or pass --allow-no-auth"

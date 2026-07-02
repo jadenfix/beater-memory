@@ -69,11 +69,14 @@ cargo run -p beater-memory -- serve --bind 127.0.0.1:8765
 ```
 
 The server refuses to start without a bearer token unless `--allow-no-auth` is
-passed. It drains with Axum graceful shutdown on Ctrl-C and on SIGTERM for Unix
-process managers. All `/v1/*` routes require `Authorization: Bearer <token>`;
-`/livez` is the unauthenticated liveness endpoint, and `/readyz` is the
-unauthenticated readiness endpoint for DB-backed traffic. The service defaults
-to 600 authenticated requests per actor per minute; use
+passed, trims configured bearer tokens, and rejects blank tokens. Public request
+limits for body size, projection batch size, query token budget, and audit page
+size must be greater than zero. It drains with Axum graceful shutdown on Ctrl-C
+and on SIGTERM for Unix process managers. All `/v1/*` routes require
+`Authorization: Bearer <token>`; `/livez` is the unauthenticated liveness
+endpoint, and `/readyz` is the unauthenticated readiness endpoint for DB-backed
+traffic. The service defaults to 600 authenticated requests per actor per
+minute; use
 `--max-requests-per-minute 0` to disable the fixed-window limiter for a trusted
 local deployment. Every response includes `x-request-id`; client-supplied valid
 request IDs are echoed, and generated IDs are written into durable audit detail.
@@ -181,7 +184,8 @@ The public API exports:
 - `MemoryEngine`
 - `ProjectReport` and `ProjectionRebuildReport`
 - `SqliteMemoryStore`
-- `MemoryServerConfig`, `memory_router`, `serve`, and `serve_with_shutdown`
+- `MemoryServerConfig`, `try_memory_router`, `memory_router`, `serve`, and
+  `serve_with_shutdown`
 - `StoreHealth`, `StoreStats`, `MaintenanceOptions`, `MaintenanceReport`,
   `GraphIntegrityReport`, `GraphRepairReport`, `AuditPruneReport`,
   `ProjectionResetReport`, `BackupReport`, `RestoreReport`, `AuditRecord`, and
