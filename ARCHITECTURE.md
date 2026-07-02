@@ -104,6 +104,9 @@ Production safeguards:
   existing SQLite files must already have that identity before migration runs
 - `PRAGMA user_version` records the supported schema version
 - each ledger event is projected inside `BEGIN IMMEDIATE ... COMMIT`
+- `beater.js` and canonical JSONL imports append inside one immediate
+  transaction, so malformed rows abort the batch with row context instead of
+  leaving a partial import behind
 - projection rechecks `projected_at_unix_ms IS NULL` inside the transaction so
   concurrent workers cannot double-count a stale pending row
 - direct writes can apply an idempotency key to stabilize the ledger
