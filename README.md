@@ -34,6 +34,8 @@ The current implementation includes:
   maintenance, backup, and restore
 - graph projection integrity checks and orphan repair for edges, citations, and
   cue index entries
+- ledger validation that rejects malformed events before they enter the
+  append-only log
 - guarded projection rebuild from the append-only ledger
 - explicit audit retention pruning by age or newest-row count
 - database identity checks that reject unrelated SQLite files instead of

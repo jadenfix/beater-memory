@@ -22,6 +22,9 @@ edges are projections that can be rebuilt.
    - Table: `ledger_events`
    - Contract: append-only observations with tenant/project/environment scope,
      trace/span/seq provenance, payload JSON, observed time, and projection time.
+   - Validation: every append validates required identifiers, non-empty memory
+     text, positive sequence numbers, and non-negative event timestamps before
+     the row can enter the ledger.
    - Hot path: no model call is required to record an event.
 
 2. **Distiller**
