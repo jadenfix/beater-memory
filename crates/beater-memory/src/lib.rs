@@ -24,4 +24,7 @@ pub use model::{
     MemoryAnswer, MemoryEdgeKind, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier,
     StaleAssumption, blend_activation, budget_evidence, estimate_tokens,
 };
-pub use store::{LedgerEvent, MemoryEdge, MemoryNode, SqliteMemoryStore};
+pub use store::{
+    LedgerEvent, MaintenanceReport, MemoryEdge, MemoryNode, SqliteMemoryStore, StoreHealth,
+    StoreStats,
+};

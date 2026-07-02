@@ -66,6 +66,17 @@ The default database is SQLite. Tables are intentionally boring:
 Projection is idempotent for repeated imports because ledger events are keyed by
 `tenant_id + project_id + trace_id + span_id + seq`.
 
+Production safeguards:
+
+- every connection enables `foreign_keys`, `busy_timeout`, WAL mode, and
+  `synchronous=NORMAL`
+- `PRAGMA user_version` records the supported schema version
+- each ledger event is projected inside `BEGIN IMMEDIATE ... COMMIT`
+- projection rechecks `projected_at_unix_ms IS NULL` inside the transaction so
+  concurrent workers cannot double-count a stale pending row
+- `health` runs schema, integrity, foreign-key, and count checks
+- `maintenance` runs SQLite optimize and WAL checkpointing, with optional vacuum
+
 ## Commands
 
 ```bash
@@ -74,6 +85,8 @@ cargo run -p beater-memory -- remember --tenant local --project demo --kind gotc
   "Checkout fails when DATABASE_URL is missing. Fix by setting DATABASE_URL."
 cargo run -p beater-memory -- query --tenant local --project demo \
   "How do I fix checkout database failures?"
+cargo run -p beater-memory -- health --json
+cargo run -p beater-memory -- maintenance
 ```
 
 Import sibling repo data:
@@ -94,6 +107,7 @@ Every feature slice should pass:
 ```bash
 cargo fmt --all --check
 cargo test
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Before publishing a slice, inspect the diff, commit only intended files, open a

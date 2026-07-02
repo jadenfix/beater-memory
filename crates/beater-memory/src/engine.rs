@@ -9,11 +9,14 @@ use crate::{
     store::{LedgerEvent, MemoryNode, SqliteMemoryStore, StoreScope},
     text::{now_unix_ms, overlap_score, top_terms},
 };
+use serde::{Deserialize, Serialize};
 
 /// Result of one projection pass.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectReport {
     pub events_seen: usize,
+    pub events_projected: usize,
+    pub events_skipped: usize,
     pub memories_added: usize,
     pub memories_updated: usize,
     pub memories_invalidated: usize,
@@ -71,43 +74,56 @@ impl<D: Distiller> MemoryEngine<D> {
 
     pub fn project_pending(&self, limit: usize) -> MemoryResult<ProjectReport> {
         let events = self.store.pending_events(limit)?;
-        let mut report = ProjectReport {
-            events_seen: events.len(),
-            ..ProjectReport::default()
-        };
+        let mut report = ProjectReport::default();
         for event in events {
-            let neighbors = self.store.active_neighbors(
-                &event.tenant_id,
-                &event.project_id,
-                event.environment_id.as_deref(),
-                &event.text,
-                24,
-            )?;
-            let memories = self.distiller.distill(&event, &neighbors);
-            let mut projected_nodes = Vec::new();
-            for memory in memories {
-                match self.apply_distilled(&event, memory, &neighbors)? {
-                    ApplyOutcome::Added(node) => {
-                        report.memories_added += 1;
-                        projected_nodes.push(node);
-                    }
-                    ApplyOutcome::Updated(node) => {
-                        report.memories_updated += 1;
-                        projected_nodes.push(node);
-                    }
-                    ApplyOutcome::Invalidated { replacement } => {
-                        report.memories_invalidated += 1;
-                        if let Some(node) = replacement {
+            let event_report = self.store.with_immediate_transaction(|store| {
+                let mut event_report = ProjectReport {
+                    events_seen: 1,
+                    ..ProjectReport::default()
+                };
+                let Some(event_id) = event.id else {
+                    event_report.events_skipped = 1;
+                    return Ok(event_report);
+                };
+                if !store.event_is_pending(event_id)? {
+                    event_report.events_skipped = 1;
+                    return Ok(event_report);
+                }
+
+                let neighbors = store.active_neighbors(
+                    &event.tenant_id,
+                    &event.project_id,
+                    event.environment_id.as_deref(),
+                    &event.text,
+                    24,
+                )?;
+                let memories = self.distiller.distill(&event, &neighbors);
+                let mut projected_nodes = Vec::new();
+                for memory in memories {
+                    match self.apply_distilled(&event, memory, &neighbors)? {
+                        ApplyOutcome::Added(node) => {
+                            event_report.memories_added += 1;
                             projected_nodes.push(node);
                         }
+                        ApplyOutcome::Updated(node) => {
+                            event_report.memories_updated += 1;
+                            projected_nodes.push(node);
+                        }
+                        ApplyOutcome::Invalidated { replacement } => {
+                            event_report.memories_invalidated += 1;
+                            if let Some(node) = replacement {
+                                projected_nodes.push(node);
+                            }
+                        }
+                        ApplyOutcome::Noop => event_report.memories_nooped += 1,
                     }
-                    ApplyOutcome::Noop => report.memories_nooped += 1,
                 }
-            }
-            report.edges_added += self.link_projected_nodes(&event, &projected_nodes)?;
-            if let Some(id) = event.id {
-                self.store.mark_projected(id, now_unix_ms())?;
-            }
+                event_report.edges_added += self.link_projected_nodes(&event, &projected_nodes)?;
+                store.mark_projected(event_id, now_unix_ms())?;
+                event_report.events_projected = 1;
+                Ok(event_report)
+            })?;
+            report.absorb(event_report);
         }
         Ok(report)
     }
@@ -290,6 +306,19 @@ impl<D: Distiller> MemoryEngine<D> {
     }
 }
 
+impl ProjectReport {
+    fn absorb(&mut self, other: Self) {
+        self.events_seen += other.events_seen;
+        self.events_projected += other.events_projected;
+        self.events_skipped += other.events_skipped;
+        self.memories_added += other.memories_added;
+        self.memories_updated += other.memories_updated;
+        self.memories_invalidated += other.memories_invalidated;
+        self.memories_nooped += other.memories_nooped;
+        self.edges_added += other.edges_added;
+    }
+}
+
 enum ApplyOutcome {
     Added(MemoryNode),
     Updated(MemoryNode),
@@ -316,6 +345,8 @@ mod tests {
 
         let report = engine.project_pending(100)?;
         assert_eq!(report.events_seen, 1);
+        assert_eq!(report.events_projected, 1);
+        assert_eq!(report.events_skipped, 0);
         assert!(report.memories_added >= 2);
 
         let answer = engine.query(&MemoryQuery::new(
@@ -327,6 +358,25 @@ mod tests {
         assert!(answer.answer.contains("DATABASE_URL"));
         assert!(!answer.evidence.is_empty());
         assert!(!answer.cited_spans.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn projection_is_idempotent_after_event_is_marked() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "The API health route is /api/health.",
+        ))?;
+
+        let first = engine.project_pending(100)?;
+        let second = engine.project_pending(100)?;
+
+        assert_eq!(first.events_projected, 1);
+        assert_eq!(second.events_seen, 0);
+        assert_eq!(engine.store().stats()?.pending_events, 0);
         Ok(())
     }
 
