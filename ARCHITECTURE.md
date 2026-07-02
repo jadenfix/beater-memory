@@ -31,6 +31,8 @@ edges are projections that can be rebuilt.
    - Trait: `Distiller`
    - Current implementation: `HeuristicDistiller`
    - Output schema: `DistilledMemory { ADD | UPDATE | INVALIDATE | NOOP }`
+   - Projection validates required text, cited-span provenance, target IDs, and
+     invalidation/noop shape before touching graph tables.
    - Future LLM distillers must still emit this constrained shape before
      touching projections.
 

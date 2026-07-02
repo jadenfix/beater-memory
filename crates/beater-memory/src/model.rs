@@ -349,6 +349,21 @@ pub struct CitedSpan {
     pub seq: u64,
 }
 
+impl CitedSpan {
+    pub fn validate(&self) -> MemoryResult<()> {
+        validate_required_identifier("cited_span.tenant_id", &self.tenant_id)?;
+        validate_required_identifier("cited_span.project_id", &self.project_id)?;
+        validate_required_identifier("cited_span.trace_id", &self.trace_id)?;
+        validate_required_identifier("cited_span.span_id", &self.span_id)?;
+        if self.seq == 0 {
+            return Err(MemoryError::invalid(
+                "cited_span.seq must be greater than 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One compact evidence item that can be placed into model context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
@@ -452,6 +467,40 @@ impl DistilledMemory {
             target_node_id: None,
             cited_spans: vec![cited_span],
         }
+    }
+
+    pub fn validate(&self) -> MemoryResult<()> {
+        if self.cited_spans.is_empty() {
+            return Err(MemoryError::invalid("cited_spans must not be empty"));
+        }
+        for span in &self.cited_spans {
+            span.validate()?;
+        }
+        if let Some(target_node_id) = self.target_node_id.as_deref() {
+            validate_required_identifier("target_node_id", target_node_id)?;
+        }
+        match self.op {
+            BeliefRevisionOp::Add | BeliefRevisionOp::Update => {
+                validate_required_text("text", &self.text)?;
+            }
+            BeliefRevisionOp::Invalidate => {
+                let has_text = !self.text.trim().is_empty();
+                let has_target = self.target_node_id.is_some();
+                if !has_text && !has_target {
+                    return Err(MemoryError::invalid(
+                        "invalidate memory must include text or target_node_id",
+                    ));
+                }
+            }
+            BeliefRevisionOp::Noop => {
+                if self.target_node_id.is_some() {
+                    return Err(MemoryError::invalid(
+                        "noop memory must not include target_node_id",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -577,6 +626,68 @@ mod tests {
     }
 
     #[test]
+    fn cited_span_validation_rejects_malformed_provenance() {
+        let mut span = valid_span();
+        span.trace_id = " trace".to_string();
+        let err = span.validate().unwrap_err();
+        assert!(err.to_string().contains("cited_span.trace_id"));
+
+        let mut span = valid_span();
+        span.seq = 0;
+        let err = span.validate().unwrap_err();
+        assert!(err.to_string().contains("cited_span.seq"));
+    }
+
+    #[test]
+    fn distilled_memory_validation_rejects_malformed_outputs() {
+        DistilledMemory::add(
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            valid_span(),
+        )
+        .validate()
+        .unwrap_or_else(|err| panic!("{err}"));
+
+        let err = DistilledMemory::add(MemoryNodeKind::Fact, " ", valid_span())
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("text"));
+
+        let err = DistilledMemory {
+            op: BeliefRevisionOp::Noop,
+            node_kind: MemoryNodeKind::Episode,
+            text: String::new(),
+            target_node_id: Some("node_1".to_string()),
+            cited_spans: vec![valid_span()],
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("target_node_id"));
+
+        let err = DistilledMemory {
+            op: BeliefRevisionOp::Invalidate,
+            node_kind: MemoryNodeKind::Fact,
+            text: String::new(),
+            target_node_id: None,
+            cited_spans: vec![valid_span()],
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("invalidate memory"));
+
+        let err = DistilledMemory {
+            op: BeliefRevisionOp::Add,
+            node_kind: MemoryNodeKind::Fact,
+            text: "Checkout uses DATABASE_URL.".to_string(),
+            target_node_id: None,
+            cited_spans: Vec::new(),
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("cited_spans"));
+    }
+
+    #[test]
     fn token_estimate_is_nonzero_for_nonempty_text() {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abcd"), 1);
@@ -603,5 +714,15 @@ mod tests {
 
         let ids: Vec<&str> = selected.iter().map(|item| item.node_id.as_str()).collect();
         assert_eq!(ids, vec!["high", "low"]);
+    }
+
+    fn valid_span() -> CitedSpan {
+        CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "trace".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        }
     }
 }
