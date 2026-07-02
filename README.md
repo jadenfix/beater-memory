@@ -30,7 +30,7 @@ The current implementation includes:
 - CLI commands for `init`, `remember`, `project`, `query`, and import flows
 - authenticated HTTP API for service deployments
 - production operations for schema/integrity health checks and SQLite
-  maintenance
+  maintenance, backup, and restore
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
 
@@ -89,7 +89,13 @@ together.
 cargo run -p beater-memory -- health
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --vacuum
+cargo run -p beater-memory -- backup --path ./backups/memory.db
+cargo run -p beater-memory -- restore --path ./backups/memory.db --yes-replace-current-db
 ```
+
+Backups use SQLite's online backup API and refuse to overwrite an existing
+backup path. Restore replaces the active database and requires the explicit
+`--yes-replace-current-db` flag.
 
 HTTP equivalents:
 
@@ -115,7 +121,8 @@ The public API exports:
 - `MemoryEngine`
 - `SqliteMemoryStore`
 - `MemoryServerConfig`, `memory_router`, and `serve`
-- `StoreHealth`, `StoreStats`, and `MaintenanceReport`
+- `StoreHealth`, `StoreStats`, `MaintenanceReport`, `BackupReport`, and
+  `RestoreReport`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`
 - `MemoryQuery` and `MemoryAnswer`

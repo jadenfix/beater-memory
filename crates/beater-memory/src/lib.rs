@@ -30,6 +30,6 @@ pub use server::{
     RememberHttpRequest, RememberHttpResponse, memory_router, serve,
 };
 pub use store::{
-    LedgerEvent, MaintenanceReport, MemoryEdge, MemoryNode, SqliteMemoryStore, StoreHealth,
-    StoreStats,
+    BackupReport, LedgerEvent, MaintenanceReport, MemoryEdge, MemoryNode, RestoreReport,
+    SqliteMemoryStore, StoreHealth, StoreStats,
 };

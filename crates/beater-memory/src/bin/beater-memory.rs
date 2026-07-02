@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use beater_memory::{
     BeaterJsJournal, LedgerEvent, MemoryEngine, MemoryMode, MemoryNodeKind, MemoryQuery,
-    MemoryScope, MemoryServerConfig, import_canonical_jsonl, serve,
+    MemoryScope, MemoryServerConfig, SqliteMemoryStore, import_canonical_jsonl, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -74,6 +74,18 @@ enum Command {
     Maintenance {
         #[arg(long)]
         vacuum: bool,
+    },
+    /// Create an online SQLite backup of the memory database.
+    Backup {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Restore the active memory database from a SQLite backup.
+    Restore {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        yes_replace_current_db: bool,
     },
     /// Run the authenticated HTTP API.
     Serve {
@@ -292,6 +304,26 @@ async fn main() -> anyhow::Result<()> {
             let engine = MemoryEngine::open(&cli.db)
                 .with_context(|| format!("open {}", cli.db.display()))?;
             let report = engine.store().maintenance(vacuum)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Backup { path } => {
+            let engine = MemoryEngine::open(&cli.db)
+                .with_context(|| format!("open {}", cli.db.display()))?;
+            let report = engine.store().backup_to(path)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Restore {
+            path,
+            yes_replace_current_db,
+        } => {
+            if !yes_replace_current_db {
+                anyhow::bail!(
+                    "restore replaces the active database; pass --yes-replace-current-db to continue"
+                );
+            }
+            let mut store = SqliteMemoryStore::open(&cli.db)
+                .with_context(|| format!("open {}", cli.db.display()))?;
+            let report = store.restore_from(path)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Serve {
