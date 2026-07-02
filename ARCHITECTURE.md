@@ -144,6 +144,9 @@ Production safeguards:
   embedded limits cannot wrap into unbounded reads or retention operations
 - service audit events are persisted in SQLite so backup/restore includes the
   operational trail for the memory database
+- audit records and audit-retention options are validated before insert or
+  pruning, including non-negative retention cutoffs and checked SQLite
+  retention limits
 
 ## Commands
 

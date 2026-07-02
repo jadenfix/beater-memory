@@ -283,6 +283,23 @@ pub struct MaintenanceOptions {
     pub retain_latest_audit_events: Option<usize>,
 }
 
+impl MaintenanceOptions {
+    pub fn validate(&self) -> MemoryResult<()> {
+        if self
+            .prune_audit_before_unix_ms
+            .is_some_and(|cutoff| cutoff < 0)
+        {
+            return Err(MemoryError::invalid(
+                "prune_audit_before_unix_ms must be non-negative",
+            ));
+        }
+        if let Some(retain_latest) = self.retain_latest_audit_events {
+            sqlite_limit("retain_latest audit limit", retain_latest)?;
+        }
+        Ok(())
+    }
+}
+
 /// Result of a local maintenance pass.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -349,6 +366,26 @@ pub struct AuditRecord {
     pub route: Option<String>,
     pub status_code: Option<u16>,
     pub detail: serde_json::Value,
+}
+
+impl AuditRecord {
+    pub fn validate(&self) -> MemoryResult<()> {
+        validate_required_identifier("audit actor", &self.actor)?;
+        validate_required_identifier("audit action", &self.action)?;
+        validate_required_identifier("audit outcome", &self.outcome)?;
+        if let Some(route) = self.route.as_deref() {
+            validate_required_identifier("audit route", route)?;
+        }
+        if self
+            .status_code
+            .is_some_and(|status_code| !(100..=599).contains(&status_code))
+        {
+            return Err(MemoryError::invalid(
+                "audit status_code must be a valid HTTP status code",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// SQLite-backed local memory store.
@@ -991,6 +1028,7 @@ impl SqliteMemoryStore {
     }
 
     pub fn append_audit(&self, record: &AuditRecord) -> MemoryResult<i64> {
+        record.validate()?;
         self.conn.execute(
             "
             INSERT INTO audit_events(
@@ -1073,6 +1111,7 @@ impl SqliteMemoryStore {
         &self,
         options: MaintenanceOptions,
     ) -> MemoryResult<MaintenanceReport> {
+        options.validate()?;
         self.conn.execute_batch("PRAGMA optimize")?;
         let graph_integrity_before = self.graph_integrity()?;
         let graph_repair = if options.repair_orphans {
@@ -1222,11 +1261,22 @@ impl SqliteMemoryStore {
         before_unix_ms: Option<i64>,
         retain_latest: Option<usize>,
     ) -> MemoryResult<AuditPruneReport> {
-        if before_unix_ms.is_none() && retain_latest.is_none() {
+        let options = MaintenanceOptions {
+            prune_audit_before_unix_ms: before_unix_ms,
+            retain_latest_audit_events: retain_latest,
+            ..MaintenanceOptions::default()
+        };
+        options.validate()?;
+        if options.prune_audit_before_unix_ms.is_none()
+            && options.retain_latest_audit_events.is_none()
+        {
             return Ok(AuditPruneReport::default());
         }
         self.with_immediate_transaction(|store| {
-            store.prune_audit_events_in_transaction(before_unix_ms, retain_latest)
+            store.prune_audit_events_in_transaction(
+                options.prune_audit_before_unix_ms,
+                options.retain_latest_audit_events,
+            )
         })
     }
 
@@ -1971,6 +2021,40 @@ mod tests {
     }
 
     #[test]
+    fn append_audit_rejects_malformed_records() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+
+        assert_invalid_audit(
+            &store,
+            |record| record.actor = " bearer:test".to_string(),
+            "audit actor",
+        )?;
+        assert_invalid_audit(
+            &store,
+            |record| record.action = String::new(),
+            "audit action",
+        )?;
+        assert_invalid_audit(
+            &store,
+            |record| record.outcome = "success ".to_string(),
+            "audit outcome",
+        )?;
+        assert_invalid_audit(
+            &store,
+            |record| record.route = Some(" ".to_string()),
+            "audit route",
+        )?;
+        assert_invalid_audit(
+            &store,
+            |record| record.status_code = Some(99),
+            "status_code",
+        )?;
+
+        assert_eq!(store.stats()?.audit_events, 0);
+        Ok(())
+    }
+
+    #[test]
     fn audit_pruning_removes_old_rows_and_retains_newest() -> MemoryResult<()> {
         let store = SqliteMemoryStore::in_memory()?;
         insert_audit_event(&store, 1_000, "oldest")?;
@@ -1997,6 +2081,30 @@ mod tests {
 
         assert_eq!(clear_report.audit_events_removed, 1);
         assert_eq!(store.stats()?.audit_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_pruning_rejects_invalid_retention_before_deleting_rows() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        insert_audit_event(&store, 1_000, "oldest")?;
+        insert_audit_event(&store, 2_000, "newest")?;
+
+        let err = store.prune_audit_events(Some(-1), Some(0)).unwrap_err();
+
+        assert!(err.to_string().contains("prune_audit_before_unix_ms"));
+        assert_eq!(store.stats()?.audit_events, 2);
+
+        let err = store
+            .maintenance_with_options(MaintenanceOptions {
+                prune_audit_before_unix_ms: Some(-1),
+                retain_latest_audit_events: Some(0),
+                ..MaintenanceOptions::default()
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("prune_audit_before_unix_ms"));
+        assert_eq!(store.stats()?.audit_events, 2);
         Ok(())
     }
 
@@ -2047,6 +2155,30 @@ mod tests {
         );
         edit(&mut event);
         let err = store.append_event(&event).unwrap_err();
+        assert!(
+            err.to_string().contains(expected_message),
+            "expected error containing {expected_message:?}, got {err}"
+        );
+        Ok(())
+    }
+
+    fn assert_invalid_audit(
+        store: &SqliteMemoryStore,
+        edit: impl FnOnce(&mut AuditRecord),
+        expected_message: &str,
+    ) -> MemoryResult<()> {
+        let mut record = AuditRecord {
+            actor: "bearer:test".to_string(),
+            action: "remember".to_string(),
+            outcome: "success".to_string(),
+            route: Some("/v1/remember".to_string()),
+            status_code: Some(200),
+            detail: serde_json::json!({}),
+        };
+        edit(&mut record);
+
+        let err = store.append_audit(&record).unwrap_err();
+
         assert!(
             err.to_string().contains(expected_message),
             "expected error containing {expected_message:?}, got {err}"
