@@ -134,6 +134,8 @@ Production safeguards:
 - `rebuild-projection` clears only derived projection tables and ledger
   projection markers, then replays the append-only ledger behind an explicit
   confirmation flag
+- projection batch sizes and optional rebuild event caps must be positive so a
+  rebuild cannot clear projections and replay zero events
 - service audit events are persisted in SQLite so backup/restore includes the
   operational trail for the memory database
 

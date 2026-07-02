@@ -39,6 +39,8 @@ The current implementation includes:
   append-only log
 - query validation that rejects malformed scopes, empty questions, and unusable
   token budgets before retrieval
+- projection limit validation that rejects zero-sized project and rebuild
+  batches before mutating derived graph state
 - guarded projection rebuild from the append-only ledger
 - explicit audit retention pruning by age or newest-row count
 - database identity checks that reject unrelated SQLite files instead of
