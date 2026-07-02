@@ -1,6 +1,6 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -167,6 +167,24 @@ pub struct MaintenanceReport {
     pub wal_checkpoint_log_frames: i64,
     pub wal_checkpoint_checkpointed_frames: i64,
     pub vacuumed: bool,
+}
+
+/// Result of writing a SQLite backup file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupReport {
+    pub path: String,
+    pub bytes: u64,
+    pub schema_version: u32,
+    pub integrity_ok: bool,
+}
+
+/// Result of restoring the active database from a SQLite backup file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreReport {
+    pub path: String,
+    pub schema_version: u32,
+    pub integrity_ok: bool,
+    pub stats: StoreStats,
 }
 
 /// SQLite-backed local memory store.
@@ -822,6 +840,52 @@ impl SqliteMemoryStore {
         })
     }
 
+    pub fn backup_to(&self, path: impl AsRef<Path>) -> MemoryResult<BackupReport> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(MemoryError::invalid(format!(
+                "backup path already exists: {}",
+                path.display()
+            )));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.conn.backup(MAIN_DB, path, None)?;
+        let health = self.health()?;
+        Ok(BackupReport {
+            path: path.display().to_string(),
+            bytes: std::fs::metadata(path)?.len(),
+            schema_version: health.schema_version,
+            integrity_ok: health.integrity_ok,
+        })
+    }
+
+    pub fn restore_from(&mut self, path: impl AsRef<Path>) -> MemoryResult<RestoreReport> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(MemoryError::invalid(format!(
+                "restore path is not a file: {}",
+                path.display()
+            )));
+        }
+        self.conn.restore(
+            MAIN_DB,
+            path,
+            Option::<fn(rusqlite::backup::Progress)>::None,
+        )?;
+        self.migrate()?;
+        let health = self.health()?;
+        Ok(RestoreReport {
+            path: path.display().to_string(),
+            schema_version: health.schema_version,
+            integrity_ok: health.integrity_ok,
+            stats: health.stats,
+        })
+    }
+
     fn attach_spans(&self, node_id: &str, cited_spans: &[CitedSpan]) -> MemoryResult<()> {
         for span in cited_spans {
             self.conn.execute(
@@ -967,6 +1031,8 @@ fn read_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEdge> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
 
     #[test]
@@ -1039,5 +1105,50 @@ mod tests {
         assert!(!report.vacuumed);
         assert!(report.wal_checkpoint_busy >= 0);
         Ok(())
+    }
+
+    #[test]
+    fn backup_and_restore_round_trip_memory_data() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "The support API health route is /api/health.",
+        );
+        store.append_event(&event)?;
+        let span = event.cited_span();
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "The support API health route is /api/health.",
+            event.observed_at_unix_ms,
+            &[span],
+        )?;
+
+        let backup_path = temp_path("backup.db");
+        let backup = store.backup_to(&backup_path)?;
+        assert!(backup.bytes > 0);
+        assert!(backup.integrity_ok);
+
+        let mut restored = SqliteMemoryStore::in_memory()?;
+        let report = restored.restore_from(&backup_path)?;
+
+        assert!(report.integrity_ok);
+        assert_eq!(report.stats.ledger_events, 1);
+        assert_eq!(report.stats.nodes, 1);
+        let _ = std::fs::remove_file(backup_path);
+        Ok(())
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "beater-memory-{}-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            name
+        ))
     }
 }

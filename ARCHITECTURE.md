@@ -86,6 +86,10 @@ Production safeguards:
   concurrent workers cannot double-count a stale pending row
 - `health` runs schema, integrity, foreign-key, and count checks
 - `maintenance` runs SQLite optimize and WAL checkpointing, with optional vacuum
+- `backup` uses SQLite's online backup API and refuses to overwrite an existing
+  backup path
+- `restore` replaces the active database only behind an explicit confirmation
+  flag and re-runs schema/health checks after restore
 
 ## Commands
 
@@ -97,6 +101,7 @@ cargo run -p beater-memory -- query --tenant local --project demo \
   "How do I fix checkout database failures?"
 cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance
+cargo run -p beater-memory -- backup --path ./backups/memory.db
 BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
 ```
 
