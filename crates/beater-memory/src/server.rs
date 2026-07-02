@@ -36,6 +36,7 @@ const DEFAULT_MAX_REQUESTS_PER_MINUTE: u32 = 600;
 const DEFAULT_MAX_CONCURRENT_DB_TASKS: usize = 32;
 const DEFAULT_DB_TASK_TIMEOUT_MS: u64 = 30_000;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// HTTP server configuration.
 #[derive(Clone, Debug)]
@@ -451,6 +452,7 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/stats", get(stats))
         .route("/v1/metrics", get(metrics))
+        .route("/v1/metrics/prometheus", get(metrics_prometheus))
         .route("/v1/audit", get(audit))
         .route("/v1/remember", post(remember))
         .route("/v1/project", post(project))
@@ -579,6 +581,27 @@ async fn metrics(
     let ctx = begin_request(&state, &headers, "metrics", "/v1/metrics").await?;
     finish_success(&state, &ctx, StatusCode::OK, serde_json::json!({})).await;
     Ok(Json(metrics_snapshot(&state)))
+}
+
+async fn metrics_prometheus(
+    State(state): State<MemoryServerState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let ctx = begin_request(&state, &headers, "metrics", "/v1/metrics/prometheus").await?;
+    finish_success(
+        &state,
+        &ctx,
+        StatusCode::OK,
+        serde_json::json!({"format": "prometheus"}),
+    )
+    .await;
+    let body = render_prometheus_metrics(&metrics_snapshot(&state), now_unix_ms());
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(PROMETHEUS_CONTENT_TYPE),
+    );
+    Ok(response)
 }
 
 async fn audit(
@@ -996,6 +1019,179 @@ fn metrics_snapshot(state: &MemoryServerState) -> ServiceMetricsSnapshot {
         .clone()
 }
 
+fn render_prometheus_metrics(snapshot: &ServiceMetricsSnapshot, now_unix_ms: i64) -> String {
+    let uptime_ms = now_unix_ms.saturating_sub(snapshot.started_at_unix_ms);
+    let start_time_seconds = snapshot.started_at_unix_ms as f64 / 1000.0;
+    let uptime_seconds = uptime_ms as f64 / 1000.0;
+    let mut output = String::new();
+    output.push_str(
+        "# HELP beater_memory_process_start_time_seconds Unix timestamp when the service metrics window started.\n",
+    );
+    output.push_str("# TYPE beater_memory_process_start_time_seconds gauge\n");
+    output.push_str(&format!(
+        "beater_memory_process_start_time_seconds {start_time_seconds:.3}\n"
+    ));
+    output.push_str("# HELP beater_memory_uptime_seconds Service uptime in seconds.\n");
+    output.push_str("# TYPE beater_memory_uptime_seconds gauge\n");
+    output.push_str(&format!(
+        "beater_memory_uptime_seconds {uptime_seconds:.3}\n"
+    ));
+    output.push_str("# HELP beater_memory_http_requests_total Total HTTP requests by category.\n");
+    output.push_str("# TYPE beater_memory_http_requests_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_requests_total",
+        "category",
+        "all",
+        snapshot.total_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_requests_total",
+        "category",
+        "authorized",
+        snapshot.authorized_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_requests_total",
+        "category",
+        "unauthorized",
+        snapshot.unauthorized_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_requests_total",
+        "category",
+        "rate_limited",
+        snapshot.rate_limited_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_requests_total",
+        "category",
+        "successful",
+        snapshot.successful_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_requests_total",
+        "category",
+        "failed",
+        snapshot.failed_requests,
+    );
+    output
+        .push_str("# HELP beater_memory_http_route_requests_total Total HTTP requests by route.\n");
+    output.push_str("# TYPE beater_memory_http_route_requests_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "livez",
+        snapshot.live_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "readyz",
+        snapshot.ready_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "health",
+        snapshot.health_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "stats",
+        snapshot.stats_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "remember",
+        snapshot.remember_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "project",
+        snapshot.project_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "query",
+        snapshot.query_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "maintenance",
+        snapshot.maintenance_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "metrics",
+        snapshot.metrics_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "audit",
+        snapshot.audit_requests,
+    );
+    output.push_str("# HELP beater_memory_db_requests_total Total DB guard outcomes.\n");
+    output.push_str("# TYPE beater_memory_db_requests_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_db_requests_total",
+        "outcome",
+        "busy",
+        snapshot.db_busy_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_db_requests_total",
+        "outcome",
+        "timeout",
+        snapshot.db_timeout_requests,
+    );
+    output
+}
+
+fn push_prometheus_counter(
+    output: &mut String,
+    name: &str,
+    label_name: &str,
+    label_value: &str,
+    value: u64,
+) {
+    output.push_str(&format!(
+        "{name}{{{label_name}=\"{}\"}} {value}\n",
+        escape_prometheus_label(label_value)
+    ));
+}
+
+fn escape_prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
 fn record_request_started(state: &MemoryServerState, action: &str) {
     state
         .metrics
@@ -1365,6 +1561,35 @@ mod tests {
                 && event.outcome == "success"
                 && event.status_code == Some(200)
         }));
+    }
+
+    #[tokio::test]
+    async fn prometheus_metrics_are_available_over_http() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+
+        let response = app
+            .oneshot(get_request("/v1/metrics/prometheus"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| panic!("missing content-type"));
+        assert_eq!(content_type, PROMETHEUS_CONTENT_TYPE);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let text = String::from_utf8(body.to_vec()).unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(text.contains("# TYPE beater_memory_http_requests_total counter"));
+        assert!(text.contains("beater_memory_http_requests_total{category=\"all\"} 1"));
+        assert!(text.contains("beater_memory_http_requests_total{category=\"authorized\"} 1"));
+        assert!(text.contains("beater_memory_http_requests_total{category=\"successful\"} 1"));
+        assert!(text.contains("beater_memory_http_route_requests_total{route=\"metrics\"} 1"));
+        assert!(text.contains("beater_memory_db_requests_total{outcome=\"busy\"} 0"));
     }
 
     #[tokio::test]

@@ -51,16 +51,16 @@ edges are projections that can be rebuilt.
    - Public endpoints: `GET /livez`, `GET /readyz`
    - Authenticated endpoints: `/v1/health`, `/v1/stats`, `/v1/remember`,
      `/v1/project`, `/v1/query`, `/v1/maintenance`, `/v1/metrics`,
-     `/v1/audit`
+     `/v1/metrics/prometheus`, `/v1/audit`
    - Auth: bearer token from `--bearer-token` or `BEATER_MEMORY_TOKEN` by
      default; unauthenticated serving requires explicit `--allow-no-auth`
    - Limits: max request body bytes, max projection batch size, max query token
      budget, max concurrent blocking SQLite tasks, and DB task timeout are
      configurable at startup.
    - Controls: a fixed-window per-actor limiter protects `/v1/*`; in-memory
-     service metrics expose request totals, DB saturation, and DB timeouts;
-     durable audit rows record successes, failures, denied auth, and throttled
-     attempts.
+     JSON and Prometheus service metrics expose request totals, DB saturation,
+     and DB timeouts; durable audit rows record successes, failures, denied
+     auth, and throttled attempts.
    - Writes: direct `remember` calls can carry an idempotency key so client
      retries map to the same ledger event.
    - Shutdown: `serve` uses Axum graceful shutdown on Ctrl-C and SIGTERM on
