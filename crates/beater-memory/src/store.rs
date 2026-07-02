@@ -564,6 +564,7 @@ impl SqliteMemoryStore {
     }
 
     pub fn pending_events(&self, limit: usize) -> MemoryResult<Vec<LedgerEvent>> {
+        let limit = sqlite_limit("pending_events limit", limit)?;
         let mut stmt = self.conn.prepare(
             "
             SELECT id, source, tenant_id, project_id, environment_id, trace_id, span_id, seq,
@@ -575,7 +576,7 @@ impl SqliteMemoryStore {
             LIMIT ?1
             ",
         )?;
-        let rows = stmt.query_map(params![limit as i64], read_ledger_event)?;
+        let rows = stmt.query_map(params![limit], read_ledger_event)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -837,6 +838,7 @@ impl SqliteMemoryStore {
         query_terms: &[String],
         limit: usize,
     ) -> MemoryResult<Vec<MemoryNode>> {
+        let sql_limit = sqlite_limit("seed_nodes limit", limit)?;
         if query_terms.is_empty() {
             return self.recent_nodes(tenant_id, project_id, environment_id, limit);
         }
@@ -859,7 +861,7 @@ impl SqliteMemoryStore {
         )?;
         for term in query_terms {
             let rows = stmt.query_map(
-                params![tenant_id, project_id, environment_id, term, limit as i64],
+                params![tenant_id, project_id, environment_id, term, sql_limit],
                 read_node,
             )?;
             for row in rows {
@@ -884,6 +886,7 @@ impl SqliteMemoryStore {
         environment_id: Option<&str>,
         limit: usize,
     ) -> MemoryResult<Vec<MemoryNode>> {
+        let limit = sqlite_limit("recent_nodes limit", limit)?;
         let mut stmt = self.conn.prepare(
             "
             SELECT id, tenant_id, project_id, environment_id, kind, text, canonical_key,
@@ -898,7 +901,7 @@ impl SqliteMemoryStore {
             ",
         )?;
         let rows = stmt.query_map(
-            params![tenant_id, project_id, environment_id, limit as i64],
+            params![tenant_id, project_id, environment_id, limit],
             read_node,
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1008,6 +1011,7 @@ impl SqliteMemoryStore {
     }
 
     pub fn recent_audit_events(&self, limit: usize) -> MemoryResult<Vec<AuditEvent>> {
+        let limit = sqlite_limit("recent_audit_events limit", limit)?;
         let mut stmt = self.conn.prepare(
             "
             SELECT id, occurred_at_unix_ms, actor, action, outcome, route, status_code, detail_json
@@ -1016,7 +1020,7 @@ impl SqliteMemoryStore {
             LIMIT ?1
             ",
         )?;
-        let rows = stmt.query_map(params![limit as i64], read_audit_event)?;
+        let rows = stmt.query_map(params![limit], read_audit_event)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1239,6 +1243,7 @@ impl SqliteMemoryStore {
             )? as i64;
         }
         if let Some(limit) = retain_latest {
+            let limit = sqlite_limit("retain_latest audit limit", limit)?;
             audit_events_removed += self.conn.execute(
                 "
                 DELETE FROM audit_events
@@ -1249,7 +1254,7 @@ impl SqliteMemoryStore {
                     LIMIT ?1
                 )
                 ",
-                params![limit as i64],
+                params![limit],
             )? as i64;
         }
         Ok(AuditPruneReport {
@@ -1378,6 +1383,11 @@ fn validate_required_text(field: &str, value: &str) -> MemoryResult<()> {
     } else {
         Ok(())
     }
+}
+
+fn sqlite_limit(field: &str, limit: usize) -> MemoryResult<i64> {
+    i64::try_from(limit)
+        .map_err(|_| MemoryError::invalid(format!("{field} exceeds SQLite LIMIT range")))
 }
 
 fn configure_connection(conn: &Connection) -> MemoryResult<()> {
@@ -1602,6 +1612,40 @@ mod tests {
         )?;
 
         assert_eq!(store.stats()?.ledger_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn store_rejects_limits_outside_sqlite_range() -> MemoryResult<()> {
+        let Some(limit) = oversized_sqlite_limit() else {
+            return Ok(());
+        };
+        let store = SqliteMemoryStore::in_memory()?;
+
+        let err = store.pending_events(limit).unwrap_err();
+        assert!(err.to_string().contains("pending_events limit"));
+
+        let err = store
+            .seed_nodes(
+                "tenant",
+                "project",
+                None,
+                &[String::from("checkout")],
+                limit,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("seed_nodes limit"));
+
+        let err = store
+            .recent_nodes("tenant", "project", None, limit)
+            .unwrap_err();
+        assert!(err.to_string().contains("recent_nodes limit"));
+
+        let err = store.recent_audit_events(limit).unwrap_err();
+        assert!(err.to_string().contains("recent_audit_events limit"));
+
+        let err = store.prune_audit_events(None, Some(limit)).unwrap_err();
+        assert!(err.to_string().contains("retain_latest audit limit"));
         Ok(())
     }
 
@@ -2008,6 +2052,12 @@ mod tests {
             "expected error containing {expected_message:?}, got {err}"
         );
         Ok(())
+    }
+
+    fn oversized_sqlite_limit() -> Option<usize> {
+        usize::try_from(i64::MAX)
+            .ok()
+            .and_then(|max| max.checked_add(1))
     }
 
     fn insert_audit_event(
