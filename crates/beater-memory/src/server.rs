@@ -868,6 +868,9 @@ async fn maintenance(
         prune_audit_before_unix_ms: request.prune_audit_before_unix_ms,
         retain_latest_audit_events: request.retain_latest_audit_events,
     };
+    if let Err(err) = options.validate() {
+        return fail_request(&state, &ctx, ApiError::from(err)).await;
+    }
     let detail_options = options.clone();
     let result = with_engine(state.clone(), move |engine| {
         engine.store().maintenance_with_options(options)
@@ -2194,6 +2197,47 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(events[0].action, "maintenance");
         assert_eq!(events[1].action, "newest");
+    }
+
+    #[tokio::test]
+    async fn maintenance_rejects_invalid_audit_retention_over_http_before_pruning() {
+        let config = test_config().with_bearer_token("secret");
+        let db_path = config.db_path.clone();
+        let store =
+            crate::SqliteMemoryStore::open(&config.db_path).unwrap_or_else(|err| panic!("{err}"));
+        insert_audit_event(&store, 1_000, "oldest");
+        insert_audit_event(&store, 2_000, "newest");
+        drop(store);
+        let app = memory_router(config);
+        let request = serde_json::json!({
+            "prune_audit_before_unix_ms": -1,
+            "retain_latest_audit_events": 0
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/maintenance", request))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "bad_request");
+        assert!(error.error.message.contains("prune_audit_before_unix_ms"));
+
+        let store = crate::SqliteMemoryStore::open(&db_path).unwrap_or_else(|err| panic!("{err}"));
+        let events = store
+            .recent_audit_events(10)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(events.iter().any(|event| event.action == "oldest"));
+        assert!(events.iter().any(|event| event.action == "newest"));
+        assert!(events.iter().any(|event| {
+            event.action == "maintenance"
+                && event.outcome == "failure"
+                && event.status_code == Some(400)
+        }));
     }
 
     fn json_request(path: &str, body: serde_json::Value) -> Request<Body> {
