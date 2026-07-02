@@ -15,7 +15,7 @@ mod store;
 mod text;
 
 pub use distill::{Distiller, HeuristicDistiller};
-pub use engine::{MemoryEngine, ProjectReport};
+pub use engine::{MemoryEngine, ProjectReport, ProjectionRebuildReport};
 pub use error::{MemoryError, MemoryResult};
 pub use imports::{
     BeaterJsImportReport, BeaterJsJournal, CanonicalJsonlImportReport, import_canonical_jsonl,
@@ -32,6 +32,6 @@ pub use server::{
 };
 pub use store::{
     AuditEvent, AuditRecord, BackupReport, GraphIntegrityReport, GraphRepairReport, LedgerEvent,
-    MaintenanceOptions, MaintenanceReport, MemoryEdge, MemoryNode, RestoreReport,
-    SqliteMemoryStore, StoreHealth, StoreStats,
+    MaintenanceOptions, MaintenanceReport, MemoryEdge, MemoryNode, ProjectionResetReport,
+    RestoreReport, SqliteMemoryStore, StoreHealth, StoreStats,
 };

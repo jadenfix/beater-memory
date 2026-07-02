@@ -33,6 +33,7 @@ The current implementation includes:
   maintenance, backup, and restore
 - graph projection integrity checks and orphan repair for edges, citations, and
   cue index entries
+- guarded projection rebuild from the append-only ledger
 - database identity checks that reject unrelated SQLite files instead of
   silently migrating them
 - service metrics, persisted audit events, fixed-window request limiting, and
@@ -106,6 +107,7 @@ cargo run -p beater-memory -- health
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --vacuum
 cargo run -p beater-memory -- maintenance --repair-orphans
+cargo run -p beater-memory -- rebuild-projection --yes-clear-projections
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 cargo run -p beater-memory -- restore --path ./backups/memory.db --yes-replace-current-db
 ```
@@ -115,7 +117,9 @@ backup path. Restore replaces the active database and requires the explicit
 `--yes-replace-current-db` flag. Health reports graph projection orphan counts;
 maintenance reports graph integrity before and after the pass, and only removes
 orphan projection rows when `--repair-orphans` or HTTP `repair_orphans: true` is
-set.
+set. Projection rebuild clears only derived memory nodes, edges, citations, cue
+indexes, and projection markers, then replays the append-only ledger; audit rows
+and ledger events remain intact.
 
 HTTP equivalents:
 
@@ -150,11 +154,12 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
 The public API exports:
 
 - `MemoryEngine`
+- `ProjectReport` and `ProjectionRebuildReport`
 - `SqliteMemoryStore`
 - `MemoryServerConfig`, `memory_router`, and `serve`
 - `StoreHealth`, `StoreStats`, `MaintenanceOptions`, `MaintenanceReport`,
-  `GraphIntegrityReport`, `GraphRepairReport`, `BackupReport`, `RestoreReport`,
-  `AuditRecord`, and `AuditEvent`
+  `GraphIntegrityReport`, `GraphRepairReport`, `ProjectionResetReport`,
+  `BackupReport`, `RestoreReport`, `AuditRecord`, and `AuditEvent`
 - `ServiceMetricsSnapshot`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`
