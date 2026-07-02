@@ -26,10 +26,11 @@ pub use model::{
     StaleAssumption, blend_activation, budget_evidence, estimate_tokens,
 };
 pub use server::{
-    LiveResponse, MaintenanceHttpRequest, MemoryServerConfig, ProjectHttpRequest, QueryHttpRequest,
-    RememberHttpRequest, RememberHttpResponse, memory_router, serve,
+    AuditHttpQuery, AuditHttpResponse, LiveResponse, MaintenanceHttpRequest, MemoryServerConfig,
+    ProjectHttpRequest, QueryHttpRequest, RememberHttpRequest, RememberHttpResponse,
+    ServiceMetricsSnapshot, memory_router, serve,
 };
 pub use store::{
-    BackupReport, LedgerEvent, MaintenanceReport, MemoryEdge, MemoryNode, RestoreReport,
-    SqliteMemoryStore, StoreHealth, StoreStats,
+    AuditEvent, AuditRecord, BackupReport, LedgerEvent, MaintenanceReport, MemoryEdge, MemoryNode,
+    RestoreReport, SqliteMemoryStore, StoreHealth, StoreStats,
 };

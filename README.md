@@ -31,6 +31,7 @@ The current implementation includes:
 - authenticated HTTP API for service deployments
 - production operations for schema/integrity health checks and SQLite
   maintenance, backup, and restore
+- service metrics, persisted audit events, and fixed-window request limiting
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
 
@@ -59,7 +60,9 @@ cargo run -p beater-memory -- serve --bind 127.0.0.1:8765
 
 The server refuses to start without a bearer token unless `--allow-no-auth` is
 passed. All `/v1/*` routes require `Authorization: Bearer <token>`; `/livez` is
-the unauthenticated liveness endpoint.
+the unauthenticated liveness endpoint. The service defaults to 600 authenticated
+requests per actor per minute; use `--max-requests-per-minute 0` to disable the
+fixed-window limiter for a trusted local deployment.
 
 Import a `beater.js` journal:
 
@@ -104,6 +107,12 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   http://127.0.0.1:8765/v1/health
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+  http://127.0.0.1:8765/v1/metrics
+
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+  'http://127.0.0.1:8765/v1/audit?limit=50'
+
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"local","project_id":"demo","kind":"gotcha","text":"Checkout fails when DATABASE_URL is missing."}' \
   http://127.0.0.1:8765/v1/remember
@@ -121,8 +130,9 @@ The public API exports:
 - `MemoryEngine`
 - `SqliteMemoryStore`
 - `MemoryServerConfig`, `memory_router`, and `serve`
-- `StoreHealth`, `StoreStats`, `MaintenanceReport`, `BackupReport`, and
-  `RestoreReport`
+- `StoreHealth`, `StoreStats`, `MaintenanceReport`, `BackupReport`,
+  `RestoreReport`, `AuditRecord`, and `AuditEvent`
+- `ServiceMetricsSnapshot`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`
 - `MemoryQuery` and `MemoryAnswer`

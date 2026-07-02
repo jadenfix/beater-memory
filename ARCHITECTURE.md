@@ -50,11 +50,15 @@ edges are projections that can be rebuilt.
    - CLI command: `beater-memory serve`
    - Public endpoint: `GET /livez`
    - Authenticated endpoints: `/v1/health`, `/v1/stats`, `/v1/remember`,
-     `/v1/project`, `/v1/query`, `/v1/maintenance`
+     `/v1/project`, `/v1/query`, `/v1/maintenance`, `/v1/metrics`,
+     `/v1/audit`
    - Auth: bearer token from `--bearer-token` or `BEATER_MEMORY_TOKEN` by
      default; unauthenticated serving requires explicit `--allow-no-auth`
    - Limits: max request body bytes, max projection batch size, and max query
      token budget are configurable at startup.
+   - Controls: a fixed-window per-actor limiter protects `/v1/*`; in-memory
+     service metrics expose request totals; durable audit rows record successes,
+     failures, denied auth, and throttled attempts.
 
 ## Why No Embeddings In The MVP
 
@@ -72,6 +76,7 @@ The default database is SQLite. Tables are intentionally boring:
 - `memory_edges`: typed graph relationships
 - `node_spans`: many-to-many provenance citations
 - `cue_index`: deterministic lexical seed index
+- `audit_events`: durable service audit records
 
 Projection is idempotent for repeated imports because ledger events are keyed by
 `tenant_id + project_id + trace_id + span_id + seq`.
@@ -90,6 +95,8 @@ Production safeguards:
   backup path
 - `restore` replaces the active database only behind an explicit confirmation
   flag and re-runs schema/health checks after restore
+- service audit events are persisted in SQLite so backup/restore includes the
+  operational trail for the memory database
 
 ## Commands
 
@@ -103,6 +110,13 @@ cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
+```
+
+Useful service reads:
+
+```bash
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" http://127.0.0.1:8765/v1/metrics
+curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" 'http://127.0.0.1:8765/v1/audit?limit=50'
 ```
 
 Import sibling repo data:
