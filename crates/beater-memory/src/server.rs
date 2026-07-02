@@ -18,7 +18,10 @@ use crate::{
     MemoryEngine, ProjectReport,
     error::{MemoryError, MemoryResult},
     model::{MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope},
-    store::{AuditEvent, AuditRecord, LedgerEvent, MaintenanceReport, StoreHealth, StoreStats},
+    store::{
+        AuditEvent, AuditRecord, LedgerEvent, MaintenanceOptions, MaintenanceReport, StoreHealth,
+        StoreStats,
+    },
     text::{now_unix_ms, stable_id},
 };
 
@@ -134,6 +137,7 @@ pub struct QueryHttpRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceHttpRequest {
     pub vacuum: Option<bool>,
+    pub repair_orphans: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,12 +603,25 @@ async fn maintenance(
     Json(request): Json<MaintenanceHttpRequest>,
 ) -> Result<Json<MaintenanceReport>, ApiError> {
     let ctx = begin_request(&state, &headers, "maintenance", "/v1/maintenance").await?;
-    let vacuum = request.vacuum.unwrap_or(false);
+    let options = MaintenanceOptions {
+        vacuum: request.vacuum.unwrap_or(false),
+        repair_orphans: request.repair_orphans.unwrap_or(false),
+    };
+    let detail_options = options.clone();
     let result = with_engine(state.clone(), move |engine| {
-        engine.store().maintenance(vacuum)
+        engine.store().maintenance_with_options(options)
     })
     .await;
-    finish_request(state, ctx, result, serde_json::json!({ "vacuum": vacuum })).await
+    finish_request(
+        state,
+        ctx,
+        result,
+        serde_json::json!({
+            "vacuum": detail_options.vacuum,
+            "repair_orphans": detail_options.repair_orphans
+        }),
+    )
+    .await
 }
 
 async fn with_engine<T>(
@@ -1039,6 +1056,44 @@ mod tests {
         assert!(response.headers().contains_key(header::RETRY_AFTER));
     }
 
+    #[tokio::test]
+    async fn maintenance_repairs_graph_orphans_over_http() {
+        let config = test_config().with_bearer_token("secret");
+        let store =
+            crate::SqliteMemoryStore::open(&config.db_path).unwrap_or_else(|err| panic!("{err}"));
+        insert_orphan_projection_rows(&store);
+        assert!(
+            !store
+                .health()
+                .unwrap_or_else(|err| panic!("{err}"))
+                .graph_integrity_ok
+        );
+        drop(store);
+        let app = memory_router(config);
+        let request = serde_json::json!({
+            "vacuum": false,
+            "repair_orphans": true
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/maintenance", request))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let report: MaintenanceReport =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(report.repaired_orphans);
+        assert!(!report.graph_integrity_before.is_clean());
+        assert!(report.graph_integrity_after.is_clean());
+        assert_eq!(report.graph_repair.memory_edges_removed, 1);
+        assert_eq!(report.graph_repair.node_spans_removed, 1);
+        assert_eq!(report.graph_repair.cue_index_entries_removed, 1);
+    }
+
     fn json_request(path: &str, body: serde_json::Value) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -1070,5 +1125,24 @@ mod tests {
             db_path,
             "127.0.0.1:0".parse().unwrap_or_else(|err| panic!("{err}")),
         )
+    }
+
+    fn insert_orphan_projection_rows(store: &crate::SqliteMemoryStore) {
+        store
+            .connection()
+            .execute_batch(
+                "
+                INSERT INTO memory_edges(
+                    tenant_id, project_id, from_node_id, to_node_id, kind, weight, created_at_unix_ms
+                ) VALUES (
+                    'tenant', 'project', 'missing-from', 'missing-to', 'mentions', 1.0, 1
+                );
+                INSERT INTO node_spans(node_id, tenant_id, project_id, trace_id, span_id, seq)
+                VALUES ('missing-node', 'tenant', 'project', 'trace', 'span', 1);
+                INSERT INTO cue_index(term, node_id, tenant_id, project_id, weight)
+                VALUES ('missing', 'missing-node', 'tenant', 'project', 1.0);
+                ",
+            )
+            .unwrap_or_else(|err| panic!("{err}"));
     }
 }

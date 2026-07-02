@@ -159,7 +159,43 @@ pub struct StoreHealth {
     pub integrity_ok: bool,
     pub integrity_messages: Vec<String>,
     pub foreign_key_violations: i64,
+    pub graph_integrity_ok: bool,
+    pub graph_integrity: GraphIntegrityReport,
     pub stats: StoreStats,
+}
+
+/// Projection graph integrity counts not covered by SQLite foreign keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphIntegrityReport {
+    pub orphan_edges_from: i64,
+    pub orphan_edges_to: i64,
+    pub orphan_node_spans: i64,
+    pub orphan_cue_index_entries: i64,
+}
+
+impl GraphIntegrityReport {
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.orphan_edges_from == 0
+            && self.orphan_edges_to == 0
+            && self.orphan_node_spans == 0
+            && self.orphan_cue_index_entries == 0
+    }
+}
+
+/// Rows removed by graph integrity repair.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRepairReport {
+    pub memory_edges_removed: i64,
+    pub node_spans_removed: i64,
+    pub cue_index_entries_removed: i64,
+}
+
+/// Options for a local maintenance pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceOptions {
+    pub vacuum: bool,
+    pub repair_orphans: bool,
 }
 
 /// Result of a local maintenance pass.
@@ -170,6 +206,10 @@ pub struct MaintenanceReport {
     pub wal_checkpoint_log_frames: i64,
     pub wal_checkpoint_checkpointed_frames: i64,
     pub vacuumed: bool,
+    pub repaired_orphans: bool,
+    pub graph_integrity_before: GraphIntegrityReport,
+    pub graph_integrity_after: GraphIntegrityReport,
+    pub graph_repair: GraphRepairReport,
 }
 
 /// Result of writing a SQLite backup file.
@@ -897,6 +937,7 @@ impl SqliteMemoryStore {
     pub fn health(&self) -> MemoryResult<StoreHealth> {
         let schema_version = self.schema_version()?;
         let application_id = self.application_id()?;
+        let graph_integrity = self.graph_integrity()?;
         let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
         let integrity_messages = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -911,6 +952,8 @@ impl SqliteMemoryStore {
             integrity_ok,
             integrity_messages,
             foreign_key_violations,
+            graph_integrity_ok: graph_integrity.is_clean(),
+            graph_integrity,
             stats: self.stats()?,
             application_id,
             expected_application_id: SQLITE_APPLICATION_ID,
@@ -918,13 +961,30 @@ impl SqliteMemoryStore {
     }
 
     pub fn maintenance(&self, vacuum: bool) -> MemoryResult<MaintenanceReport> {
+        self.maintenance_with_options(MaintenanceOptions {
+            vacuum,
+            repair_orphans: false,
+        })
+    }
+
+    pub fn maintenance_with_options(
+        &self,
+        options: MaintenanceOptions,
+    ) -> MemoryResult<MaintenanceReport> {
         self.conn.execute_batch("PRAGMA optimize")?;
+        let graph_integrity_before = self.graph_integrity()?;
+        let graph_repair = if options.repair_orphans {
+            self.with_immediate_transaction(|store| store.repair_graph_orphans())?
+        } else {
+            GraphRepairReport::default()
+        };
+        let graph_integrity_after = self.graph_integrity()?;
         let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
             self.conn
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?;
-        if vacuum {
+        if options.vacuum {
             self.conn.execute_batch("VACUUM")?;
         }
         Ok(MaintenanceReport {
@@ -932,7 +992,90 @@ impl SqliteMemoryStore {
             wal_checkpoint_busy: busy,
             wal_checkpoint_log_frames: log_frames,
             wal_checkpoint_checkpointed_frames: checkpointed_frames,
-            vacuumed: vacuum,
+            vacuumed: options.vacuum,
+            repaired_orphans: options.repair_orphans,
+            graph_integrity_before,
+            graph_integrity_after,
+            graph_repair,
+        })
+    }
+
+    pub fn graph_integrity(&self) -> MemoryResult<GraphIntegrityReport> {
+        let orphan_edges_from: i64 = self.conn.query_row(
+            "
+            SELECT COUNT(*)
+            FROM memory_edges e
+            LEFT JOIN memory_nodes n ON n.id = e.from_node_id
+            WHERE n.id IS NULL
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        let orphan_edges_to: i64 = self.conn.query_row(
+            "
+            SELECT COUNT(*)
+            FROM memory_edges e
+            LEFT JOIN memory_nodes n ON n.id = e.to_node_id
+            WHERE n.id IS NULL
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        let orphan_node_spans: i64 = self.conn.query_row(
+            "
+            SELECT COUNT(*)
+            FROM node_spans s
+            LEFT JOIN memory_nodes n ON n.id = s.node_id
+            WHERE n.id IS NULL
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        let orphan_cue_index_entries: i64 = self.conn.query_row(
+            "
+            SELECT COUNT(*)
+            FROM cue_index c
+            LEFT JOIN memory_nodes n ON n.id = c.node_id
+            WHERE n.id IS NULL
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(GraphIntegrityReport {
+            orphan_edges_from,
+            orphan_edges_to,
+            orphan_node_spans,
+            orphan_cue_index_entries,
+        })
+    }
+
+    fn repair_graph_orphans(&self) -> MemoryResult<GraphRepairReport> {
+        let memory_edges_removed = self.conn.execute(
+            "
+            DELETE FROM memory_edges
+            WHERE from_node_id NOT IN (SELECT id FROM memory_nodes)
+               OR to_node_id NOT IN (SELECT id FROM memory_nodes)
+            ",
+            [],
+        )? as i64;
+        let node_spans_removed = self.conn.execute(
+            "
+            DELETE FROM node_spans
+            WHERE node_id NOT IN (SELECT id FROM memory_nodes)
+            ",
+            [],
+        )? as i64;
+        let cue_index_entries_removed = self.conn.execute(
+            "
+            DELETE FROM cue_index
+            WHERE node_id NOT IN (SELECT id FROM memory_nodes)
+            ",
+            [],
+        )? as i64;
+        Ok(GraphRepairReport {
+            memory_edges_removed,
+            node_spans_removed,
+            cue_index_entries_removed,
         })
     }
 
@@ -1267,6 +1410,8 @@ mod tests {
         assert_eq!(health.expected_schema_version, SCHEMA_VERSION);
         assert!(health.integrity_ok);
         assert_eq!(health.foreign_key_violations, 0);
+        assert!(health.graph_integrity_ok);
+        assert!(health.graph_integrity.is_clean());
         Ok(())
     }
 
@@ -1371,7 +1516,44 @@ mod tests {
 
         assert!(report.optimized);
         assert!(!report.vacuumed);
+        assert!(!report.repaired_orphans);
+        assert!(report.graph_integrity_before.is_clean());
+        assert!(report.graph_integrity_after.is_clean());
         assert!(report.wal_checkpoint_busy >= 0);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_integrity_reports_and_repairs_orphan_projection_rows() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        insert_orphan_projection_rows(&store)?;
+
+        let health = store.health()?;
+        assert!(!health.graph_integrity_ok);
+        assert_eq!(health.graph_integrity.orphan_edges_from, 2);
+        assert_eq!(health.graph_integrity.orphan_edges_to, 2);
+        assert_eq!(health.graph_integrity.orphan_node_spans, 1);
+        assert_eq!(health.graph_integrity.orphan_cue_index_entries, 1);
+
+        let dry_run = store.maintenance_with_options(MaintenanceOptions {
+            vacuum: false,
+            repair_orphans: false,
+        })?;
+        assert!(!dry_run.repaired_orphans);
+        assert!(!dry_run.graph_integrity_after.is_clean());
+
+        let repaired = store.maintenance_with_options(MaintenanceOptions {
+            vacuum: false,
+            repair_orphans: true,
+        })?;
+
+        assert!(repaired.repaired_orphans);
+        assert!(!repaired.graph_integrity_before.is_clean());
+        assert!(repaired.graph_integrity_after.is_clean());
+        assert_eq!(repaired.graph_repair.memory_edges_removed, 2);
+        assert_eq!(repaired.graph_repair.node_spans_removed, 1);
+        assert_eq!(repaired.graph_repair.cue_index_entries_removed, 1);
+        assert!(store.health()?.graph_integrity_ok);
         Ok(())
     }
 
@@ -1480,5 +1662,22 @@ mod tests {
                 .as_nanos(),
             name
         ))
+    }
+
+    fn insert_orphan_projection_rows(store: &SqliteMemoryStore) -> MemoryResult<()> {
+        store.connection().execute_batch(
+            "
+            INSERT INTO memory_edges(
+                tenant_id, project_id, from_node_id, to_node_id, kind, weight, created_at_unix_ms
+            ) VALUES
+                ('tenant', 'project', 'missing-from', 'missing-to', 'mentions', 1.0, 1),
+                ('tenant', 'project', 'missing-from-2', 'missing-to-2', 'derived_from', 1.0, 1);
+            INSERT INTO node_spans(node_id, tenant_id, project_id, trace_id, span_id, seq)
+            VALUES ('missing-node', 'tenant', 'project', 'trace', 'span', 1);
+            INSERT INTO cue_index(term, node_id, tenant_id, project_id, weight)
+            VALUES ('missing', 'missing-node', 'tenant', 'project', 1.0);
+            ",
+        )?;
+        Ok(())
     }
 }

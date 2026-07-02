@@ -2,8 +2,8 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use beater_memory::{
-    BeaterJsJournal, LedgerEvent, MemoryEngine, MemoryMode, MemoryNodeKind, MemoryQuery,
-    MemoryScope, MemoryServerConfig, SqliteMemoryStore, import_canonical_jsonl, serve,
+    BeaterJsJournal, LedgerEvent, MaintenanceOptions, MemoryEngine, MemoryMode, MemoryNodeKind,
+    MemoryQuery, MemoryScope, MemoryServerConfig, SqliteMemoryStore, import_canonical_jsonl, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -74,6 +74,8 @@ enum Command {
     Maintenance {
         #[arg(long)]
         vacuum: bool,
+        #[arg(long)]
+        repair_orphans: bool,
     },
     /// Create an online SQLite backup of the memory database.
     Backup {
@@ -297,6 +299,14 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("integrity_ok: {}", health.integrity_ok);
                 println!("foreign_key_violations: {}", health.foreign_key_violations);
+                println!("graph_integrity_ok: {}", health.graph_integrity_ok);
+                println!(
+                    "graph_orphans: edges_from={} edges_to={} node_spans={} cue_index={}",
+                    health.graph_integrity.orphan_edges_from,
+                    health.graph_integrity.orphan_edges_to,
+                    health.graph_integrity.orphan_node_spans,
+                    health.graph_integrity.orphan_cue_index_entries
+                );
                 println!("ledger_events: {}", health.stats.ledger_events);
                 println!("pending_events: {}", health.stats.pending_events);
                 println!("nodes: {}", health.stats.nodes);
@@ -309,10 +319,18 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Maintenance { vacuum } => {
+        Command::Maintenance {
+            vacuum,
+            repair_orphans,
+        } => {
             let engine = MemoryEngine::open(&cli.db)
                 .with_context(|| format!("open {}", cli.db.display()))?;
-            let report = engine.store().maintenance(vacuum)?;
+            let report = engine
+                .store()
+                .maintenance_with_options(MaintenanceOptions {
+                    vacuum,
+                    repair_orphans,
+                })?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Backup { path } => {
