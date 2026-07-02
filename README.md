@@ -31,6 +31,8 @@ The current implementation includes:
 - authenticated HTTP API for service deployments
 - production operations for schema/integrity health checks and SQLite
   maintenance, backup, and restore
+- database identity checks that reject unrelated SQLite files instead of
+  silently migrating them
 - service metrics, persisted audit events, and fixed-window request limiting
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
@@ -86,7 +88,9 @@ The default DB path is `.beater-memory/memory.db`; override with `--db`.
 Projection is atomic per ledger event. The engine uses an immediate SQLite
 transaction, rechecks that the event is still pending inside the transaction,
 then commits the memory nodes, edges, cue index, citations, and projected marker
-together.
+together. New databases are stamped with the Beater Memory SQLite
+`application_id`; existing databases must already carry that identity before
+schema migration runs.
 
 ```bash
 cargo run -p beater-memory -- health
