@@ -140,6 +140,7 @@ pub struct RememberHttpRequest {
     pub environment_id: Option<String>,
     pub kind: MemoryNodeKind,
     pub text: String,
+    pub idempotency_key: Option<String>,
     pub project: Option<bool>,
 }
 
@@ -623,9 +624,18 @@ async fn remember(
     if let Err(err) = validate_nonempty("text", &request.text) {
         return fail_request(&state, &ctx, err).await;
     }
+    if let Some(idempotency_key) = request.idempotency_key.as_deref()
+        && let Err(err) = validate_nonempty("idempotency_key", idempotency_key)
+    {
+        return fail_request(&state, &ctx, err).await;
+    }
 
     let tenant_id = request.tenant_id.clone();
     let project_id = request.project_id.clone();
+    let idempotency_key_hash = request
+        .idempotency_key
+        .as_deref()
+        .map(|key| stable_id("idempotency_key", &[key.trim()]));
     let result = with_engine(state.clone(), move |engine| {
         let mut event = LedgerEvent::direct_memory_write(
             &request.tenant_id,
@@ -634,6 +644,9 @@ async fn remember(
             request.text,
         );
         event.environment_id = request.environment_id;
+        if let Some(idempotency_key) = request.idempotency_key.as_deref() {
+            event.apply_idempotency_key(idempotency_key);
+        }
         let ingested = engine.ingest_event(&event)?;
         let project = if request.project.unwrap_or(true) {
             Some(engine.project_pending(100)?)
@@ -649,7 +662,8 @@ async fn remember(
         result,
         serde_json::json!({
             "tenant_id": tenant_id,
-            "project_id": project_id
+            "project_id": project_id,
+            "idempotency_key_hash": idempotency_key_hash
         }),
     )
     .await
@@ -1210,6 +1224,77 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
         assert!(answer.answer.contains("DATABASE_URL"));
         assert!(!answer.cited_spans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remember_idempotency_key_deduplicates_retries() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let remember = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "environment_id": "prod",
+            "kind": "fact",
+            "text": "Checkout uses DATABASE_URL.",
+            "idempotency_key": "retry-1",
+            "project": false
+        });
+
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/remember", remember.clone()))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let first: RememberHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(first.ingested);
+
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/remember", remember))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let second: RememberHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(!second.ingested);
+
+        let response = app
+            .oneshot(get_request("/v1/stats"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let stats: StoreStats = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(stats.ledger_events, 1);
+        assert_eq!(stats.pending_events, 1);
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_empty_idempotency_key() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let remember = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "kind": "fact",
+            "text": "Checkout uses DATABASE_URL.",
+            "idempotency_key": "   "
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/remember", remember))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

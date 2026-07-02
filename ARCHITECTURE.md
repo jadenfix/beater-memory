@@ -61,6 +61,8 @@ edges are projections that can be rebuilt.
      service metrics expose request totals, DB saturation, and DB timeouts;
      durable audit rows record successes, failures, denied auth, and throttled
      attempts.
+   - Writes: direct `remember` calls can carry an idempotency key so client
+     retries map to the same ledger event.
    - Shutdown: `serve` uses Axum graceful shutdown on Ctrl-C and SIGTERM on
      Unix; `serve_with_shutdown` exposes the same server loop with an injected
      shutdown future for embedding and tests.
@@ -96,6 +98,8 @@ Production safeguards:
 - each ledger event is projected inside `BEGIN IMMEDIATE ... COMMIT`
 - projection rechecks `projected_at_unix_ms IS NULL` inside the transaction so
   concurrent workers cannot double-count a stale pending row
+- direct writes can apply an idempotency key to stabilize the ledger
+  `trace_id + span_id + seq` for retry-safe ingestion
 - `health` runs schema, integrity, foreign-key, and count checks
 - `health` also reports graph projection orphan counts for edges, citations,
   and cue index rows because the current projection tables are not SQLite-FK
