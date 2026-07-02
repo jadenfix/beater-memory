@@ -53,10 +53,13 @@ edges are projections that can be rebuilt.
      `/v1/project`, `/v1/query`, `/v1/maintenance`, `/v1/metrics`,
      `/v1/metrics/prometheus`, `/v1/audit`
    - Auth: bearer token from `--bearer-token` or `BEATER_MEMORY_TOKEN` by
-     default; unauthenticated serving requires explicit `--allow-no-auth`
+     default; configured tokens are trimmed, blank tokens are rejected, and
+     unauthenticated serving requires explicit `--allow-no-auth`
    - Limits: max request body bytes, max projection batch size, max query token
-     budget, max concurrent blocking SQLite tasks, and DB task timeout are
-     configurable at startup.
+     budget, audit page size, max concurrent blocking SQLite tasks, and DB task
+     timeout are configurable at startup. Public request limits must be
+     positive; the rate limiter, DB concurrency limiter, and DB timeout keep
+     their documented zero-value controls.
    - Controls: a fixed-window per-actor limiter protects `/v1/*`; in-memory
      JSON and Prometheus service metrics expose request totals, DB saturation,
      and DB timeouts; durable audit rows record successes, failures, denied

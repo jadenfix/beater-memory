@@ -79,7 +79,7 @@ impl MemoryServerConfig {
 
     #[must_use]
     pub fn with_bearer_token(mut self, bearer_token: impl Into<String>) -> Self {
-        self.bearer_token = Some(bearer_token.into());
+        self.bearer_token = Some(bearer_token.into().trim().to_string());
         self
     }
 
@@ -118,6 +118,42 @@ impl MemoryServerConfig {
     pub fn with_db_task_timeout_ms(mut self, db_task_timeout_ms: u64) -> Self {
         self.db_task_timeout_ms = db_task_timeout_ms;
         self
+    }
+
+    /// Validate server settings before binding or embedding the router.
+    ///
+    /// A zero rate limit disables rate limiting, a zero DB concurrency limit
+    /// intentionally makes DB-backed routes shed load, and a zero DB timeout is
+    /// accepted for tests that need deterministic timeout behavior.
+    pub fn validate(&self) -> MemoryResult<()> {
+        if self
+            .bearer_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(MemoryError::invalid("bearer token must not be empty"));
+        }
+        if self.max_body_bytes == 0 {
+            return Err(MemoryError::invalid(
+                "max_body_bytes must be greater than 0",
+            ));
+        }
+        if self.max_project_limit == 0 {
+            return Err(MemoryError::invalid(
+                "max_project_limit must be greater than 0",
+            ));
+        }
+        if self.max_query_tokens == 0 {
+            return Err(MemoryError::invalid(
+                "max_query_tokens must be greater than 0",
+            ));
+        }
+        if self.max_audit_limit == 0 {
+            return Err(MemoryError::invalid(
+                "max_audit_limit must be greater than 0",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -443,6 +479,12 @@ impl RateLimiter {
 
 /// Build the HTTP API router.
 pub fn memory_router(config: MemoryServerConfig) -> Router {
+    try_memory_router(config).expect("invalid memory server config")
+}
+
+/// Build the HTTP API router after validating server settings.
+pub fn try_memory_router(config: MemoryServerConfig) -> MemoryResult<Router> {
+    config.validate()?;
     let max_body_bytes = config.max_body_bytes;
     let state = MemoryServerState {
         metrics: Arc::new(Mutex::new(ServiceMetricsSnapshot::new())),
@@ -454,7 +496,7 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
         config: Arc::new(config),
     };
 
-    Router::new()
+    Ok(Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/health", get(health))
@@ -468,7 +510,7 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
         .route("/v1/maintenance", post(maintenance))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(middleware::from_fn(request_id_middleware))
-        .with_state(state)
+        .with_state(state))
 }
 
 /// Run the HTTP server until Ctrl-C or SIGTERM on Unix.
@@ -482,7 +524,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let bind_addr = config.bind_addr;
-    let router = memory_router(config);
+    let router = try_memory_router(config)?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
@@ -1409,6 +1451,54 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn server_config_normalizes_and_validates_inputs() {
+        let config = test_config()
+            .with_bearer_token("  secret  ")
+            .with_limits(4096, 10, 100)
+            .with_audit_limit(10);
+
+        assert_eq!(config.bearer_token.as_deref(), Some("secret"));
+        config.validate().unwrap_or_else(|err| panic!("{err}"));
+
+        let err = test_config()
+            .with_bearer_token("   ")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("bearer token"));
+
+        let err = test_config()
+            .with_limits(0, 10, 100)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_body_bytes"));
+
+        let err = test_config()
+            .with_limits(4096, 0, 100)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_project_limit"));
+
+        let err = test_config()
+            .with_limits(4096, 10, 0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_query_tokens"));
+
+        let err = test_config().with_audit_limit(0).validate().unwrap_err();
+        assert!(err.to_string().contains("max_audit_limit"));
+    }
+
+    #[test]
+    fn fallible_router_rejects_invalid_config() {
+        let err = match try_memory_router(test_config().with_bearer_token(" ")) {
+            Ok(_) => panic!("invalid config should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("bearer token"));
+    }
+
     #[tokio::test]
     async fn v1_routes_require_bearer_auth() {
         let app = memory_router(test_config().with_bearer_token("secret"));
@@ -1540,6 +1630,15 @@ mod tests {
         serve_with_shutdown(test_config().with_bearer_token("secret"), async {})
             .await
             .unwrap_or_else(|err| panic!("{err}"));
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_rejects_invalid_config_before_binding() {
+        let err = serve_with_shutdown(test_config().with_bearer_token(" "), async {})
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("bearer token"));
     }
 
     #[tokio::test]
