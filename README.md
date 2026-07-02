@@ -29,6 +29,7 @@ The current implementation includes:
 - canonical span JSONL import aligned with `beater-agents` span kinds
 - CLI commands for `init`, `remember`, `project`, `query`, and import flows
 - authenticated HTTP API for service deployments
+- optional idempotency keys for retry-safe direct `remember` writes
 - production operations for schema/integrity health checks and SQLite
   maintenance, backup, and restore
 - graph projection integrity checks and orphan repair for edges, citations, and
@@ -48,6 +49,7 @@ The current implementation includes:
 cargo run -p beater-memory -- init
 
 cargo run -p beater-memory -- remember \
+  --idempotency-key demo-checkout-db-gotcha \
   --tenant local --project demo --kind gotcha \
   "Checkout fails when DATABASE_URL is missing. Fix by setting DATABASE_URL."
 
@@ -97,6 +99,11 @@ cargo run -p beater-memory -- import-jsonl \
 ```
 
 The default DB path is `.beater-memory/memory.db`; override with `--db`.
+
+For retryable direct writes, pass an idempotency key. Reusing the same key in
+the same tenant, project, environment, and memory kind maps the write to the same
+ledger event; repeated submissions return `ingested: false` over HTTP instead of
+appending duplicate ledger work.
 
 ## Operations
 
@@ -152,7 +159,7 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"tenant_id":"local","project_id":"demo","kind":"gotcha","text":"Checkout fails when DATABASE_URL is missing."}' \
+  -d '{"tenant_id":"local","project_id":"demo","kind":"gotcha","idempotency_key":"demo-checkout-db-gotcha","text":"Checkout fails when DATABASE_URL is missing."}' \
   http://127.0.0.1:8765/v1/remember
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \

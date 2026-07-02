@@ -65,6 +65,46 @@ impl LedgerEvent {
     }
 
     #[must_use]
+    pub fn direct_memory_write_with_idempotency_key(
+        tenant_id: impl Into<String>,
+        project_id: impl Into<String>,
+        kind: MemoryNodeKind,
+        text: impl Into<String>,
+        idempotency_key: &str,
+    ) -> Self {
+        Self::direct_memory_write(tenant_id, project_id, kind, text)
+            .with_idempotency_key(idempotency_key)
+    }
+
+    #[must_use]
+    pub fn with_idempotency_key(mut self, idempotency_key: &str) -> Self {
+        self.apply_idempotency_key(idempotency_key);
+        self
+    }
+
+    pub fn apply_idempotency_key(&mut self, idempotency_key: &str) {
+        let idempotency_key = idempotency_key.trim();
+        let environment_id = self.environment_id.as_deref().unwrap_or("");
+        self.trace_id = stable_id(
+            "direct_trace_idempotent",
+            &[
+                &self.tenant_id,
+                &self.project_id,
+                environment_id,
+                &self.name,
+                idempotency_key,
+            ],
+        );
+        self.span_id = stable_id("direct_span", &[&self.trace_id]);
+        if let Some(payload) = self.payload.as_object_mut() {
+            payload.insert(
+                "idempotency_key_hash".to_string(),
+                serde_json::json!(stable_id("idempotency_key", &[idempotency_key])),
+            );
+        }
+    }
+
+    #[must_use]
     pub fn cited_span(&self) -> CitedSpan {
         CitedSpan {
             tenant_id: self.tenant_id.clone(),
@@ -1462,6 +1502,38 @@ mod tests {
 
         assert!(store.append_event(&event)?);
         assert!(!store.append_event(&event)?);
+        assert_eq!(store.stats()?.ledger_events, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_memory_idempotency_key_stabilizes_ledger_key() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let mut first = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        first.environment_id = Some("prod".to_string());
+        first.apply_idempotency_key("retry-key");
+        let mut second = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        second.environment_id = Some("prod".to_string());
+        second.apply_idempotency_key("retry-key");
+
+        assert_eq!(first.trace_id, second.trace_id);
+        assert_eq!(first.span_id, second.span_id);
+        assert_eq!(
+            first.payload["idempotency_key_hash"],
+            second.payload["idempotency_key_hash"]
+        );
+        assert!(store.append_event(&first)?);
+        assert!(!store.append_event(&second)?);
         assert_eq!(store.stats()?.ledger_events, 1);
         Ok(())
     }

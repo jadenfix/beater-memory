@@ -58,6 +58,8 @@ enum Command {
         environment: Option<String>,
         #[arg(long, value_enum, default_value_t = NodeKindArg::Fact)]
         kind: NodeKindArg,
+        #[arg(long)]
+        idempotency_key: Option<String>,
         text: String,
     },
     /// Project pending ledger events into graph memory.
@@ -282,10 +284,17 @@ async fn main() -> anyhow::Result<()> {
             project,
             environment,
             kind,
+            idempotency_key,
             text,
         } => {
             let engine = MemoryEngine::open(&cli.db)
                 .with_context(|| format!("open {}", cli.db.display()))?;
+            if idempotency_key
+                .as_deref()
+                .is_some_and(|key| key.trim().is_empty())
+            {
+                anyhow::bail!("--idempotency-key must not be empty");
+            }
             let mut event = LedgerEvent::direct_memory_write(
                 &tenant,
                 &project,
@@ -293,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
                 text,
             );
             event.environment_id = environment;
+            if let Some(idempotency_key) = idempotency_key.as_deref() {
+                event.apply_idempotency_key(idempotency_key);
+            }
             engine.ingest_event(&event)?;
             let report = engine.project_pending(100)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
