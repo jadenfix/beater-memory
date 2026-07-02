@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr};
+use std::{path::Path, str::FromStr, time::Duration};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,9 @@ use crate::{
     model::{CitedSpan, MemoryEdgeKind, MemoryNodeKind, estimate_tokens},
     text::{canonical_key, now_unix_ms, stable_id, terms},
 };
+
+const SCHEMA_VERSION: u32 = 1;
+const SQLITE_APPLICATION_ID: i64 = 0x424D_454D;
 
 /// An append-only observation imported from a journal, span store, or direct write.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -135,6 +138,37 @@ impl<'a> StoreScope<'a> {
     }
 }
 
+/// Operational counts for the memory database.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreStats {
+    pub ledger_events: i64,
+    pub pending_events: i64,
+    pub nodes: i64,
+    pub active_nodes: i64,
+    pub edges: i64,
+}
+
+/// Health snapshot suitable for CLI output and service health endpoints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreHealth {
+    pub schema_version: u32,
+    pub expected_schema_version: u32,
+    pub integrity_ok: bool,
+    pub integrity_messages: Vec<String>,
+    pub foreign_key_violations: i64,
+    pub stats: StoreStats,
+}
+
+/// Result of a local maintenance pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceReport {
+    pub optimized: bool,
+    pub wal_checkpoint_busy: i64,
+    pub wal_checkpoint_log_frames: i64,
+    pub wal_checkpoint_checkpointed_frames: i64,
+    pub vacuumed: bool,
+}
+
 /// SQLite-backed local memory store.
 pub struct SqliteMemoryStore {
     conn: Connection,
@@ -148,6 +182,7 @@ impl SqliteMemoryStore {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        configure_connection(&conn)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -157,6 +192,7 @@ impl SqliteMemoryStore {
         let store = Self {
             conn: Connection::open_in_memory()?,
         };
+        configure_connection(&store.conn)?;
         store.migrate()?;
         Ok(store)
     }
@@ -166,11 +202,16 @@ impl SqliteMemoryStore {
     }
 
     fn migrate(&self) -> MemoryResult<()> {
+        let user_version: u32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if user_version > SCHEMA_VERSION {
+            return Err(MemoryError::invalid(format!(
+                "database schema version {user_version} is newer than supported version {SCHEMA_VERSION}"
+            )));
+        }
         self.conn.execute_batch(
             "
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-
             CREATE TABLE IF NOT EXISTS ledger_events(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source TEXT NOT NULL,
@@ -259,9 +300,31 @@ impl SqliteMemoryStore {
 
             CREATE INDEX IF NOT EXISTS idx_cue_scope
                 ON cue_index(tenant_id, project_id, environment_id, term);
+
+            PRAGMA user_version = 1;
             ",
         )?;
         Ok(())
+    }
+
+    pub(crate) fn with_immediate_transaction<T>(
+        &self,
+        f: impl FnOnce(&Self) -> MemoryResult<T>,
+    ) -> MemoryResult<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(self) {
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(err) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(err.into())
+                }
+            },
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
     pub fn append_event(&self, event: &LedgerEvent) -> MemoryResult<bool> {
@@ -316,6 +379,19 @@ impl SqliteMemoryStore {
             params![event_id, projected_at_unix_ms],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn event_is_pending(&self, event_id: i64) -> MemoryResult<bool> {
+        let pending = self
+            .conn
+            .query_row(
+                "SELECT projected_at_unix_ms IS NULL FROM ledger_events WHERE id = ?1",
+                params![event_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(pending)
     }
 
     pub fn active_neighbors(
@@ -672,7 +748,7 @@ impl SqliteMemoryStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn stats(&self) -> MemoryResult<serde_json::Value> {
+    pub fn stats(&self) -> MemoryResult<StoreStats> {
         let ledger_events: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))?;
@@ -692,13 +768,58 @@ impl SqliteMemoryStore {
         let edges: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0))?;
-        Ok(serde_json::json!({
-            "ledger_events": ledger_events,
-            "pending_events": pending_events,
-            "nodes": nodes,
-            "active_nodes": active_nodes,
-            "edges": edges,
-        }))
+        Ok(StoreStats {
+            ledger_events,
+            pending_events,
+            nodes,
+            active_nodes,
+            edges,
+        })
+    }
+
+    pub fn schema_version(&self) -> MemoryResult<u32> {
+        self.conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub fn health(&self) -> MemoryResult<StoreHealth> {
+        let schema_version = self.schema_version()?;
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
+        let integrity_messages = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let integrity_ok =
+            integrity_messages.len() == 1 && integrity_messages.first().is_some_and(|m| m == "ok");
+        let mut fk_stmt = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let foreign_key_violations = fk_stmt.query_map([], |_| Ok(()))?.count() as i64;
+        Ok(StoreHealth {
+            schema_version,
+            expected_schema_version: SCHEMA_VERSION,
+            integrity_ok,
+            integrity_messages,
+            foreign_key_violations,
+            stats: self.stats()?,
+        })
+    }
+
+    pub fn maintenance(&self, vacuum: bool) -> MemoryResult<MaintenanceReport> {
+        self.conn.execute_batch("PRAGMA optimize")?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if vacuum {
+            self.conn.execute_batch("VACUUM")?;
+        }
+        Ok(MaintenanceReport {
+            optimized: true,
+            wal_checkpoint_busy: busy,
+            wal_checkpoint_log_frames: log_frames,
+            wal_checkpoint_checkpointed_frames: checkpointed_frames,
+            vacuumed: vacuum,
+        })
     }
 
     fn attach_spans(&self, node_id: &str, cited_spans: &[CitedSpan]) -> MemoryResult<()> {
@@ -755,6 +876,19 @@ fn merge_node_text(existing: &str, incoming: &str) -> String {
     } else {
         format!("{} {}", existing.trim(), incoming)
     }
+}
+
+fn configure_connection(conn: &Connection) -> MemoryResult<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.execute_batch(&format!(
+        "
+        PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA application_id = {SQLITE_APPLICATION_ID};
+        "
+    ))?;
+    Ok(())
 }
 
 fn read_ledger_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEvent> {
@@ -847,10 +981,7 @@ mod tests {
 
         assert!(store.append_event(&event)?);
         assert!(!store.append_event(&event)?);
-        assert_eq!(
-            store.stats()?["ledger_events"],
-            serde_json::Value::Number(1.into())
-        );
+        assert_eq!(store.stats()?.ledger_events, 1);
         Ok(())
     }
 
@@ -884,6 +1015,29 @@ mod tests {
         assert!(!second_created);
         assert_eq!(node.observation_count, 2);
         assert_eq!(store.cited_spans_for_node(&node.id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn health_reports_schema_and_integrity() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let health = store.health()?;
+
+        assert_eq!(health.schema_version, SCHEMA_VERSION);
+        assert_eq!(health.expected_schema_version, SCHEMA_VERSION);
+        assert!(health.integrity_ok);
+        assert_eq!(health.foreign_key_violations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_reports_checkpoint_state() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let report = store.maintenance(false)?;
+
+        assert!(report.optimized);
+        assert!(!report.vacuumed);
+        assert!(report.wal_checkpoint_busy >= 0);
         Ok(())
     }
 }

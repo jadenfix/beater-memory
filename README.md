@@ -28,6 +28,8 @@ The current implementation includes:
 - `beater.js` journal import from `.beater/journal.db`
 - canonical span JSONL import aligned with `beater-agents` span kinds
 - CLI commands for `init`, `remember`, `project`, `query`, and import flows
+- production operations for schema/integrity health checks and SQLite
+  maintenance
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
 
@@ -43,6 +45,8 @@ cargo run -p beater-memory -- remember \
 cargo run -p beater-memory -- query \
   --tenant local --project demo \
   "How do I fix checkout database failures?"
+
+cargo run -p beater-memory -- health --json
 ```
 
 Import a `beater.js` journal:
@@ -62,12 +66,26 @@ cargo run -p beater-memory -- import-jsonl \
 
 The default DB path is `.beater-memory/memory.db`; override with `--db`.
 
+## Operations
+
+Projection is atomic per ledger event. The engine uses an immediate SQLite
+transaction, rechecks that the event is still pending inside the transaction,
+then commits the memory nodes, edges, cue index, citations, and projected marker
+together.
+
+```bash
+cargo run -p beater-memory -- health
+cargo run -p beater-memory -- maintenance
+cargo run -p beater-memory -- maintenance --vacuum
+```
+
 ## Crate API
 
 The public API exports:
 
 - `MemoryEngine`
 - `SqliteMemoryStore`
+- `StoreHealth`, `StoreStats`, and `MaintenanceReport`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`
 - `MemoryQuery` and `MemoryAnswer`
@@ -80,6 +98,7 @@ Run checks:
 ```bash
 cargo fmt --all --check
 cargo test
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Design Constraints

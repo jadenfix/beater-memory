@@ -65,6 +65,16 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
+    /// Run integrity, schema, and count checks.
+    Health {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run SQLite maintenance.
+    Maintenance {
+        #[arg(long)]
+        vacuum: bool,
+    },
     /// Query memory and return an answer-shaped context bundle.
     Query {
         #[arg(long, default_value = "local")]
@@ -172,14 +182,7 @@ fn main() -> anyhow::Result<()> {
                         "events_inserted": report.events_inserted,
                         "events_duplicate": report.events_duplicate,
                     },
-                    "project": project_report.map(|report| serde_json::json!({
-                        "events_seen": report.events_seen,
-                        "memories_added": report.memories_added,
-                        "memories_updated": report.memories_updated,
-                        "memories_invalidated": report.memories_invalidated,
-                        "memories_nooped": report.memories_nooped,
-                        "edges_added": report.edges_added,
-                    })),
+                    "project": project_report,
                 }))?
             );
         }
@@ -212,14 +215,7 @@ fn main() -> anyhow::Result<()> {
                         "events_inserted": report.events_inserted,
                         "events_duplicate": report.events_duplicate,
                     },
-                    "project": project_report.map(|report| serde_json::json!({
-                        "events_seen": report.events_seen,
-                        "memories_added": report.memories_added,
-                        "memories_updated": report.memories_updated,
-                        "memories_invalidated": report.memories_invalidated,
-                        "memories_nooped": report.memories_nooped,
-                        "edges_added": report.edges_added,
-                    })),
+                    "project": project_report,
                 }))?
             );
         }
@@ -241,35 +237,44 @@ fn main() -> anyhow::Result<()> {
             event.environment_id = environment;
             engine.ingest_event(&event)?;
             let report = engine.project_pending(100)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "project": {
-                        "events_seen": report.events_seen,
-                        "memories_added": report.memories_added,
-                        "memories_updated": report.memories_updated,
-                        "memories_invalidated": report.memories_invalidated,
-                        "memories_nooped": report.memories_nooped,
-                        "edges_added": report.edges_added,
-                    }
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Project { limit } => {
             let engine = MemoryEngine::open(&cli.db)
                 .with_context(|| format!("open {}", cli.db.display()))?;
             let report = engine.project_pending(limit)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "events_seen": report.events_seen,
-                    "memories_added": report.memories_added,
-                    "memories_updated": report.memories_updated,
-                    "memories_invalidated": report.memories_invalidated,
-                    "memories_nooped": report.memories_nooped,
-                    "edges_added": report.edges_added,
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Health { json } => {
+            let engine = MemoryEngine::open(&cli.db)
+                .with_context(|| format!("open {}", cli.db.display()))?;
+            let health = engine.store().health()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&health)?);
+            } else {
+                println!(
+                    "schema: {}/{}",
+                    health.schema_version, health.expected_schema_version
+                );
+                println!("integrity_ok: {}", health.integrity_ok);
+                println!("foreign_key_violations: {}", health.foreign_key_violations);
+                println!("ledger_events: {}", health.stats.ledger_events);
+                println!("pending_events: {}", health.stats.pending_events);
+                println!("nodes: {}", health.stats.nodes);
+                println!("edges: {}", health.stats.edges);
+                if !health.integrity_ok {
+                    println!(
+                        "integrity_messages: {}",
+                        health.integrity_messages.join("; ")
+                    );
+                }
+            }
+        }
+        Command::Maintenance { vacuum } => {
+            let engine = MemoryEngine::open(&cli.db)
+                .with_context(|| format!("open {}", cli.db.display()))?;
+            let report = engine.store().maintenance(vacuum)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Query {
             tenant,
