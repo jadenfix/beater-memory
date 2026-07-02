@@ -55,11 +55,12 @@ edges are projections that can be rebuilt.
    - Auth: bearer token from `--bearer-token` or `BEATER_MEMORY_TOKEN` by
      default; unauthenticated serving requires explicit `--allow-no-auth`
    - Limits: max request body bytes, max projection batch size, max query token
-     budget, and max concurrent blocking SQLite tasks are configurable at
-     startup.
+     budget, max concurrent blocking SQLite tasks, and DB task timeout are
+     configurable at startup.
    - Controls: a fixed-window per-actor limiter protects `/v1/*`; in-memory
-     service metrics expose request totals and DB saturation; durable audit rows
-     record successes, failures, denied auth, and throttled attempts.
+     service metrics expose request totals, DB saturation, and DB timeouts;
+     durable audit rows record successes, failures, denied auth, and throttled
+     attempts.
 
 ## Why No Embeddings In The MVP
 

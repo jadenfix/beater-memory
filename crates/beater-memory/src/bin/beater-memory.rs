@@ -113,6 +113,9 @@ enum Command {
         /// Maximum concurrent blocking SQLite tasks. Set 0 to reject DB-backed requests.
         #[arg(long, default_value_t = 32)]
         max_concurrent_db_tasks: usize,
+        /// Maximum wall time for one DB-backed HTTP task in milliseconds.
+        #[arg(long, default_value_t = 30_000)]
+        db_task_timeout_ms: u64,
     },
     /// Query memory and return an answer-shaped context bundle.
     Query {
@@ -367,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
             max_audit_limit,
             max_requests_per_minute,
             max_concurrent_db_tasks,
+            db_task_timeout_ms,
         } => {
             let token = bearer_token
                 .or_else(|| std::env::var(&bearer_token_env).ok())
@@ -380,7 +384,8 @@ async fn main() -> anyhow::Result<()> {
                 .with_limits(max_body_bytes, max_project_limit, max_query_tokens)
                 .with_audit_limit(max_audit_limit)
                 .with_rate_limit(max_requests_per_minute)
-                .with_db_concurrency_limit(max_concurrent_db_tasks);
+                .with_db_concurrency_limit(max_concurrent_db_tasks)
+                .with_db_task_timeout_ms(db_task_timeout_ms);
             if let Some(token) = token {
                 config = config.with_bearer_token(token);
             }

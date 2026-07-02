@@ -71,7 +71,9 @@ fixed-window limiter for a trusted local deployment. DB-backed HTTP requests are
 also capped at 32 concurrent blocking SQLite tasks by default; use
 `--max-concurrent-db-tasks` to tune this. When saturated, DB-backed routes return
 `503 service_busy` with `Retry-After`, while `/livez` and `/v1/metrics` remain
-available.
+available. Each DB-backed task also has a 30s wall-time budget by default;
+adjust it with `--db-task-timeout-ms`. Timed-out DB routes return
+`504 service_timeout` and increment `db_timeout_requests`.
 
 Import a `beater.js` journal:
 

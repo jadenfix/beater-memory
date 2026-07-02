@@ -14,6 +14,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+use tokio::time::{Duration, timeout};
 
 use crate::{
     MemoryEngine, ProjectReport,
@@ -32,6 +33,7 @@ const DEFAULT_MAX_QUERY_TOKENS: u32 = 8_000;
 const DEFAULT_MAX_AUDIT_LIMIT: usize = 500;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: u32 = 600;
 const DEFAULT_MAX_CONCURRENT_DB_TASKS: usize = 32;
+const DEFAULT_DB_TASK_TIMEOUT_MS: u64 = 30_000;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
 
 /// HTTP server configuration.
@@ -46,6 +48,7 @@ pub struct MemoryServerConfig {
     pub max_audit_limit: usize,
     pub max_requests_per_minute: u32,
     pub max_concurrent_db_tasks: usize,
+    pub db_task_timeout_ms: u64,
 }
 
 impl MemoryServerConfig {
@@ -61,6 +64,7 @@ impl MemoryServerConfig {
             max_audit_limit: DEFAULT_MAX_AUDIT_LIMIT,
             max_requests_per_minute: DEFAULT_MAX_REQUESTS_PER_MINUTE,
             max_concurrent_db_tasks: DEFAULT_MAX_CONCURRENT_DB_TASKS,
+            db_task_timeout_ms: DEFAULT_DB_TASK_TIMEOUT_MS,
         }
     }
 
@@ -98,6 +102,12 @@ impl MemoryServerConfig {
     #[must_use]
     pub fn with_db_concurrency_limit(mut self, max_concurrent_db_tasks: usize) -> Self {
         self.max_concurrent_db_tasks = max_concurrent_db_tasks;
+        self
+    }
+
+    #[must_use]
+    pub fn with_db_task_timeout_ms(mut self, db_task_timeout_ms: u64) -> Self {
+        self.db_task_timeout_ms = db_task_timeout_ms;
         self
     }
 }
@@ -169,6 +179,7 @@ pub struct ServiceMetricsSnapshot {
     pub unauthorized_requests: u64,
     pub rate_limited_requests: u64,
     pub db_busy_requests: u64,
+    pub db_timeout_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
     pub live_requests: u64,
@@ -191,6 +202,7 @@ impl ServiceMetricsSnapshot {
             unauthorized_requests: 0,
             rate_limited_requests: 0,
             db_busy_requests: 0,
+            db_timeout_requests: 0,
             successful_requests: 0,
             failed_requests: 0,
             live_requests: 0,
@@ -265,6 +277,15 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "service_busy",
             message: "database work queue is full; retry later".to_string(),
+            retry_after_seconds: Some(1),
+        }
+    }
+
+    fn service_timeout(timeout_ms: u64) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "service_timeout",
+            message: format!("database task exceeded {timeout_ms}ms"),
             retry_after_seconds: Some(1),
         }
     }
@@ -666,9 +687,19 @@ where
         let _permit = permit;
         let engine = MemoryEngine::open(db_path)?;
         f(engine)
-    })
+    });
+    let result = match timeout(
+        Duration::from_millis(state.config.db_task_timeout_ms),
+        result,
+    )
     .await
-    .map_err(|err| ApiError::internal(err.to_string()))?;
+    {
+        Ok(join_result) => join_result.map_err(|err| ApiError::internal(err.to_string()))?,
+        Err(_) => {
+            record_db_timeout(&state);
+            return Err(ApiError::service_timeout(state.config.db_task_timeout_ms));
+        }
+    };
     result.map(Json).map_err(Into::into)
 }
 
@@ -901,6 +932,14 @@ fn record_db_busy(state: &MemoryServerState) {
         .db_busy_requests += 1;
 }
 
+fn record_db_timeout(state: &MemoryServerState) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .db_timeout_requests += 1;
+}
+
 fn error_detail(err: &ApiError) -> serde_json::Value {
     serde_json::json!({
         "code": err.code,
@@ -1131,6 +1170,43 @@ mod tests {
         let metrics: ServiceMetricsSnapshot =
             serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(metrics.db_busy_requests, 1);
+        assert_eq!(metrics.failed_requests, 1);
+        assert_eq!(metrics.successful_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn db_task_timeout_returns_gateway_timeout() {
+        let app = memory_router(
+            test_config()
+                .with_bearer_token("secret")
+                .with_db_task_timeout_ms(0),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/v1/stats"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "service_timeout");
+
+        let response = app
+            .oneshot(get_request("/v1/metrics"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let metrics: ServiceMetricsSnapshot =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(metrics.db_timeout_requests, 1);
         assert_eq!(metrics.failed_requests, 1);
         assert_eq!(metrics.successful_requests, 1);
     }
