@@ -288,6 +288,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&health)?);
             } else {
                 println!(
+                    "application_id: {}/{}",
+                    health.application_id, health.expected_application_id
+                );
+                println!(
                     "schema: {}/{}",
                     health.schema_version, health.expected_schema_version
                 );

@@ -1,6 +1,6 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
-use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
+use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -152,6 +152,8 @@ pub struct StoreStats {
 /// Health snapshot suitable for CLI output and service health endpoints.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreHealth {
+    pub application_id: i64,
+    pub expected_application_id: i64,
     pub schema_version: u32,
     pub expected_schema_version: u32,
     pub integrity_ok: bool,
@@ -228,6 +230,7 @@ impl SqliteMemoryStore {
         configure_connection(&conn)?;
         let store = Self { conn };
         store.migrate()?;
+        configure_persistent_database(&store.conn)?;
         Ok(store)
     }
 
@@ -237,6 +240,7 @@ impl SqliteMemoryStore {
         };
         configure_connection(&store.conn)?;
         store.migrate()?;
+        configure_persistent_database(&store.conn)?;
         Ok(store)
     }
 
@@ -245,6 +249,7 @@ impl SqliteMemoryStore {
     }
 
     fn migrate(&self) -> MemoryResult<()> {
+        self.validate_database_identity()?;
         let user_version: u32 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -364,6 +369,10 @@ impl SqliteMemoryStore {
             ",
         )?;
         Ok(())
+    }
+
+    fn validate_database_identity(&self) -> MemoryResult<()> {
+        validate_database_identity(&self.conn, true)
     }
 
     pub(crate) fn with_immediate_transaction<T>(
@@ -879,8 +888,15 @@ impl SqliteMemoryStore {
             .map_err(Into::into)
     }
 
+    pub fn application_id(&self) -> MemoryResult<i64> {
+        self.conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
     pub fn health(&self) -> MemoryResult<StoreHealth> {
         let schema_version = self.schema_version()?;
+        let application_id = self.application_id()?;
         let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
         let integrity_messages = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -896,6 +912,8 @@ impl SqliteMemoryStore {
             integrity_messages,
             foreign_key_violations,
             stats: self.stats()?,
+            application_id,
+            expected_application_id: SQLITE_APPLICATION_ID,
         })
     }
 
@@ -949,6 +967,7 @@ impl SqliteMemoryStore {
                 path.display()
             )));
         }
+        validate_restore_source(path)?;
         self.conn.restore(
             MAIN_DB,
             path,
@@ -1022,14 +1041,72 @@ fn merge_node_text(existing: &str, incoming: &str) -> String {
 
 fn configure_connection(conn: &Connection) -> MemoryResult<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
-    conn.execute_batch(&format!(
+    conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
+        ",
+    )?;
+    Ok(())
+}
+
+fn configure_persistent_database(conn: &Connection) -> MemoryResult<()> {
+    conn.execute_batch(
+        "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
-        PRAGMA application_id = {SQLITE_APPLICATION_ID};
+        ",
+    )?;
+    Ok(())
+}
+
+fn validate_restore_source(path: &Path) -> MemoryResult<()> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    validate_database_identity(&conn, false)?;
+    let user_version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version > SCHEMA_VERSION {
+        return Err(MemoryError::invalid(format!(
+            "restore source schema version {user_version} is newer than supported version {SCHEMA_VERSION}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_database_identity(conn: &Connection, initialize_empty: bool) -> MemoryResult<()> {
+    let application_id: i64 = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    if application_id == SQLITE_APPLICATION_ID {
+        return Ok(());
+    }
+    if application_id != 0 {
+        return Err(MemoryError::invalid(format!(
+            "database application_id {application_id} is not beater-memory application_id {SQLITE_APPLICATION_ID}"
+        )));
+    }
+    let user_version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if initialize_empty && user_version == 0 && !database_has_user_objects(conn)? {
+        set_application_id(conn)?;
+        return Ok(());
+    }
+    Err(MemoryError::invalid(
+        "refusing to initialize a SQLite database that was not created by beater-memory",
+    ))
+}
+
+fn database_has_user_objects(conn: &Connection) -> MemoryResult<bool> {
+    let count: i64 = conn.query_row(
         "
-    ))?;
+        SELECT COUNT(*)
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+          AND type IN ('table', 'index', 'trigger', 'view')
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn set_application_id(conn: &Connection) -> MemoryResult<()> {
+    conn.execute_batch(&format!("PRAGMA application_id = {SQLITE_APPLICATION_ID};"))?;
     Ok(())
 }
 
@@ -1184,10 +1261,106 @@ mod tests {
         let store = SqliteMemoryStore::in_memory()?;
         let health = store.health()?;
 
+        assert_eq!(health.application_id, SQLITE_APPLICATION_ID);
+        assert_eq!(health.expected_application_id, SQLITE_APPLICATION_ID);
         assert_eq!(health.schema_version, SCHEMA_VERSION);
         assert_eq!(health.expected_schema_version, SCHEMA_VERSION);
         assert!(health.integrity_ok);
         assert_eq!(health.foreign_key_violations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn new_database_is_stamped_with_beater_memory_identity() -> MemoryResult<()> {
+        let path = temp_path("identity.db");
+        let store = SqliteMemoryStore::open(&path)?;
+
+        assert_eq!(store.application_id()?, SQLITE_APPLICATION_ID);
+        assert_eq!(store.schema_version()?, SCHEMA_VERSION);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn version_one_database_migrates_after_identity_check() -> MemoryResult<()> {
+        let path = temp_path("v1.db");
+        {
+            let conn = Connection::open(&path)?;
+            set_application_id(&conn)?;
+            conn.execute_batch(
+                "
+                CREATE TABLE ledger_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    environment_id TEXT,
+                    trace_id TEXT NOT NULL,
+                    span_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    span_kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    observed_at_unix_ms INTEGER NOT NULL,
+                    ingested_at_unix_ms INTEGER NOT NULL,
+                    projected_at_unix_ms INTEGER,
+                    UNIQUE(tenant_id, project_id, trace_id, span_id, seq)
+                );
+                INSERT INTO ledger_events(
+                    source, tenant_id, project_id, trace_id, span_id, seq, span_kind,
+                    name, status, text, payload_json, observed_at_unix_ms, ingested_at_unix_ms
+                ) VALUES (
+                    'test', 'tenant', 'project', 'trace', 'span', 1, 'memory.write',
+                    'fact', 'ok', 'Existing v1 data survives migration.', '{}', 1, 1
+                );
+                PRAGMA user_version = 1;
+                ",
+            )?;
+        }
+
+        let store = SqliteMemoryStore::open(&path)?;
+
+        assert_eq!(store.application_id()?, SQLITE_APPLICATION_ID);
+        assert_eq!(store.schema_version()?, SCHEMA_VERSION);
+        assert_eq!(store.stats()?.ledger_events, 1);
+        assert_eq!(store.stats()?.audit_events, 0);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_sqlite_database_is_rejected_without_restamping() -> MemoryResult<()> {
+        let path = temp_path("foreign.db");
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "
+                CREATE TABLE foreign_data(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO foreign_data(value) VALUES ('do not touch');
+                ",
+            )?;
+        }
+
+        let err = match SqliteMemoryStore::open(&path) {
+            Ok(_) => panic!("foreign database should not open as beater-memory"),
+            Err(err) => err,
+        };
+        let conn = Connection::open(&path)?;
+        let application_id: i64 = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        let value: String =
+            conn.query_row("SELECT value FROM foreign_data WHERE id = 1", [], |row| {
+                row.get(0)
+            })?;
+
+        assert!(err.to_string().contains("refusing to initialize"));
+        assert_eq!(application_id, 0);
+        assert_eq!(value, "do not touch");
+
+        let _ = std::fs::remove_file(path);
         Ok(())
     }
 
@@ -1233,6 +1406,39 @@ mod tests {
         assert_eq!(report.stats.ledger_events, 1);
         assert_eq!(report.stats.nodes, 1);
         let _ = std::fs::remove_file(backup_path);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_foreign_sqlite_before_replacing_active_data() -> MemoryResult<()> {
+        let mut store = SqliteMemoryStore::in_memory()?;
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "This active memory must survive failed restore.",
+        );
+        store.append_event(&event)?;
+        let foreign_path = temp_path("foreign-restore.db");
+        {
+            let conn = Connection::open(&foreign_path)?;
+            conn.execute_batch(
+                "
+                CREATE TABLE foreign_data(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO foreign_data(value) VALUES ('not a memory backup');
+                ",
+            )?;
+        }
+
+        let err = match store.restore_from(&foreign_path) {
+            Ok(_) => panic!("foreign database should not restore as beater-memory"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("refusing to initialize"));
+        assert_eq!(store.stats()?.ledger_events, 1);
+
+        let _ = std::fs::remove_file(foreign_path);
         Ok(())
     }
 

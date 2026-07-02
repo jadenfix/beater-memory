@@ -85,6 +85,8 @@ Production safeguards:
 
 - every connection enables `foreign_keys`, `busy_timeout`, WAL mode, and
   `synchronous=NORMAL`
+- new databases are stamped with the Beater Memory SQLite `application_id`;
+  existing SQLite files must already have that identity before migration runs
 - `PRAGMA user_version` records the supported schema version
 - each ledger event is projected inside `BEGIN IMMEDIATE ... COMMIT`
 - projection rechecks `projected_at_unix_ms IS NULL` inside the transaction so
