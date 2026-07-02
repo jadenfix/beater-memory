@@ -61,6 +61,9 @@ edges are projections that can be rebuilt.
      service metrics expose request totals, DB saturation, and DB timeouts;
      durable audit rows record successes, failures, denied auth, and throttled
      attempts.
+   - Shutdown: `serve` uses Axum graceful shutdown on Ctrl-C and SIGTERM on
+     Unix; `serve_with_shutdown` exposes the same server loop with an injected
+     shutdown future for embedding and tests.
 
 ## Why No Embeddings In The MVP
 
@@ -99,6 +102,8 @@ Production safeguards:
   constrained
 - `readyz` uses the same DB concurrency and timeout guard as normal DB-backed
   requests, but returns only coarse readiness state
+- service shutdown drains through Axum graceful shutdown on Ctrl-C and Unix
+  SIGTERM
 - `maintenance` runs SQLite optimize and WAL checkpointing, with optional vacuum
   and explicit orphan repair
 - `maintenance` also owns explicit audit retention, either by Unix millisecond

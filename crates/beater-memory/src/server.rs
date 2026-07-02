@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -458,17 +459,56 @@ pub fn memory_router(config: MemoryServerConfig) -> Router {
         .with_state(state)
 }
 
-/// Run the HTTP server until Ctrl-C.
+/// Run the HTTP server until Ctrl-C or SIGTERM on Unix.
 pub async fn serve(config: MemoryServerConfig) -> MemoryResult<()> {
+    serve_with_shutdown(config, shutdown_signal()).await
+}
+
+/// Run the HTTP server until the provided shutdown future resolves.
+pub async fn serve_with_shutdown<F>(config: MemoryServerConfig, shutdown: F) -> MemoryResult<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let bind_addr = config.bind_addr;
     let router = memory_router(config);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to install Ctrl-C shutdown handler: {err}");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(err) => {
+                    eprintln!("failed to install SIGTERM shutdown handler: {err}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+    }
 }
 
 async fn livez(State(state): State<MemoryServerState>) -> Json<LiveResponse> {
@@ -1126,6 +1166,13 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(ready.status, "ok");
         assert_eq!(ready.database, "ok");
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_exits_when_shutdown_future_resolves() {
+        serve_with_shutdown(test_config().with_bearer_token("secret"), async {})
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
     }
 
     #[tokio::test]
