@@ -38,6 +38,11 @@ edges are projections that can be rebuilt.
      `"update"`, `"invalidate"`, `"noop"`). Provider output is parsed through a
      strict JSON batch schema; malformed JSON or invalid memories get bounded
      repair attempts before rejection.
+   - Provider output can attach typed `relation_edges` from an emitted memory
+     to existing scoped neighbor memories. Providers may emit domain relation
+     kinds (`caused_by`, `fixes`, `before`, `after`, `part_of`, `blocks`,
+     `enables`); revision and projection-scaffolding edge kinds remain
+     engine-owned. The engine validates relation edge targets before projection.
    - Projection validates required text, cited-span provenance, scoped target
      IDs, and invalidation/noop shape before touching graph tables. Targetless
      invalidations with no resolvable neighbor are normalized to adds instead
@@ -67,6 +72,11 @@ edges are projections that can be rebuilt.
      `contradicts`, plus causal/procedural edge kinds reserved in the model.
    - Contradicted memory is invalidated with `valid_to_unix_ms`; it is not
      deleted.
+   - Projection-created graph edges carry the source ledger event when the edge
+     came from distillation or projection scaffolding. Legacy source-less edges
+     remain usable for current reads but are hidden from transaction-time reads;
+     schema migration resets source-less projection rows so they can be replayed
+     with provenance.
 
 4. **Read Path**
    - Validate query scope, question text, token budget, and enabled memory modes
@@ -88,8 +98,8 @@ edges are projections that can be rebuilt.
      propagation, ACT-R-like base-level activation, edge weights, and freshness
    - Reads are bitemporal: `as_of_unix_ms` is the observed validity boundary,
      and `known_at_unix_ms` is the ledger transaction-time boundary based on
-     event ingestion. Future-known facts and invalidations are excluded until
-     their source events are known.
+     event ingestion. Future-known facts, invalidations, and sourced ordinary
+     graph edges are excluded until their source events are known.
    - Tier 2: optional active reconstruction that escalates forced queries and
      hard auto queries into bounded graph expansion through an
      `ActiveReconstructor` policy. The default policy is deterministic and
@@ -174,7 +184,8 @@ The default database is SQLite. Tables are intentionally boring:
 
 - `ledger_events`: imported or direct observations
 - `memory_nodes`: bitemporal typed memories
-- `memory_edges`: typed graph relationships
+- `memory_edges`: typed graph relationships, with optional source event
+  provenance for transaction-time visibility
 - `node_spans`: many-to-many provenance citations
 - `cue_index`: deterministic lexical seed index
 - `audit_events`: durable service audit records

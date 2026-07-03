@@ -1,15 +1,18 @@
 use crate::{
     error::{MemoryError, MemoryResult},
-    model::{BeliefRevisionOp, DistilledMemory, MemoryNodeKind, estimate_tokens},
+    model::{BeliefRevisionOp, DistilledEdge, DistilledMemory, MemoryNodeKind, estimate_tokens},
     store::{LedgerEvent, MemoryNode},
     text::{concise, overlap_score, stable_id},
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
+    env, fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -217,6 +220,7 @@ impl CommandDistillationProviderConfig {
                 "distillation command timeout_ms must be greater than 0",
             ));
         }
+        validate_command_path(&self.command)?;
         Ok(())
     }
 
@@ -371,6 +375,66 @@ impl CommandDistillationProvider {
     }
 }
 
+fn validate_command_path(command: &Path) -> MemoryResult<()> {
+    if command.is_absolute() || command.components().count() > 1 {
+        validate_command_file(command)
+    } else if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            let candidate = dir.join(command);
+            if command_file_is_executable(&candidate) {
+                return Ok(());
+            }
+        }
+        Err(MemoryError::invalid(format!(
+            "distillation command {:?} was not found in PATH or is not executable",
+            command
+        )))
+    } else {
+        Err(MemoryError::invalid(format!(
+            "distillation command {:?} was not found because PATH is unset",
+            command
+        )))
+    }
+}
+
+fn validate_command_file(command: &Path) -> MemoryResult<()> {
+    if command_file_is_executable(command) {
+        Ok(())
+    } else {
+        match fs::metadata(command) {
+            Ok(metadata) if !metadata.is_file() => Err(MemoryError::invalid(format!(
+                "distillation command {:?} is not a file",
+                command
+            ))),
+            Ok(_) => Err(MemoryError::invalid(format!(
+                "distillation command {:?} is not executable",
+                command
+            ))),
+            Err(err) => Err(MemoryError::invalid(format!(
+                "distillation command {:?} is not accessible: {err}",
+                command
+            ))),
+        }
+    }
+}
+
+fn command_file_is_executable(command: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(command) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn terminate_child(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -479,6 +543,7 @@ impl Distiller for HeuristicDistiller {
                 node_kind: MemoryNodeKind::Episode,
                 text: String::new(),
                 target_node_id: None,
+                relation_edges: Vec::new(),
                 cited_spans: vec![event.cited_span()],
             }]));
         }
@@ -503,6 +568,7 @@ impl Distiller for HeuristicDistiller {
             node_kind: kind,
             text: body,
             target_node_id,
+            relation_edges: Vec::new(),
             cited_spans: vec![cited_span],
         });
         Ok(DistillOutcome::accepted(out))
@@ -613,6 +679,8 @@ struct ProviderMemory {
     node_kind: MemoryNodeKind,
     text: String,
     target_node_id: Option<String>,
+    #[serde(default)]
+    relation_edges: Vec<DistilledEdge>,
     cited_spans: Vec<crate::model::CitedSpan>,
 }
 
@@ -630,6 +698,7 @@ fn parse_provider_output(raw: &str) -> Result<Vec<DistilledMemory>, String> {
             node_kind: memory.node_kind,
             text: memory.text,
             target_node_id: memory.target_node_id,
+            relation_edges: memory.relation_edges,
             cited_spans: memory.cited_spans,
         })
         .collect::<Vec<_>>();
@@ -922,6 +991,15 @@ mod tests {
         assert!(err.to_string().contains("UTF-8"));
     }
 
+    #[test]
+    fn command_provider_config_rejects_missing_command_path() {
+        let err = CommandDistillationProviderConfig::new("./missing-distiller-command")
+            .validate()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("distillation command"));
+    }
+
     fn provider_json(event: &LedgerEvent, text: &str) -> String {
         serde_json::json!({
             "memories": [{
@@ -953,6 +1031,40 @@ mod tests {
         assert_eq!(outcome.metrics.repair_attempts, 0);
         assert!(outcome.metrics.input_tokens > 0);
         assert!(outcome.metrics.output_tokens > 0);
+    }
+
+    #[test]
+    fn provider_distiller_accepts_typed_relation_edges() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let raw = serde_json::json!({
+            "memories": [{
+                "op": "add",
+                "node_kind": "procedure",
+                "text": "Set DATABASE_URL before running migrations.",
+                "target_node_id": null,
+                "relation_edges": [{
+                    "kind": "fixes",
+                    "target_node_id": "node_checkout_gotcha"
+                }],
+                "cited_spans": [event.cited_span()]
+            }]
+        })
+        .to_string();
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Ok(raw),
+            repaired: None,
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!outcome.rejected);
+        assert_eq!(outcome.memories[0].relation_edges.len(), 1);
+        assert_eq!(
+            outcome.memories[0].relation_edges[0].kind,
+            crate::model::MemoryEdgeKind::Fixes
+        );
     }
 
     #[test]
@@ -1021,6 +1133,39 @@ mod tests {
                 "target_node_id": null,
                 "cited_spans": [event.cited_span()],
                 "unexpected": true
+            }]
+        })
+        .to_string();
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Ok(raw),
+            repaired: None,
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(outcome.rejected);
+        assert_eq!(outcome.metrics.schema_errors, 1);
+        assert_eq!(outcome.metrics.repair_attempts, 1);
+        assert_eq!(outcome.metrics.rejected_outputs, 1);
+    }
+
+    #[test]
+    fn provider_distiller_rejects_unknown_relation_edge_fields() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let raw = serde_json::json!({
+            "memories": [{
+                "op": "add",
+                "node_kind": "fact",
+                "text": "Checkout uses DATABASE_URL.",
+                "target_node_id": null,
+                "relation_edges": [{
+                    "kind": "fixes",
+                    "target_node_id": "node_checkout",
+                    "unexpected": true
+                }],
+                "cited_spans": [event.cited_span()]
             }]
         })
         .to_string();

@@ -27,6 +27,9 @@ The current implementation includes:
   inside projection write transactions
 - opt-in command-backed provider distillation for CLI and HTTP manage paths,
   with a per-call timeout and bounded repair attempts
+- provider distillation can emit typed relation edges to scoped neighbor
+  memories; projected edges carry source-event provenance so bitemporal
+  `known_at_unix_ms` reads traverse only relationships known at that time
 - opt-in command-backed active reconstruction for CLI and HTTP query paths,
   with strict decision parsing, candidate validation, and provider metrics
 - memory economics telemetry for projection source/stored-token estimates,
@@ -234,6 +237,9 @@ malformed output. It must write provider JSON on stdout:
       "node_kind": "fact",
       "text": "Distilled memory text",
       "target_node_id": null,
+      "relation_edges": [
+        {"kind": "fixes", "target_node_id": "existing-scoped-neighbor-id"}
+      ],
       "cited_spans": [
         {"tenant_id": "local", "project_id": "demo", "trace_id": "trace", "span_id": "span", "seq": 1}
       ]
@@ -252,6 +258,14 @@ projections if any already projected event is missing a matching durable batch.
 Replay-safe provider batches may use `add` and `noop` freely; `update` and
 `invalidate` must include an explicit `target_node_id` after validation so
 rebuild does not re-resolve targets against a different neighbor set.
+`relation_edges` may point from the emitted memory to an existing scoped
+neighbor by `target_node_id`. Providers may emit domain relation kinds
+`caused_by`, `fixes`, `before`, `after`, `part_of`, `blocks`, and `enables`;
+revision and projection-scaffolding kinds such as `supersedes`, `contradicts`,
+`mentions`, `derived_from`, and `observed_in` are reserved for the engine.
+Projected relation edges record the source ledger event, allowing
+`known_at_unix_ms` reads and active reconstruction to use only relationships
+that were known by the query's transaction-time boundary.
 The current command fingerprint includes the command path string, JSON command
 arguments, and effective repair budget; it does not include provider file
 contents, environment variables, cwd-dependent behavior, timeout, or model
@@ -355,7 +369,10 @@ maintenance reports graph integrity before and after the pass, and only removes
 orphan projection rows when `--repair-orphans` or HTTP `repair_orphans: true` is
 set. Projection rebuild clears only derived memory nodes, edges, citations, cue
 indexes, and projection markers, then replays the append-only ledger; audit rows
-and ledger events remain intact. Audit retention is explicit: maintenance can
+and ledger events remain intact. Schema upgrades that introduce source-event
+edge provenance reset legacy source-less projection rows when needed so the next
+manage/rebuild pass regenerates edges with bitemporal provenance. Audit
+retention is explicit: maintenance can
 drop rows older than a Unix millisecond cutoff and/or keep only the newest N
 audit rows. If both are set, age pruning runs first and newest-row retention is
 applied to the remaining audit trail.
@@ -421,8 +438,9 @@ Key public API exports include:
   `ReconstructionStep`
 - `MemoryQuery` and `MemoryAnswer`
 - `MemoryTier`, `MemoryMode`, `MemoryNodeKind`, `MemoryEdgeKind`,
-  `BeliefRevisionOp`, `RoutingReason`, `RoutingReport`, `ReconstructionMode`,
-  `ReconstructionOptions`, `ReconstructionReason`, and `ReconstructionReport`
+  `BeliefRevisionOp`, `DistilledEdge`, `RoutingReason`, `RoutingReport`,
+  `ReconstructionMode`, `ReconstructionOptions`, `ReconstructionReason`, and
+  `ReconstructionReport`
 - `EVAL_CONTRACT_VERSION`, `EvalSuite`, `EvalSuiteSource`, `EvalCase`,
   `EvalEvent`, `EvalOptions`, `EvalReport`, `EvalReportSource`,
   `EvalExpectationReport`, `EvalAbility`, `EvalScoreKind`,
@@ -450,7 +468,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Provider-backed distillation must happen outside projection write
   transactions, use constrained schemas with snake_case JSON values such as
   `"add"` and `"invalidate"`, repair or reject malformed output, and emit
-  provider/repair/rejection counters before writing projections.
+  provider/repair/rejection counters before writing projections. Provider
+  relation edges must target scoped neighbor memories and are stored with source
+  event provenance for bitemporal graph traversal.
 - Retrieval returns an answer-shaped evidence bundle, not raw chunks.
 - Token cost, read latency, write amplification, and context pollution are
   first-class metrics.

@@ -33,11 +33,11 @@ pub use imports::{
     BeaterJsImportReport, BeaterJsJournal, CanonicalJsonlImportReport, import_canonical_jsonl,
 };
 pub use model::{
-    ActivationWeights, BeliefRevisionOp, CitedSpan, Contradiction, DistilledMemory, Evidence,
-    MemoryAnswer, MemoryEdgeKind, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier,
-    ReconstructionMode, ReconstructionOptions, ReconstructionReason, ReconstructionReport,
-    RoutingReason, RoutingReport, StaleAssumption, blend_activation, budget_evidence,
-    estimate_tokens,
+    ActivationWeights, BeliefRevisionOp, CitedSpan, Contradiction, DistilledEdge, DistilledMemory,
+    Evidence, MemoryAnswer, MemoryEdgeKind, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope,
+    MemoryTier, ReconstructionMode, ReconstructionOptions, ReconstructionReason,
+    ReconstructionReport, RoutingReason, RoutingReport, StaleAssumption, blend_activation,
+    budget_evidence, estimate_tokens,
 };
 pub use reconstruct::{
     ActiveReconstructor, CommandReconstructionProvider, CommandReconstructionProviderConfig,

@@ -10,7 +10,7 @@ use crate::{
     text::{canonical_key, now_unix_ms, stable_id, terms},
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const SQLITE_APPLICATION_ID: i64 = 0x424D_454D;
 
 /// An append-only observation imported from a journal, span store, or direct write.
@@ -203,6 +203,8 @@ pub struct MemoryEdge {
     pub kind: MemoryEdgeKind,
     pub weight: f32,
     pub created_at_unix_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<i64>,
 }
 
 /// Durable accepted distillation output used for replay-safe provider rebuilds.
@@ -483,6 +485,7 @@ impl SqliteMemoryStore {
             )));
         }
         let needs_v3_upgrade = user_version < 3;
+        let needs_v5_source_event_upgrade = user_version < 5;
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS ledger_events(
@@ -544,6 +547,7 @@ impl SqliteMemoryStore {
                 kind TEXT NOT NULL,
                 weight REAL NOT NULL,
                 created_at_unix_ms INTEGER NOT NULL,
+                source_event_id INTEGER,
                 UNIQUE(from_node_id, to_node_id, kind)
             );
 
@@ -615,8 +619,21 @@ impl SqliteMemoryStore {
                 [],
             )?;
         }
+        if !self.column_exists("memory_edges", "source_event_id")? {
+            self.conn.execute(
+                "ALTER TABLE memory_edges ADD COLUMN source_event_id INTEGER",
+                [],
+            )?;
+        }
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edges_source_event ON memory_edges(source_event_id)",
+            [],
+        )?;
         self.backfill_valid_to_event_ids()?;
         if needs_v3_upgrade && self.projection_requires_v3_rebuild()? {
+            let _ = self.reset_projection_in_transaction()?;
+        }
+        if needs_v5_source_event_upgrade && self.projection_requires_source_event_rebuild()? {
             let _ = self.reset_projection_in_transaction()?;
         }
         self.conn
@@ -694,6 +711,22 @@ impl SqliteMemoryStore {
             [],
         )?;
         Ok(())
+    }
+
+    fn projection_requires_source_event_rebuild(&self) -> MemoryResult<bool> {
+        let requires_rebuild: i64 = self.conn.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM memory_edges
+                WHERE source_event_id IS NULL
+                LIMIT 1
+            )
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(requires_rebuild != 0)
     }
 
     fn projection_requires_v3_rebuild(&self) -> MemoryResult<bool> {
@@ -1753,15 +1786,16 @@ impl SqliteMemoryStore {
         Ok(changed > 0)
     }
 
-    pub(crate) fn insert_edge(
+    pub(crate) fn insert_edge_with_source_event(
         &self,
         scope: StoreScope<'_>,
-        from_node_id: &str,
-        to_node_id: &str,
+        node_ids: (&str, &str),
         kind: MemoryEdgeKind,
         weight: f32,
         created_at_unix_ms: i64,
+        source_event_id: Option<i64>,
     ) -> MemoryResult<bool> {
+        let (from_node_id, to_node_id) = node_ids;
         if from_node_id == to_node_id {
             return Ok(false);
         }
@@ -1769,8 +1803,8 @@ impl SqliteMemoryStore {
             "
             INSERT OR IGNORE INTO memory_edges(
                 tenant_id, project_id, environment_id, from_node_id, to_node_id,
-                kind, weight, created_at_unix_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                kind, weight, created_at_unix_ms, source_event_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ",
             params![
                 scope.tenant_id,
@@ -1781,9 +1815,26 @@ impl SqliteMemoryStore {
                 kind.as_str(),
                 weight,
                 created_at_unix_ms,
+                source_event_id,
             ],
         )?;
-        Ok(inserted == 1)
+        if inserted == 1 {
+            return Ok(true);
+        }
+        if let Some(source_event_id) = source_event_id {
+            self.conn.execute(
+                "
+                UPDATE memory_edges
+                SET source_event_id = ?4
+                WHERE from_node_id = ?1
+                  AND to_node_id = ?2
+                  AND kind = ?3
+                  AND source_event_id IS NULL
+                ",
+                params![from_node_id, to_node_id, kind.as_str(), source_event_id],
+            )?;
+        }
+        Ok(false)
     }
 
     pub fn seed_nodes(
@@ -2109,7 +2160,7 @@ impl SqliteMemoryStore {
         let mut stmt = self.conn.prepare(
             "
             SELECT id, tenant_id, project_id, environment_id, from_node_id, to_node_id,
-                   kind, weight, created_at_unix_ms
+                   kind, weight, created_at_unix_ms, source_event_id
             FROM memory_edges
             WHERE tenant_id = ?1
               AND project_id = ?2
@@ -2118,6 +2169,26 @@ impl SqliteMemoryStore {
         )?;
         let rows = stmt.query_map(params![tenant_id, project_id, environment_id], read_edge)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn event_known_at(
+        &self,
+        event_id: i64,
+        known_at_unix_ms: i64,
+    ) -> MemoryResult<bool> {
+        let known: i64 = self.conn.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM ledger_events
+                WHERE id = ?1
+                  AND ingested_at_unix_ms <= ?2
+            )
+            ",
+            params![event_id, known_at_unix_ms],
+            |row| row.get(0),
+        )?;
+        Ok(known != 0)
     }
 
     pub fn cited_spans_for_node(&self, node_id: &str) -> MemoryResult<Vec<CitedSpan>> {
@@ -2951,6 +3022,7 @@ fn read_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEdge> {
         kind,
         weight: row.get(7)?,
         created_at_unix_ms: row.get(8)?,
+        source_event_id: row.get(9)?,
     })
 }
 
@@ -3419,6 +3491,46 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_edge_insert_fills_missing_source_event() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let scope = StoreScope::new("tenant", "project", None);
+
+        let inserted = store.insert_edge_with_source_event(
+            scope,
+            ("node_source", "node_target"),
+            MemoryEdgeKind::Fixes,
+            1.0,
+            1_000,
+            None,
+        )?;
+        let duplicate = store.insert_edge_with_source_event(
+            scope,
+            ("node_source", "node_target"),
+            MemoryEdgeKind::Fixes,
+            1.0,
+            1_000,
+            Some(42),
+        )?;
+        let ignored = store.insert_edge_with_source_event(
+            scope,
+            ("node_source", "node_target"),
+            MemoryEdgeKind::Fixes,
+            1.0,
+            1_000,
+            Some(99),
+        )?;
+
+        let edges = store.edges_for_scope("tenant", "project", None)?;
+
+        assert!(inserted);
+        assert!(!duplicate);
+        assert!(!ignored);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source_event_id, Some(42));
+        Ok(())
+    }
+
+    #[test]
     fn cited_spans_filter_by_known_time() -> MemoryResult<()> {
         let store = SqliteMemoryStore::in_memory()?;
         let mut first = LedgerEvent::direct_memory_write(
@@ -3670,13 +3782,13 @@ mod tests {
                 &[closer.cited_span()],
             )?;
             store.invalidate_node(&target.id, 3_000, closer.id)?;
-            store.insert_edge(
+            store.insert_edge_with_source_event(
                 StoreScope::new("tenant", "project", None),
-                &closer_node.id,
-                &target.id,
+                (&closer_node.id, &target.id),
                 MemoryEdgeKind::Contradicts,
                 0.8,
                 3_000,
+                None,
             )?;
         }
 
@@ -3805,6 +3917,115 @@ mod tests {
         assert_eq!(store.schema_version()?, SCHEMA_VERSION);
         assert_eq!(store.stats()?.ledger_events, 1);
         assert_eq!(store.stats()?.audit_events, 0);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn version_four_source_less_edges_reset_projection_on_migration() -> MemoryResult<()> {
+        let path = temp_path("v4-source-events.db");
+        {
+            let conn = Connection::open(&path)?;
+            set_application_id(&conn)?;
+            conn.execute_batch(
+                "
+                CREATE TABLE ledger_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    environment_id TEXT,
+                    trace_id TEXT NOT NULL,
+                    span_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    span_kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    observed_at_unix_ms INTEGER NOT NULL,
+                    ingested_at_unix_ms INTEGER NOT NULL,
+                    projected_at_unix_ms INTEGER,
+                    UNIQUE(tenant_id, project_id, trace_id, span_id, seq)
+                );
+                INSERT INTO ledger_events(
+                    source, tenant_id, project_id, trace_id, span_id, seq, span_kind,
+                    name, status, text, payload_json, observed_at_unix_ms, ingested_at_unix_ms,
+                    projected_at_unix_ms
+                ) VALUES (
+                    'test', 'tenant', 'project', 'trace', 'span', 1, 'memory.write',
+                    'fact', 'ok', 'Existing v4 projection is reset.', '{}', 1, 1, 2
+                );
+                CREATE TABLE memory_nodes(
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    environment_id TEXT,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    created_at_unix_ms INTEGER NOT NULL,
+                    updated_at_unix_ms INTEGER NOT NULL,
+                    valid_from_unix_ms INTEGER NOT NULL,
+                    valid_to_unix_ms INTEGER,
+                    valid_to_event_id INTEGER,
+                    confidence REAL NOT NULL,
+                    token_estimate INTEGER NOT NULL,
+                    observation_count INTEGER NOT NULL,
+                    UNIQUE(tenant_id, project_id, environment_id, kind, canonical_key)
+                );
+                INSERT INTO memory_nodes(
+                    id, tenant_id, project_id, kind, text, canonical_key,
+                    created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
+                    confidence, token_estimate, observation_count
+                ) VALUES
+                    ('node_a', 'tenant', 'project', 'fact', 'Source fact.', 'fact:source', 1, 1, 1, 0.7, 2, 1),
+                    ('node_b', 'tenant', 'project', 'fact', 'Target fact.', 'fact:target', 1, 1, 1, 0.7, 2, 1);
+                CREATE TABLE memory_edges(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    environment_id TEXT,
+                    from_node_id TEXT NOT NULL,
+                    to_node_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    created_at_unix_ms INTEGER NOT NULL,
+                    UNIQUE(from_node_id, to_node_id, kind)
+                );
+                INSERT INTO memory_edges(
+                    tenant_id, project_id, from_node_id, to_node_id, kind, weight, created_at_unix_ms
+                ) VALUES ('tenant', 'project', 'node_a', 'node_b', 'fixes', 1.0, 1);
+                CREATE TABLE node_spans(
+                    node_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    span_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    PRIMARY KEY(node_id, tenant_id, project_id, trace_id, span_id, seq)
+                );
+                CREATE TABLE cue_index(
+                    term TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    environment_id TEXT,
+                    weight REAL NOT NULL,
+                    PRIMARY KEY(term, node_id)
+                );
+                PRAGMA user_version = 4;
+                ",
+            )?;
+        }
+
+        let store = SqliteMemoryStore::open(&path)?;
+
+        assert_eq!(store.schema_version()?, SCHEMA_VERSION);
+        assert_eq!(store.stats()?.pending_events, 1);
+        assert!(store.edges_for_scope("tenant", "project", None)?.is_empty());
+        assert!(store.all_nodes("tenant", "project", None)?.is_empty());
 
         let _ = std::fs::remove_file(path);
         Ok(())
