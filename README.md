@@ -45,8 +45,9 @@ The current implementation includes:
   maintenance, backup, and restore
 - graph projection integrity checks and orphan repair for edges, citations, and
   cue index entries
-- as-of temporal query windows that exclude future or invalidated facts while
-  still surfacing stale assumptions from contradiction edges
+- bitemporal query windows: `as_of_unix_ms` filters observed validity, while
+  `known_at_unix_ms` filters what the ledger had ingested by that transaction
+  time
 - optional Tier 2 active reconstruction for hard or forced read-time graph
   exploration, with bounded steps, token budget, and a diagnostic report
 - ledger validation that rejects malformed events before they enter the
@@ -94,6 +95,12 @@ cargo run -p beater-memory -- manage --limit 100
 cargo run -p beater-memory -- query \
   --tenant local --project demo \
   "How do I fix checkout database failures?"
+
+cargo run -p beater-memory -- query \
+  --tenant local --project demo \
+  --as-of-unix-ms 1782864000000 \
+  --known-at-unix-ms 1782867600000 \
+  "How did checkout look at that time?"
 
 cargo run -p beater-memory -- query \
   --tenant local --project demo \
@@ -225,7 +232,7 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"question":"checkout database failure","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null},"reconstruction_mode":"auto","max_reconstruction_steps":4,"max_reconstruction_tokens":2000}' \
+  -d '{"question":"checkout database failure","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null,"known_at_unix_ms":null},"reconstruction_mode":"auto","max_reconstruction_steps":4,"max_reconstruction_tokens":2000}' \
   http://127.0.0.1:8765/v1/query
 ```
 

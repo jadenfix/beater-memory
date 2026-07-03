@@ -2320,6 +2320,13 @@ mod tests {
                 }),
                 "as_of_unix_ms",
             ),
+            (
+                serde_json::json!({
+                    "question": "anything",
+                    "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null, "known_at_unix_ms": -1}
+                }),
+                "known_at_unix_ms",
+            ),
         ];
 
         for (query, expected_field) in malformed_queries {

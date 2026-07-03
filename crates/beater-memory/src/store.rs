@@ -1296,6 +1296,163 @@ impl SqliteMemoryStore {
             .map_err(Into::into)
     }
 
+    pub(crate) fn node_is_visible_at(
+        &self,
+        node: &MemoryNode,
+        as_of_unix_ms: Option<i64>,
+        known_at_unix_ms: Option<i64>,
+    ) -> MemoryResult<bool> {
+        let as_of = as_of_unix_ms.unwrap_or_else(now_unix_ms);
+        if node.valid_from_unix_ms > as_of {
+            return Ok(false);
+        }
+        if !self.node_has_source_known_by(&node.id, Some(as_of), known_at_unix_ms)? {
+            return Ok(false);
+        }
+        if node
+            .valid_to_unix_ms
+            .is_some_and(|valid_to| valid_to <= as_of)
+        {
+            return Ok(!self.node_closure_known_by(node, known_at_unix_ms)?);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn node_is_stale_at(
+        &self,
+        node: &MemoryNode,
+        as_of_unix_ms: Option<i64>,
+        known_at_unix_ms: Option<i64>,
+    ) -> MemoryResult<bool> {
+        let as_of = as_of_unix_ms.unwrap_or_else(now_unix_ms);
+        if node.valid_from_unix_ms > as_of {
+            return Ok(false);
+        }
+        if !self.node_has_source_known_by(&node.id, Some(as_of), known_at_unix_ms)? {
+            return Ok(false);
+        }
+        if node
+            .valid_to_unix_ms
+            .is_some_and(|valid_to| valid_to <= as_of)
+        {
+            return self.node_closure_known_by(node, known_at_unix_ms);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn node_snapshot_known_at(
+        &self,
+        node: &MemoryNode,
+        as_of_unix_ms: Option<i64>,
+        known_at_unix_ms: Option<i64>,
+    ) -> MemoryResult<Option<MemoryNode>> {
+        let as_of = as_of_unix_ms.unwrap_or_else(now_unix_ms);
+        if node.valid_from_unix_ms > as_of {
+            return Ok(None);
+        }
+        if !self.node_has_source_known_by(&node.id, Some(as_of), known_at_unix_ms)? {
+            return Ok(None);
+        }
+        let Some(known_at_unix_ms) = known_at_unix_ms else {
+            return Ok(Some(node.clone()));
+        };
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT e.text, e.observed_at_unix_ms
+            FROM node_spans s
+            JOIN ledger_events e
+              ON e.tenant_id = s.tenant_id
+             AND e.project_id = s.project_id
+             AND e.trace_id = s.trace_id
+             AND e.span_id = s.span_id
+             AND e.seq = s.seq
+            WHERE s.node_id = ?1
+              AND e.observed_at_unix_ms <= ?2
+              AND e.ingested_at_unix_ms <= ?3
+            ORDER BY e.observed_at_unix_ms, e.id
+            ",
+        )?;
+        let rows = stmt.query_map(params![node.id, as_of, known_at_unix_ms], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut text = String::new();
+        let mut observations = 0_u32;
+        let mut updated_at = node.created_at_unix_ms;
+        for row in rows {
+            let (source_text, observed_at) = row?;
+            text = merge_node_text(&text, &source_text);
+            observations = observations.saturating_add(1);
+            updated_at = updated_at.max(observed_at);
+        }
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut snapshot = node.clone();
+        snapshot.text = text;
+        snapshot.updated_at_unix_ms = updated_at;
+        snapshot.token_estimate = estimate_tokens(&snapshot.text);
+        snapshot.observation_count = observations.max(1);
+        Ok(Some(snapshot))
+    }
+
+    fn node_has_source_known_by(
+        &self,
+        node_id: &str,
+        as_of_unix_ms: Option<i64>,
+        known_at_unix_ms: Option<i64>,
+    ) -> MemoryResult<bool> {
+        let Some(known_at_unix_ms) = known_at_unix_ms else {
+            return Ok(true);
+        };
+        self.conn
+            .query_row(
+                "
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM node_spans s
+                    JOIN ledger_events e
+                      ON e.tenant_id = s.tenant_id
+                     AND e.project_id = s.project_id
+                     AND e.trace_id = s.trace_id
+                     AND e.span_id = s.span_id
+                     AND e.seq = s.seq
+                    WHERE s.node_id = ?1
+                      AND (?2 IS NULL OR e.observed_at_unix_ms <= ?2)
+                      AND e.ingested_at_unix_ms <= ?3
+                )
+                ",
+                params![node_id, as_of_unix_ms, known_at_unix_ms],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn node_closure_known_by(
+        &self,
+        node: &MemoryNode,
+        known_at_unix_ms: Option<i64>,
+    ) -> MemoryResult<bool> {
+        let Some(known_at_unix_ms) = known_at_unix_ms else {
+            return Ok(true);
+        };
+        let Some(valid_to_event_id) = node.valid_to_event_id else {
+            return Ok(false);
+        };
+        self.conn
+            .query_row(
+                "
+                SELECT ingested_at_unix_ms <= ?2
+                FROM ledger_events
+                WHERE id = ?1
+                ",
+                params![valid_to_event_id, known_at_unix_ms],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|known| known.unwrap_or(false))
+            .map_err(Into::into)
+    }
+
     pub fn node_by_scope_key(
         &self,
         tenant_id: &str,
@@ -1530,19 +1687,37 @@ impl SqliteMemoryStore {
         as_of_unix_ms: Option<i64>,
         kinds: &[MemoryNodeKind],
     ) -> MemoryResult<Vec<MemoryNode>> {
+        self.seed_nodes_observed_known_by_kinds(
+            scope,
+            query_terms,
+            limit,
+            as_of_unix_ms,
+            None,
+            kinds,
+        )
+    }
+
+    pub(crate) fn seed_nodes_observed_known_by_kinds(
+        &self,
+        scope: StoreScope<'_>,
+        query_terms: &[String],
+        limit: usize,
+        as_of_unix_ms: Option<i64>,
+        known_at_unix_ms: Option<i64>,
+        kinds: &[MemoryNodeKind],
+    ) -> MemoryResult<Vec<MemoryNode>> {
         let sql_limit = sqlite_limit("seed_nodes limit", limit)?;
         if query_terms.is_empty() {
-            return self.recent_nodes_observed_by_kinds(
-                scope.tenant_id,
-                scope.project_id,
-                scope.environment_id,
+            return self.recent_nodes_observed_known_by_kinds(
+                scope,
                 limit,
                 as_of_unix_ms,
+                known_at_unix_ms,
                 kinds,
             );
         }
         let mut nodes = Vec::new();
-        let kind_filter = kind_filter_clause("n", 7, kinds.len());
+        let kind_filter = kind_filter_clause("n", 8, kinds.len());
         let sql = format!(
             "
             SELECT DISTINCT n.id, n.tenant_id, n.project_id, n.environment_id, n.kind,
@@ -1556,6 +1731,22 @@ impl SqliteMemoryStore {
               AND COALESCE(c.environment_id, '') = COALESCE(?3, '')
               AND c.term = ?4
               AND (?6 IS NULL OR n.valid_from_unix_ms <= ?6)
+              AND (
+                    ?7 IS NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM node_spans known_s
+                        JOIN ledger_events known_e
+                          ON known_e.tenant_id = known_s.tenant_id
+                         AND known_e.project_id = known_s.project_id
+                         AND known_e.trace_id = known_s.trace_id
+                         AND known_e.span_id = known_s.span_id
+                         AND known_e.seq = known_s.seq
+                        WHERE known_s.node_id = n.id
+                          AND (?6 IS NULL OR known_e.observed_at_unix_ms <= ?6)
+                          AND known_e.ingested_at_unix_ms <= ?7
+                    )
+                  )
               {kind_filter}
             ORDER BY c.weight DESC,
                      n.valid_from_unix_ms DESC,
@@ -1579,12 +1770,11 @@ impl SqliteMemoryStore {
         let mut stmt = self.conn.prepare(&sql)?;
         for term in query_terms {
             let values = query_values(
-                scope.tenant_id,
-                scope.project_id,
-                scope.environment_id,
+                scope,
                 Some(term.as_str()),
                 sql_limit,
                 as_of_unix_ms,
+                known_at_unix_ms,
                 kinds,
             );
             let rows = stmt.query_map(params_from_iter(values.iter()), read_node)?;
@@ -1635,8 +1825,25 @@ impl SqliteMemoryStore {
         as_of_unix_ms: Option<i64>,
         kinds: &[MemoryNodeKind],
     ) -> MemoryResult<Vec<MemoryNode>> {
+        self.recent_nodes_observed_known_by_kinds(
+            StoreScope::new(tenant_id, project_id, environment_id),
+            limit,
+            as_of_unix_ms,
+            None,
+            kinds,
+        )
+    }
+
+    pub(crate) fn recent_nodes_observed_known_by_kinds(
+        &self,
+        scope: StoreScope<'_>,
+        limit: usize,
+        as_of_unix_ms: Option<i64>,
+        known_at_unix_ms: Option<i64>,
+        kinds: &[MemoryNodeKind],
+    ) -> MemoryResult<Vec<MemoryNode>> {
         let limit = sqlite_limit("recent_nodes limit", limit)?;
-        let kind_filter = kind_filter_clause("memory_nodes", 6, kinds.len());
+        let kind_filter = kind_filter_clause("memory_nodes", 7, kinds.len());
         let sql = format!(
             "
             SELECT id, tenant_id, project_id, environment_id, kind, text, canonical_key,
@@ -1648,6 +1855,22 @@ impl SqliteMemoryStore {
               AND project_id = ?2
               AND COALESCE(environment_id, '') = COALESCE(?3, '')
               AND (?5 IS NULL OR valid_from_unix_ms <= ?5)
+              AND (
+                    ?6 IS NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM node_spans known_s
+                        JOIN ledger_events known_e
+                          ON known_e.tenant_id = known_s.tenant_id
+                         AND known_e.project_id = known_s.project_id
+                         AND known_e.trace_id = known_s.trace_id
+                         AND known_e.span_id = known_s.span_id
+                         AND known_e.seq = known_s.seq
+                        WHERE known_s.node_id = memory_nodes.id
+                          AND (?5 IS NULL OR known_e.observed_at_unix_ms <= ?5)
+                          AND known_e.ingested_at_unix_ms <= ?6
+                    )
+                  )
               {kind_filter}
             ORDER BY valid_from_unix_ms DESC,
                      COALESCE((
@@ -1668,15 +1891,7 @@ impl SqliteMemoryStore {
             "
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let values = query_values(
-            tenant_id,
-            project_id,
-            environment_id,
-            None,
-            limit,
-            as_of_unix_ms,
-            kinds,
-        );
+        let values = query_values(scope, None, limit, as_of_unix_ms, known_at_unix_ms, kinds);
         let rows = stmt.query_map(params_from_iter(values.iter()), read_node)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -1724,6 +1939,24 @@ impl SqliteMemoryStore {
         )
     }
 
+    pub(crate) fn all_nodes_observed_known_by_kinds(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        environment_id: Option<&str>,
+        as_of_unix_ms: i64,
+        known_at_unix_ms: Option<i64>,
+        kinds: &[MemoryNodeKind],
+    ) -> MemoryResult<Vec<MemoryNode>> {
+        self.recent_nodes_observed_known_by_kinds(
+            StoreScope::new(tenant_id, project_id, environment_id),
+            10_000,
+            Some(as_of_unix_ms),
+            known_at_unix_ms,
+            kinds,
+        )
+    }
+
     pub fn edges_for_scope(
         &self,
         tenant_id: &str,
@@ -1753,6 +1986,15 @@ impl SqliteMemoryStore {
         node_id: &str,
         as_of_unix_ms: Option<i64>,
     ) -> MemoryResult<Vec<CitedSpan>> {
+        self.cited_spans_for_node_read_at(node_id, as_of_unix_ms, None)
+    }
+
+    pub(crate) fn cited_spans_for_node_read_at(
+        &self,
+        node_id: &str,
+        as_of_unix_ms: Option<i64>,
+        known_at_unix_ms: Option<i64>,
+    ) -> MemoryResult<Vec<CitedSpan>> {
         let mut stmt = self.conn.prepare(
             "
             SELECT s.tenant_id, s.project_id, s.trace_id, s.span_id, s.seq
@@ -1765,10 +2007,11 @@ impl SqliteMemoryStore {
              AND e.seq = s.seq
             WHERE s.node_id = ?1
               AND (?2 IS NULL OR e.observed_at_unix_ms IS NULL OR e.observed_at_unix_ms <= ?2)
+              AND (?3 IS NULL OR e.ingested_at_unix_ms <= ?3)
             ORDER BY s.seq
             ",
         )?;
-        let rows = stmt.query_map(params![node_id, as_of_unix_ms], |row| {
+        let rows = stmt.query_map(params![node_id, as_of_unix_ms, known_at_unix_ms], |row| {
             Ok(CitedSpan {
                 tenant_id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -2369,24 +2612,24 @@ fn kind_filter_clause(alias: &str, first_index: usize, count: usize) -> String {
 }
 
 fn query_values(
-    tenant_id: &str,
-    project_id: &str,
-    environment_id: Option<&str>,
+    scope: StoreScope<'_>,
     term: Option<&str>,
     limit: i64,
     as_of_unix_ms: Option<i64>,
+    known_at_unix_ms: Option<i64>,
     kinds: &[MemoryNodeKind],
 ) -> Vec<Value> {
     let mut values = vec![
-        Value::Text(tenant_id.to_string()),
-        Value::Text(project_id.to_string()),
-        optional_text(environment_id),
+        Value::Text(scope.tenant_id.to_string()),
+        Value::Text(scope.project_id.to_string()),
+        optional_text(scope.environment_id),
     ];
     if let Some(term) = term {
         values.push(Value::Text(term.to_string()));
     }
     values.push(Value::Integer(limit));
     values.push(as_of_unix_ms.map(Value::Integer).unwrap_or(Value::Null));
+    values.push(known_at_unix_ms.map(Value::Integer).unwrap_or(Value::Null));
     values.extend(
         kinds
             .iter()
@@ -2910,6 +3153,149 @@ mod tests {
         assert_eq!(recent[0].id, old.id);
         assert_eq!(seeded.len(), 1);
         assert_eq!(seeded[0].id, old.id);
+        Ok(())
+    }
+
+    #[test]
+    fn known_by_queries_filter_future_known_rows_before_limits() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let mut old_event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses alpha.",
+        );
+        old_event.trace_id = "known-old".to_string();
+        old_event.span_id = "span".to_string();
+        old_event.observed_at_unix_ms = 1_000;
+        old_event.ingested_at_unix_ms = 1_000;
+        store.append_event(&old_event)?;
+        let (old, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            &old_event.text,
+            old_event.observed_at_unix_ms,
+            &[old_event.cited_span()],
+        )?;
+
+        let mut late_event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses late-known alpha.",
+        );
+        late_event.trace_id = "known-late".to_string();
+        late_event.span_id = "span".to_string();
+        late_event.observed_at_unix_ms = 2_000;
+        late_event.ingested_at_unix_ms = 4_000;
+        store.append_event(&late_event)?;
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            &late_event.text,
+            late_event.observed_at_unix_ms,
+            &[late_event.cited_span()],
+        )?;
+
+        let recent = store.recent_nodes_observed_known_by_kinds(
+            StoreScope::new("tenant", "project", None),
+            1,
+            Some(2_500),
+            Some(1_500),
+            &[MemoryNodeKind::Fact],
+        )?;
+        let seeded = store.seed_nodes_observed_known_by_kinds(
+            StoreScope::new("tenant", "project", None),
+            &[String::from("checkout")],
+            1,
+            Some(2_500),
+            Some(1_500),
+            &[MemoryNodeKind::Fact],
+        )?;
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, old.id);
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].id, old.id);
+        Ok(())
+    }
+
+    #[test]
+    fn known_by_queries_require_source_observed_by_as_of() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let mut event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout observed too late.",
+        );
+        event.trace_id = "known-observed-late".to_string();
+        event.span_id = "span".to_string();
+        event.observed_at_unix_ms = 3_000;
+        event.ingested_at_unix_ms = 1_000;
+        store.append_event(&event)?;
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            &event.text,
+            1_000,
+            &[event.cited_span()],
+        )?;
+
+        let recent = store.recent_nodes_observed_known_by_kinds(
+            StoreScope::new("tenant", "project", None),
+            1,
+            Some(1_500),
+            Some(2_000),
+            &[MemoryNodeKind::Fact],
+        )?;
+
+        assert!(recent.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cited_spans_filter_by_known_time() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let mut first = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        first.trace_id = "citation-first".to_string();
+        first.span_id = "span".to_string();
+        first.observed_at_unix_ms = 1_000;
+        first.ingested_at_unix_ms = 1_000;
+        store.append_event(&first)?;
+        let (node, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            &first.text,
+            first.observed_at_unix_ms,
+            &[first.cited_span()],
+        )?;
+
+        let mut restatement = first.clone();
+        restatement.id = None;
+        restatement.trace_id = "citation-late".to_string();
+        restatement.span_id = "span".to_string();
+        restatement.ingested_at_unix_ms = 3_000;
+        store.append_event(&restatement)?;
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            &restatement.text,
+            restatement.observed_at_unix_ms,
+            &[restatement.cited_span()],
+        )?;
+
+        let before = store.cited_spans_for_node_read_at(&node.id, Some(1_500), Some(2_000))?;
+        let after = store.cited_spans_for_node_read_at(&node.id, Some(1_500), Some(3_500))?;
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].trace_id, "citation-first");
+        assert_eq!(after.len(), 2);
         Ok(())
     }
 

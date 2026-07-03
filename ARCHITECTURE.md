@@ -74,9 +74,10 @@ edges are projections that can be rebuilt.
    - Tier 0: routed lexical cue seeding through `cue_index`
    - Tier 1: LLM-free graph activation using personalized PageRank-style
      propagation, ACT-R-like base-level activation, edge weights, and freshness
-   - `as_of_unix_ms` is a validity boundary: future memories and facts
-     invalidated by that time are excluded from evidence, while contradiction
-     edges still surface stale assumptions when the newer fact is visible
+   - Reads are bitemporal: `as_of_unix_ms` is the observed validity boundary,
+     and `known_at_unix_ms` is the ledger transaction-time boundary based on
+     event ingestion. Future-known facts and invalidations are excluded until
+     their source events are known.
    - Tier 2: optional active reconstruction that escalates forced queries and
      hard auto queries into bounded graph expansion through an
      `ActiveReconstructor` policy. The default policy is deterministic and
@@ -214,6 +215,9 @@ cargo run -p beater-memory -- remember --no-project --tenant local --project dem
 cargo run -p beater-memory -- manage --limit 100
 cargo run -p beater-memory -- query --tenant local --project demo \
   "How do I fix checkout database failures?"
+cargo run -p beater-memory -- query --tenant local --project demo \
+  --as-of-unix-ms 1782864000000 --known-at-unix-ms 1782867600000 \
+  "How did checkout look at that time?"
 cargo run -p beater-memory -- query --tenant local --project demo \
   --reconstruction-mode auto \
   "why did checkout database failures recover?"

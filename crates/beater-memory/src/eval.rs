@@ -64,6 +64,8 @@ pub struct EvalCase {
     #[serde(default)]
     pub as_of_unix_ms: Option<i64>,
     #[serde(default)]
+    pub known_at_unix_ms: Option<i64>,
+    #[serde(default)]
     pub require_fresh: bool,
     pub question: String,
     #[serde(default)]
@@ -95,6 +97,8 @@ pub struct EvalEvent {
     pub text: String,
     #[serde(default)]
     pub observed_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub ingested_at_unix_ms: Option<i64>,
 }
 
 /// Runtime overrides applied to every case in a suite.
@@ -195,7 +199,9 @@ pub fn run_eval_suite(suite: &EvalSuite, options: &EvalOptions) -> MemoryResult<
             ledger_event.observed_at_unix_ms = event
                 .observed_at_unix_ms
                 .unwrap_or_else(|| default_event_time(case_index, event_index));
-            ledger_event.ingested_at_unix_ms = ledger_event.observed_at_unix_ms;
+            ledger_event.ingested_at_unix_ms = event
+                .ingested_at_unix_ms
+                .unwrap_or(ledger_event.observed_at_unix_ms);
             ledger_event.payload = serde_json::json!({
                 "kind": event.kind.as_str(),
                 "eval_suite": suite.name,
@@ -412,6 +418,38 @@ fn validate_suite(suite: &EvalSuite) -> MemoryResult<()> {
                 case.id
             )));
         }
+        if case.as_of_unix_ms.is_some_and(|as_of| as_of < 0) {
+            return Err(MemoryError::invalid(format!(
+                "eval case {:?} as_of_unix_ms must be non-negative",
+                case.id
+            )));
+        }
+        if case.known_at_unix_ms.is_some_and(|known_at| known_at < 0) {
+            return Err(MemoryError::invalid(format!(
+                "eval case {:?} known_at_unix_ms must be non-negative",
+                case.id
+            )));
+        }
+        for event in &case.events {
+            if event
+                .observed_at_unix_ms
+                .is_some_and(|observed_at| observed_at < 0)
+            {
+                return Err(MemoryError::invalid(format!(
+                    "eval case {:?} event observed_at_unix_ms must be non-negative",
+                    case.id
+                )));
+            }
+            if event
+                .ingested_at_unix_ms
+                .is_some_and(|ingested_at| ingested_at < 0)
+            {
+                return Err(MemoryError::invalid(format!(
+                    "eval case {:?} event ingested_at_unix_ms must be non-negative",
+                    case.id
+                )));
+            }
+        }
         if let Some(reconstruction) = case.reconstruction.as_ref() {
             reconstruction.validate()?;
         }
@@ -445,6 +483,9 @@ fn build_query(suite: &EvalSuite, case: &EvalCase, options: &EvalOptions) -> Mem
     }
     if let Some(as_of_unix_ms) = case.as_of_unix_ms {
         scope = scope.as_of_unix_ms(as_of_unix_ms);
+    }
+    if let Some(known_at_unix_ms) = case.known_at_unix_ms {
+        scope = scope.known_at_unix_ms(known_at_unix_ms);
     }
     let max_tokens = options.max_tokens.or(case.max_tokens).unwrap_or(1_200);
     let mut reconstruction = case.reconstruction.clone().unwrap_or_default();
@@ -721,6 +762,7 @@ mod tests {
                         text: "The production API base URL is https://api.example.test."
                             .to_string(),
                         observed_at_unix_ms: Some(1_000),
+                        ingested_at_unix_ms: None,
                     }],
                     modes: Some(vec![MemoryMode::State]),
                     baseline_full_context_score: Some(1.0),
@@ -737,11 +779,13 @@ mod tests {
                             kind: MemoryNodeKind::Fact,
                             text: "Use the legacy API token.".to_string(),
                             observed_at_unix_ms: Some(2_000),
+                            ingested_at_unix_ms: None,
                         },
                         EvalEvent {
                             kind: MemoryNodeKind::Fact,
                             text: "Do not use the legacy API token; it is deprecated. Use the scoped API token.".to_string(),
                             observed_at_unix_ms: Some(3_000),
+                            ingested_at_unix_ms: None,
                         },
                     ],
                     modes: Some(vec![MemoryMode::Semantic]),
@@ -778,6 +822,38 @@ mod tests {
     }
 
     #[test]
+    fn eval_suite_applies_known_at_window() -> MemoryResult<()> {
+        let suite = EvalSuite {
+            name: "known-at".to_string(),
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            environment_id: None,
+            shared_haystack: false,
+            cases: vec![EvalCase {
+                id: "late-known".to_string(),
+                question: "what is the late known flag?".to_string(),
+                as_of_unix_ms: Some(1_500),
+                known_at_unix_ms: Some(2_000),
+                events: vec![EvalEvent {
+                    kind: MemoryNodeKind::Fact,
+                    text: "The late known flag is beta.".to_string(),
+                    observed_at_unix_ms: Some(1_000),
+                    ingested_at_unix_ms: Some(3_000),
+                }],
+                expected_answer_contains: vec!["No matching memory".to_string()],
+                expected_tier: Some(MemoryTier::Activation),
+                ..case_defaults()
+            }],
+        };
+
+        let report = run_eval_suite(&suite, &EvalOptions::default())?;
+
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.failed, 0);
+        Ok(())
+    }
+
+    #[test]
     fn eval_suite_rejects_cases_without_expectations() {
         let suite = EvalSuite {
             name: "invalid".to_string(),
@@ -792,6 +868,7 @@ mod tests {
                     kind: MemoryNodeKind::Fact,
                     text: "Checkout uses DATABASE_URL.".to_string(),
                     observed_at_unix_ms: Some(1_000),
+                    ingested_at_unix_ms: None,
                 }],
                 ..case_defaults()
             }],
@@ -817,6 +894,7 @@ mod tests {
                     kind: MemoryNodeKind::Fact,
                     text: "Checkout uses DATABASE_URL.".to_string(),
                     observed_at_unix_ms: Some(1_000),
+                    ingested_at_unix_ms: None,
                 }],
                 expected_tier: Some(MemoryTier::Activation),
                 ..case_defaults()
@@ -874,6 +952,7 @@ mod tests {
                         kind: MemoryNodeKind::Fact,
                         text: "The health route is /livez.".to_string(),
                         observed_at_unix_ms: Some(1_000),
+                        ingested_at_unix_ms: None,
                     }],
                     baseline_full_context_score: Some(1.0),
                     expected_evidence_contains: vec!["/readyz".to_string()],
@@ -886,6 +965,7 @@ mod tests {
                         kind: MemoryNodeKind::Fact,
                         text: "Checkout uses DATABASE_URL.".to_string(),
                         observed_at_unix_ms: Some(2_000),
+                        ingested_at_unix_ms: None,
                     }],
                     expected_evidence_contains: vec!["DATABASE_URL".to_string()],
                     ..case_defaults()
@@ -917,6 +997,7 @@ mod tests {
                         kind: MemoryNodeKind::Fact,
                         text: "The first case only mentions alpha.".to_string(),
                         observed_at_unix_ms: Some(1_000),
+                        ingested_at_unix_ms: None,
                     }],
                     expected_evidence_contains: vec!["shared fixture token is beta".to_string()],
                     ..case_defaults()
@@ -928,6 +1009,7 @@ mod tests {
                         kind: MemoryNodeKind::Fact,
                         text: "The shared fixture token is beta.".to_string(),
                         observed_at_unix_ms: Some(2_000),
+                        ingested_at_unix_ms: None,
                     }],
                     expected_evidence_contains: vec!["shared fixture token is beta".to_string()],
                     ..case_defaults()
@@ -959,10 +1041,12 @@ mod tests {
         let case = EvalCase {
             id: "force".to_string(),
             question: "incident chain".to_string(),
+            known_at_unix_ms: Some(1_500),
             events: vec![EvalEvent {
                 kind: MemoryNodeKind::Fact,
                 text: "Incident alpha blocked deploys.".to_string(),
                 observed_at_unix_ms: Some(1_000),
+                ingested_at_unix_ms: None,
             }],
             reconstruction: Some(ReconstructionOptions {
                 mode: ReconstructionMode::Force,
@@ -987,6 +1071,7 @@ mod tests {
         assert_eq!(query.reconstruction.mode, ReconstructionMode::Force);
         assert_eq!(query.reconstruction.max_steps, 2);
         assert_eq!(query.reconstruction.max_tokens, 500);
+        assert_eq!(query.scope.known_at_unix_ms, Some(1_500));
     }
 
     fn case_defaults() -> EvalCase {
@@ -997,6 +1082,7 @@ mod tests {
             project_id: None,
             environment_id: None,
             as_of_unix_ms: None,
+            known_at_unix_ms: None,
             require_fresh: false,
             question: String::new(),
             max_tokens: None,
