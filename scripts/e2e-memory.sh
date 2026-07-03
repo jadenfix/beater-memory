@@ -407,14 +407,133 @@ json_assert "$TMP_DIR/query-provider-reconstruction.json" 'assert data["tier_use
 json_assert "$TMP_DIR/query-provider-reconstruction.json" 'assert data["reconstruction"]["provider_errors"] == 0 and data["reconstruction"]["provider_schema_errors"] == 0'
 json_assert "$TMP_DIR/query-provider-reconstruction.json" 'assert data["reconstruction"]["provider_input_tokens"] > 0 and data["reconstruction"]["provider_output_tokens"] > 0'
 
+python3 - "$TMP_DIR/beater-js-journal.db" <<'PY'
+import json
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.executescript("""
+CREATE TABLE runs(
+  id TEXT PRIMARY KEY,
+  agent TEXT NOT NULL,
+  status TEXT NOT NULL,
+  input TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE steps(
+  run_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  request TEXT NOT NULL,
+  result TEXT,
+  tool_name TEXT,
+  tool_use_id TEXT,
+  attempt INTEGER NOT NULL DEFAULT 1,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  PRIMARY KEY(run_id, seq)
+);
+""")
+conn.execute(
+    "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?)",
+    (
+        "run-import-e2e",
+        "support",
+        "completed",
+        "record checkout journal import memory",
+        10,
+        20,
+    ),
+)
+conn.execute(
+    "INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    (
+        "run-import-e2e",
+        1,
+        "tool_call",
+        "completed",
+        json.dumps({"memory": "Checkout journal token zeta needs DATABASE_URL."}),
+        json.dumps({"ok": True, "text": "Checkout journal token zeta needs DATABASE_URL."}),
+        "memory.write",
+        "tool-use-import-e2e",
+        1,
+        11,
+        12,
+    ),
+)
+conn.execute(
+    "INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    (
+        "run-import-e2e",
+        2,
+        "tool_call",
+        "started",
+        json.dumps({"memory": "Started journal rows must not import."}),
+        None,
+        "memory.write",
+        "tool-use-import-e2e-started",
+        1,
+        13,
+        None,
+    ),
+)
+conn.execute(
+    "INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    (
+        "run-import-e2e",
+        3,
+        "tool_call",
+        "failed",
+        json.dumps({"memory": "Failed journal writes must not import."}),
+        json.dumps({"error": "write failed"}),
+        "memory.write",
+        "tool-use-import-e2e-failed",
+        1,
+        14,
+        15,
+    ),
+)
+conn.commit()
+conn.close()
+PY
+
+"$BIN" --db "$DB" import-beater-js \
+  --journal "$TMP_DIR/beater-js-journal.db" \
+  --tenant local \
+  --project demo \
+  --no-project \
+  > "$TMP_DIR/import-beater-js-write-only.json"
+json_assert "$TMP_DIR/import-beater-js-write-only.json" 'assert data["import"]["rows_seen"] == 3 and data["import"]["rows_skipped"] == 2 and data["import"]["events_inserted"] == 1 and data["import"]["events_duplicate"] == 0 and data["project"] is None'
+"$BIN" --db "$DB" import-beater-js \
+  --journal "$TMP_DIR/beater-js-journal.db" \
+  --tenant local \
+  --project demo \
+  --no-project \
+  > "$TMP_DIR/import-beater-js-duplicate.json"
+json_assert "$TMP_DIR/import-beater-js-duplicate.json" 'assert data["import"]["rows_seen"] == 3 and data["import"]["rows_skipped"] == 2 and data["import"]["events_inserted"] == 0 and data["import"]["events_duplicate"] == 1 and data["project"] is None'
+"$BIN" --db "$DB" manage --limit 1 > "$TMP_DIR/manage-beater-js-import.json"
+json_assert "$TMP_DIR/manage-beater-js-import.json" 'assert data["events_projected"] == 1 and data["memories_added"] >= 1'
+"$BIN" --db "$DB" query \
+  --tenant local \
+  --project demo \
+  --modes semantic \
+  --json \
+  "checkout journal token zeta" \
+  > "$TMP_DIR/query-beater-js-import.json"
+json_assert "$TMP_DIR/query-beater-js-import.json" 'assert data["evidence"] and any("Checkout journal token zeta" in item["text"] for item in data["evidence"])'
+
 cat > "$TMP_DIR/spans.jsonl" <<'JSONL'
-{"tenant_id":"local","project_id":"demo","trace_id":"trace-jsonl","span_id":"span-write","seq":1,"name":"procedure","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":1782864000000,"payload":{"memory":"Deploy procedure: run cargo test before merging memory changes."}}
+{"tenant_id":"local","project_id":"demo","trace_id":"trace-jsonl","span_id":"span-write","seq":1,"name":"memory.write","status":"ok","attributes":{"beater.span.kind":"memory.write","beater.memory.kind":"Workflow"},"start_time":"2026-07-01T00:00:00Z","input":{"memory":"Deploy procedure: run cargo test before merging memory changes.","kind":"procedure"}}
+{"tenant_id":"local","project_id":"demo","trace_id":"trace-jsonl-read","span_id":"span-read","seq":1,"name":"memory.read","status":"ok","attributes":{"beater.span.kind":"memory.read"},"start_time":"2026-07-01T00:00:01Z","input":"deploy procedure cargo test","output":"Deploy procedure was read from memory."}
 JSONL
 
 "$BIN" --db "$DB" import-jsonl \
   --path "$TMP_DIR/spans.jsonl" \
   > "$TMP_DIR/import-jsonl.json"
-json_assert "$TMP_DIR/import-jsonl.json" 'assert data["import"]["rows_seen"] == 1 and data["import"]["events_inserted"] == 1 and data["project"]["events_projected"] == 1'
+json_assert "$TMP_DIR/import-jsonl.json" 'assert data["import"]["rows_seen"] == 2 and data["import"]["events_inserted"] == 2 and data["project"]["events_projected"] == 2'
 
 "$BIN" --db "$DB" query \
   --tenant local \
@@ -425,6 +544,15 @@ json_assert "$TMP_DIR/import-jsonl.json" 'assert data["import"]["rows_seen"] == 
   > "$TMP_DIR/query-procedure.json"
 json_assert "$TMP_DIR/query-procedure.json" 'assert data["evidence"] and any(item["kind"] == "procedure" for item in data["evidence"])'
 json_assert "$TMP_DIR/query-procedure.json" 'assert data["routing"]["routed_modes"] == ["procedural"]'
+
+"$BIN" --db "$DB" query \
+  --tenant local \
+  --project demo \
+  --modes episodic \
+  --json \
+  "deploy procedure was read from memory" \
+  > "$TMP_DIR/query-memory-read-import.json"
+json_assert "$TMP_DIR/query-memory-read-import.json" 'assert data["evidence"] and any(item["kind"] == "episode" and "memory read question" in item["text"] for item in data["evidence"])'
 
 cat > "$TMP_DIR/temporal-old-spans.jsonl" <<'JSONL'
 {"tenant_id":"local","project_id":"demo","trace_id":"trace-temporal","span_id":"span-old","seq":1,"name":"fact","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":1000,"payload":{"memory":"Use the legacy API token for deploys."}}

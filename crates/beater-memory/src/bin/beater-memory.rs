@@ -65,8 +65,11 @@ enum Command {
         project: String,
         #[arg(long)]
         environment: Option<String>,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, hide = true)]
         project_pending: bool,
+        /// Append imported ledger events without immediate projection.
+        #[arg(long)]
+        no_project: bool,
     },
     /// Import newline-delimited canonical span JSON.
     ImportJsonl {
@@ -78,8 +81,11 @@ enum Command {
         project: Option<String>,
         #[arg(long)]
         environment: Option<String>,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, hide = true)]
         project_pending: bool,
+        /// Append imported ledger events without immediate projection.
+        #[arg(long)]
+        no_project: bool,
     },
     /// Append a direct memory write and project it.
     Remember {
@@ -429,7 +435,8 @@ async fn main() -> anyhow::Result<()> {
             tenant,
             project,
             environment,
-            project_pending,
+            project_pending: _,
+            no_project,
         } => {
             let engine =
                 open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
@@ -439,16 +446,17 @@ async fn main() -> anyhow::Result<()> {
                 &project,
                 environment.as_deref(),
             )?;
-            let project_report = if project_pending {
-                Some(engine.project_pending(10_000)?)
-            } else {
+            let project_report = if no_project {
                 None
+            } else {
+                Some(engine.project_pending(10_000)?)
             };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "import": {
                         "rows_seen": report.rows_seen,
+                        "rows_skipped": report.rows_skipped,
                         "events_inserted": report.events_inserted,
                         "events_duplicate": report.events_duplicate,
                     },
@@ -461,7 +469,8 @@ async fn main() -> anyhow::Result<()> {
             tenant,
             project,
             environment,
-            project_pending,
+            project_pending: _,
+            no_project,
         } => {
             let engine =
                 open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
@@ -472,10 +481,10 @@ async fn main() -> anyhow::Result<()> {
                 project.as_deref(),
                 environment.as_deref(),
             )?;
-            let project_report = if project_pending {
-                Some(engine.project_pending(10_000)?)
-            } else {
+            let project_report = if no_project {
                 None
+            } else {
+                Some(engine.project_pending(10_000)?)
             };
             println!(
                 "{}",

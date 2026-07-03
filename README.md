@@ -167,6 +167,9 @@ cargo run -p beater-memory -- import-jsonl \
   --path ./spans.jsonl --tenant local --project observed-agent
 ```
 
+Import commands project by default. Pass `--no-project` to append imported
+ledger events only, then run `manage` when you want to build projections.
+
 Run a deterministic memory evaluation suite:
 
 ```bash
