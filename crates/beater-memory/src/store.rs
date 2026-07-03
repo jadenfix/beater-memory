@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
 
 use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use crate::{
     text::{canonical_key, now_unix_ms, stable_id, terms},
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const SQLITE_APPLICATION_ID: i64 = 0x424D_454D;
 
 /// An append-only observation imported from a journal, span store, or direct write.
@@ -167,6 +167,7 @@ pub struct MemoryNode {
     pub updated_at_unix_ms: i64,
     pub valid_from_unix_ms: i64,
     pub valid_to_unix_ms: Option<i64>,
+    pub valid_to_event_id: Option<i64>,
     pub confidence: f32,
     pub token_estimate: u32,
     pub observation_count: u32,
@@ -432,6 +433,7 @@ impl SqliteMemoryStore {
                 "database schema version {user_version} is newer than supported version {SCHEMA_VERSION}"
             )));
         }
+        let needs_v3_upgrade = user_version < 3;
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS ledger_events(
@@ -471,6 +473,7 @@ impl SqliteMemoryStore {
                 updated_at_unix_ms INTEGER NOT NULL,
                 valid_from_unix_ms INTEGER NOT NULL,
                 valid_to_unix_ms INTEGER,
+                valid_to_event_id INTEGER,
                 confidence REAL NOT NULL,
                 token_estimate INTEGER NOT NULL,
                 observation_count INTEGER NOT NULL,
@@ -539,10 +542,128 @@ impl SqliteMemoryStore {
             CREATE INDEX IF NOT EXISTS idx_audit_events_action
                 ON audit_events(action, outcome, occurred_at_unix_ms);
 
-            PRAGMA user_version = 2;
             ",
         )?;
+        if !self.column_exists("memory_nodes", "valid_to_event_id")? {
+            self.conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN valid_to_event_id INTEGER",
+                [],
+            )?;
+        }
+        self.backfill_valid_to_event_ids()?;
+        if needs_v3_upgrade && self.projection_requires_v3_rebuild()? {
+            let _ = self.reset_projection_in_transaction()?;
+        }
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> MemoryResult<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            if row? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn backfill_valid_to_event_ids(&self) -> MemoryResult<()> {
+        self.conn.execute(
+            "
+            UPDATE memory_nodes AS n
+            SET valid_to_event_id = COALESCE(
+                (
+                    SELECT MIN(close_event.id)
+                    FROM memory_edges edge
+                    JOIN node_spans from_span
+                      ON from_span.node_id = edge.from_node_id
+                    JOIN ledger_events close_event
+                      ON close_event.tenant_id = from_span.tenant_id
+                     AND close_event.project_id = from_span.project_id
+                     AND close_event.trace_id = from_span.trace_id
+                     AND close_event.span_id = from_span.span_id
+                     AND close_event.seq = from_span.seq
+                    WHERE edge.to_node_id = n.id
+                      AND edge.kind IN ('contradicts', 'supersedes')
+                      AND close_event.observed_at_unix_ms = n.valid_to_unix_ms
+                ),
+                (
+                    SELECT MIN(successor_event.id)
+                    FROM memory_nodes successor
+                    JOIN node_spans successor_span
+                      ON successor_span.node_id = successor.id
+                    JOIN ledger_events successor_event
+                      ON successor_event.tenant_id = successor_span.tenant_id
+                     AND successor_event.project_id = successor_span.project_id
+                     AND successor_event.trace_id = successor_span.trace_id
+                     AND successor_event.span_id = successor_span.span_id
+                     AND successor_event.seq = successor_span.seq
+                    WHERE successor.id != n.id
+                      AND successor.tenant_id = n.tenant_id
+                      AND successor.project_id = n.project_id
+                      AND COALESCE(successor.environment_id, '') = COALESCE(n.environment_id, '')
+                      AND successor.kind = n.kind
+                      AND successor.valid_from_unix_ms = n.valid_to_unix_ms
+                      AND (
+                          CASE
+                              WHEN instr(successor.canonical_key, '|rev:') > 0
+                              THEN substr(successor.canonical_key, 1, instr(successor.canonical_key, '|rev:') - 1)
+                              ELSE successor.canonical_key
+                          END
+                      ) = (
+                          CASE
+                              WHEN instr(n.canonical_key, '|rev:') > 0
+                              THEN substr(n.canonical_key, 1, instr(n.canonical_key, '|rev:') - 1)
+                              ELSE n.canonical_key
+                          END
+                      )
+                      AND successor_event.observed_at_unix_ms = n.valid_to_unix_ms
+                )
+            )
+            WHERE n.valid_to_unix_ms IS NOT NULL
+              AND n.valid_to_event_id IS NULL
+            ",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn projection_requires_v3_rebuild(&self) -> MemoryResult<bool> {
+        let needs_rebuild: i64 = self.conn.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM memory_nodes n
+                WHERE n.valid_to_unix_ms IS NOT NULL
+                  AND (
+                      n.valid_to_event_id IS NULL
+                      OR EXISTS (
+                          SELECT 1
+                          FROM memory_edges edge
+                          JOIN node_spans from_span
+                            ON from_span.node_id = edge.from_node_id
+                          JOIN ledger_events close_event
+                            ON close_event.tenant_id = from_span.tenant_id
+                           AND close_event.project_id = from_span.project_id
+                           AND close_event.trace_id = from_span.trace_id
+                           AND close_event.span_id = from_span.span_id
+                           AND close_event.seq = from_span.seq
+                          WHERE edge.to_node_id = n.id
+                            AND edge.kind IN ('contradicts', 'supersedes')
+                            AND close_event.observed_at_unix_ms = n.valid_to_unix_ms
+                          GROUP BY edge.from_node_id
+                          HAVING COUNT(DISTINCT close_event.id) > 1
+                      )
+                  )
+            )
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(needs_rebuild != 0)
     }
 
     fn validate_database_identity(&self) -> MemoryResult<()> {
@@ -617,6 +738,58 @@ impl SqliteMemoryStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub(crate) fn projected_events_after(
+        &self,
+        scope: StoreScope<'_>,
+        after_event: &LedgerEvent,
+        before_unix_ms: Option<i64>,
+        before_event_id: Option<i64>,
+    ) -> MemoryResult<Vec<LedgerEvent>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, source, tenant_id, project_id, environment_id, trace_id, span_id, seq,
+                   span_kind, name, status, text, payload_json, observed_at_unix_ms,
+                   ingested_at_unix_ms, projected_at_unix_ms
+            FROM ledger_events
+            WHERE tenant_id = ?1
+              AND project_id = ?2
+              AND COALESCE(environment_id, '') = COALESCE(?3, '')
+              AND projected_at_unix_ms IS NOT NULL
+              AND (
+                    observed_at_unix_ms > ?4
+                    OR (
+                        ?5 IS NOT NULL
+                        AND observed_at_unix_ms = ?4
+                        AND id > ?5
+                    )
+                  )
+              AND (
+                    ?6 IS NULL
+                    OR observed_at_unix_ms < ?6
+                    OR (
+                        ?7 IS NOT NULL
+                        AND observed_at_unix_ms = ?6
+                        AND id < ?7
+                    )
+                  )
+            ORDER BY observed_at_unix_ms, id
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                scope.tenant_id,
+                scope.project_id,
+                scope.environment_id,
+                after_event.observed_at_unix_ms,
+                after_event.id,
+                before_unix_ms,
+                before_event_id,
+            ],
+            read_ledger_event,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn mark_projected(&self, event_id: i64, projected_at_unix_ms: i64) -> MemoryResult<()> {
         self.conn.execute(
             "UPDATE ledger_events SET projected_at_unix_ms = ?2 WHERE id = ?1",
@@ -645,21 +818,164 @@ impl SqliteMemoryStore {
         environment_id: Option<&str>,
         text: &str,
         limit: usize,
+        as_of_unix_ms: i64,
     ) -> MemoryResult<Vec<MemoryNode>> {
         let query_terms = terms(text);
         if query_terms.is_empty() {
             return Ok(Vec::new());
         }
         let mut scored = Vec::new();
+        let sql_limit = sqlite_limit("active_neighbors limit", limit)?;
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT DISTINCT n.id, n.tenant_id, n.project_id, n.environment_id, n.kind,
+                   n.text, n.canonical_key, n.created_at_unix_ms, n.updated_at_unix_ms,
+                   n.valid_from_unix_ms, n.valid_to_unix_ms, n.valid_to_event_id, n.confidence,
+                   n.token_estimate, n.observation_count
+            FROM cue_index c
+            JOIN memory_nodes n ON n.id = c.node_id
+            WHERE c.tenant_id = ?1
+              AND c.project_id = ?2
+              AND COALESCE(c.environment_id, '') = COALESCE(?3, '')
+              AND c.term = ?4
+              AND n.valid_from_unix_ms <= ?5
+              AND (n.valid_to_unix_ms IS NULL OR n.valid_to_unix_ms > ?5)
+            ORDER BY c.weight DESC,
+                     n.valid_from_unix_ms DESC,
+                     COALESCE((
+                         SELECT e.id
+                         FROM node_spans s
+                         JOIN ledger_events e
+                           ON e.tenant_id = s.tenant_id
+                          AND e.project_id = s.project_id
+                          AND e.trace_id = s.trace_id
+                          AND e.span_id = s.span_id
+                          AND e.seq = s.seq
+                         WHERE s.node_id = n.id
+                         ORDER BY e.observed_at_unix_ms, e.id
+                         LIMIT 1
+                     ), 0) DESC,
+                     n.id
+            LIMIT ?6
+            ",
+        )?;
         for term in query_terms {
-            for node in self.seed_nodes(tenant_id, project_id, environment_id, &[term], limit)? {
-                if node.valid_to_unix_ms.is_none() {
-                    scored.push(node);
-                }
+            let rows = stmt.query_map(
+                params![
+                    tenant_id,
+                    project_id,
+                    environment_id,
+                    term,
+                    as_of_unix_ms,
+                    sql_limit
+                ],
+                read_node,
+            )?;
+            for row in rows {
+                scored.push(row?);
             }
         }
-        scored.sort_by(|left, right| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms));
-        scored.dedup_by(|left, right| left.id == right.id);
+        let mut seen = BTreeSet::new();
+        scored.retain(|node| seen.insert(node.id.clone()));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    pub(crate) fn projection_neighbors_for_event(
+        &self,
+        event: &LedgerEvent,
+        text: &str,
+        limit: usize,
+    ) -> MemoryResult<Vec<MemoryNode>> {
+        let query_terms = terms(text);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut scored = Vec::new();
+        let sql_limit = sqlite_limit("projection_neighbors_for_event limit", limit)?;
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT DISTINCT n.id, n.tenant_id, n.project_id, n.environment_id, n.kind,
+                   n.text, n.canonical_key, n.created_at_unix_ms, n.updated_at_unix_ms,
+                   n.valid_from_unix_ms, n.valid_to_unix_ms, n.valid_to_event_id, n.confidence,
+                   n.token_estimate, n.observation_count
+            FROM cue_index c
+            JOIN memory_nodes n ON n.id = c.node_id
+            WHERE c.tenant_id = ?1
+              AND c.project_id = ?2
+              AND COALESCE(c.environment_id, '') = COALESCE(?3, '')
+              AND c.term = ?4
+              AND n.valid_from_unix_ms <= ?5
+	              AND (
+	                  n.valid_to_unix_ms IS NULL
+	                  OR n.valid_to_unix_ms > ?5
+	                  OR (
+	                      n.valid_to_unix_ms = ?5
+	                      AND ?6 IS NOT NULL
+	                      AND n.valid_to_event_id >= ?6
+	                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ledger_events first_event
+                  WHERE first_event.id = (
+                      SELECT e.id
+                      FROM node_spans s
+                      JOIN ledger_events e
+                        ON e.tenant_id = s.tenant_id
+                       AND e.project_id = s.project_id
+                       AND e.trace_id = s.trace_id
+                       AND e.span_id = s.span_id
+                       AND e.seq = s.seq
+                      WHERE s.node_id = n.id
+                      ORDER BY e.observed_at_unix_ms, e.id
+                      LIMIT 1
+                  )
+                    AND first_event.tenant_id = ?1
+                    AND first_event.project_id = ?2
+                    AND COALESCE(first_event.environment_id, '') = COALESCE(?3, '')
+                    AND first_event.observed_at_unix_ms = ?5
+                    AND ?6 IS NOT NULL
+                    AND first_event.id >= ?6
+              )
+            ORDER BY c.weight DESC,
+                     n.valid_from_unix_ms DESC,
+                     COALESCE((
+                         SELECT e.id
+                         FROM node_spans s
+                         JOIN ledger_events e
+                           ON e.tenant_id = s.tenant_id
+                          AND e.project_id = s.project_id
+                          AND e.trace_id = s.trace_id
+                          AND e.span_id = s.span_id
+                          AND e.seq = s.seq
+                         WHERE s.node_id = n.id
+                         ORDER BY e.observed_at_unix_ms, e.id
+                         LIMIT 1
+                     ), 0) DESC,
+                     n.id
+            LIMIT ?7
+            ",
+        )?;
+        for term in query_terms {
+            let rows = stmt.query_map(
+                params![
+                    event.tenant_id,
+                    event.project_id,
+                    event.environment_id,
+                    term,
+                    event.observed_at_unix_ms,
+                    event.id,
+                    sql_limit
+                ],
+                read_node,
+            )?;
+            for row in rows {
+                scored.push(row?);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        scored.retain(|node| seen.insert(node.id.clone()));
         scored.truncate(limit);
         Ok(scored)
     }
@@ -672,7 +988,7 @@ impl SqliteMemoryStore {
         valid_from_unix_ms: i64,
         cited_spans: &[CitedSpan],
     ) -> MemoryResult<(MemoryNode, bool)> {
-        let key = if kind == MemoryNodeKind::Episode {
+        let base_key = if kind == MemoryNodeKind::Episode {
             cited_spans
                 .first()
                 .map(|span| format!("episode:{}:{}:{}", span.trace_id, span.span_id, span.seq))
@@ -680,27 +996,30 @@ impl SqliteMemoryStore {
         } else {
             canonical_key(kind.as_str(), text)
         };
-        let id = stable_id(
-            "node",
-            &[
-                scope.tenant_id,
-                scope.project_id,
-                scope.environment_id.unwrap_or(""),
-                kind.as_str(),
-                &key,
-            ],
-        );
         let now = now_unix_ms();
         let token_estimate = estimate_tokens(text);
-        let existing = self.node_by_scope_key(
+        let family = self.node_family_by_scope_key(
             scope.tenant_id,
             scope.project_id,
             scope.environment_id,
             kind,
-            &key,
+            &base_key,
         )?;
+        let projection_event_id = self.event_id_for_spans(cited_spans)?;
+        let existing = family
+            .iter()
+            .find(|node| node.valid_from_unix_ms == valid_from_unix_ms)
+            .cloned();
         match existing {
             Some(mut node) => {
+                let first_event_id = self.first_event_id_for_node(&node.id)?;
+                if projection_event_id
+                    .zip(first_event_id)
+                    .is_some_and(|(current, first)| current > first)
+                {
+                    self.attach_spans(&node.id, cited_spans)?;
+                    return Ok((node, false));
+                }
                 let merged_text = merge_node_text(&node.text, text);
                 let token_estimate = estimate_tokens(&merged_text);
                 self.conn.execute(
@@ -708,7 +1027,6 @@ impl SqliteMemoryStore {
                     UPDATE memory_nodes
                     SET text = ?2,
                         updated_at_unix_ms = ?3,
-                        valid_to_unix_ms = NULL,
                         confidence = MIN(confidence + 0.05, 1.0),
                         token_estimate = ?4,
                         observation_count = observation_count + 1
@@ -718,7 +1036,6 @@ impl SqliteMemoryStore {
                 )?;
                 node.text = merged_text;
                 node.updated_at_unix_ms = now;
-                node.valid_to_unix_ms = None;
                 node.confidence = (node.confidence + 0.05).min(1.0);
                 node.token_estimate = token_estimate;
                 node.observation_count += 1;
@@ -727,13 +1044,46 @@ impl SqliteMemoryStore {
                 Ok((node, false))
             }
             None => {
+                let future_successor = family
+                    .iter()
+                    .filter(|node| node.valid_from_unix_ms > valid_from_unix_ms)
+                    .min_by_key(|node| node.valid_from_unix_ms);
+                let valid_to_unix_ms = future_successor.map(|node| node.valid_from_unix_ms);
+                let valid_to_event_id = if let Some(node) = future_successor {
+                    self.first_event_id_for_node(&node.id)?
+                } else {
+                    None
+                };
+                self.close_previous_family_versions(
+                    scope,
+                    kind,
+                    &base_key,
+                    valid_from_unix_ms,
+                    projection_event_id,
+                )?;
+                let key = if kind == MemoryNodeKind::Episode {
+                    base_key
+                } else {
+                    revision_key(&base_key, valid_from_unix_ms)
+                };
+                let id = stable_id(
+                    "node",
+                    &[
+                        scope.tenant_id,
+                        scope.project_id,
+                        scope.environment_id.unwrap_or(""),
+                        kind.as_str(),
+                        &key,
+                    ],
+                );
                 self.conn.execute(
                     "
                     INSERT INTO memory_nodes(
                         id, tenant_id, project_id, environment_id, kind, text, canonical_key,
                         created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
-                        valid_to_unix_ms, confidence, token_estimate, observation_count
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, NULL, ?10, ?11, 1)
+                        valid_to_unix_ms, valid_to_event_id, confidence, token_estimate,
+                        observation_count
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12, ?13, 1)
                     ",
                     params![
                         id,
@@ -745,6 +1095,8 @@ impl SqliteMemoryStore {
                         key,
                         now,
                         valid_from_unix_ms,
+                        valid_to_unix_ms,
+                        valid_to_event_id,
                         0.65_f32,
                         token_estimate,
                     ],
@@ -760,7 +1112,8 @@ impl SqliteMemoryStore {
                     created_at_unix_ms: now,
                     updated_at_unix_ms: now,
                     valid_from_unix_ms,
-                    valid_to_unix_ms: None,
+                    valid_to_unix_ms,
+                    valid_to_event_id,
                     confidence: 0.65,
                     token_estimate,
                     observation_count: 1,
@@ -778,7 +1131,8 @@ impl SqliteMemoryStore {
                 "
                 SELECT id, tenant_id, project_id, environment_id, kind, text, canonical_key,
                        created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
-                       valid_to_unix_ms, confidence, token_estimate, observation_count
+                       valid_to_unix_ms, valid_to_event_id, confidence, token_estimate,
+                       observation_count
                 FROM memory_nodes
                 WHERE id = ?1
                 ",
@@ -802,7 +1156,8 @@ impl SqliteMemoryStore {
                 "
                 SELECT id, tenant_id, project_id, environment_id, kind, text, canonical_key,
                        created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
-                       valid_to_unix_ms, confidence, token_estimate, observation_count
+                       valid_to_unix_ms, valid_to_event_id, confidence, token_estimate,
+                       observation_count
                 FROM memory_nodes
                 WHERE tenant_id = ?1
                   AND project_id = ?2
@@ -823,14 +1178,124 @@ impl SqliteMemoryStore {
             .map_err(Into::into)
     }
 
-    pub fn invalidate_node(&self, node_id: &str, valid_to_unix_ms: i64) -> MemoryResult<bool> {
+    pub(crate) fn node_version_by_text(
+        &self,
+        scope: StoreScope<'_>,
+        kind: MemoryNodeKind,
+        text: &str,
+        valid_from_unix_ms: i64,
+    ) -> MemoryResult<Option<MemoryNode>> {
+        let base_key = canonical_key(kind.as_str(), text);
+        Ok(self
+            .node_family_by_scope_key(
+                scope.tenant_id,
+                scope.project_id,
+                scope.environment_id,
+                kind,
+                &base_key,
+            )?
+            .into_iter()
+            .find(|node| node.valid_from_unix_ms == valid_from_unix_ms))
+    }
+
+    fn node_family_by_scope_key(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        environment_id: Option<&str>,
+        kind: MemoryNodeKind,
+        canonical_key: &str,
+    ) -> MemoryResult<Vec<MemoryNode>> {
+        let revision_glob = format!("{canonical_key}|rev:*");
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, tenant_id, project_id, environment_id, kind, text, canonical_key,
+                   created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
+                   valid_to_unix_ms, valid_to_event_id, confidence, token_estimate,
+                   observation_count
+            FROM memory_nodes
+            WHERE tenant_id = ?1
+              AND project_id = ?2
+              AND COALESCE(environment_id, '') = COALESCE(?3, '')
+              AND kind = ?4
+              AND (canonical_key = ?5 OR canonical_key GLOB ?6)
+            ORDER BY valid_from_unix_ms DESC, updated_at_unix_ms DESC
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                tenant_id,
+                project_id,
+                environment_id,
+                kind.as_str(),
+                canonical_key,
+                revision_glob
+            ],
+            read_node,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn close_previous_family_versions(
+        &self,
+        scope: StoreScope<'_>,
+        kind: MemoryNodeKind,
+        canonical_key: &str,
+        valid_from_unix_ms: i64,
+        valid_to_event_id: Option<i64>,
+    ) -> MemoryResult<()> {
+        let revision_glob = format!("{canonical_key}|rev:*");
+        self.conn.execute(
+            "
+            UPDATE memory_nodes
+            SET valid_to_unix_ms = ?7,
+                valid_to_event_id = ?8
+            WHERE tenant_id = ?1
+              AND project_id = ?2
+              AND COALESCE(environment_id, '') = COALESCE(?3, '')
+              AND kind = ?4
+              AND (canonical_key = ?5 OR canonical_key GLOB ?6)
+              AND valid_from_unix_ms < ?7
+              AND (valid_to_unix_ms IS NULL OR valid_to_unix_ms > ?7)
+            ",
+            params![
+                scope.tenant_id,
+                scope.project_id,
+                scope.environment_id,
+                kind.as_str(),
+                canonical_key,
+                revision_glob,
+                valid_from_unix_ms,
+                valid_to_event_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn invalidate_node(
+        &self,
+        node_id: &str,
+        valid_to_unix_ms: i64,
+        valid_to_event_id: Option<i64>,
+    ) -> MemoryResult<bool> {
         let changed = self.conn.execute(
             "
             UPDATE memory_nodes
-            SET valid_to_unix_ms = ?2, updated_at_unix_ms = ?2
-            WHERE id = ?1 AND valid_to_unix_ms IS NULL
+            SET valid_to_unix_ms = ?2,
+                valid_to_event_id = ?3
+            WHERE id = ?1
+              AND valid_from_unix_ms <= ?2
+              AND (
+                    valid_to_unix_ms IS NULL
+                    OR valid_to_unix_ms > ?2
+                    OR (
+                        valid_to_unix_ms = ?2
+                        AND ?3 IS NOT NULL
+                        AND (valid_to_event_id IS NULL OR valid_to_event_id > ?3)
+                    )
+                  )
             ",
-            params![node_id, valid_to_unix_ms],
+            params![node_id, valid_to_unix_ms, valid_to_event_id],
         )?;
         Ok(changed > 0)
     }
@@ -842,6 +1307,7 @@ impl SqliteMemoryStore {
         to_node_id: &str,
         kind: MemoryEdgeKind,
         weight: f32,
+        created_at_unix_ms: i64,
     ) -> MemoryResult<bool> {
         if from_node_id == to_node_id {
             return Ok(false);
@@ -861,7 +1327,7 @@ impl SqliteMemoryStore {
                 to_node_id,
                 kind.as_str(),
                 weight,
-                now_unix_ms(),
+                created_at_unix_ms,
             ],
         )?;
         Ok(inserted == 1)
@@ -875,16 +1341,41 @@ impl SqliteMemoryStore {
         query_terms: &[String],
         limit: usize,
     ) -> MemoryResult<Vec<MemoryNode>> {
+        self.seed_nodes_observed_by(
+            tenant_id,
+            project_id,
+            environment_id,
+            query_terms,
+            limit,
+            None,
+        )
+    }
+
+    pub fn seed_nodes_observed_by(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        environment_id: Option<&str>,
+        query_terms: &[String],
+        limit: usize,
+        as_of_unix_ms: Option<i64>,
+    ) -> MemoryResult<Vec<MemoryNode>> {
         let sql_limit = sqlite_limit("seed_nodes limit", limit)?;
         if query_terms.is_empty() {
-            return self.recent_nodes(tenant_id, project_id, environment_id, limit);
+            return self.recent_nodes_observed_by(
+                tenant_id,
+                project_id,
+                environment_id,
+                limit,
+                as_of_unix_ms,
+            );
         }
         let mut nodes = Vec::new();
         let mut stmt = self.conn.prepare(
             "
             SELECT DISTINCT n.id, n.tenant_id, n.project_id, n.environment_id, n.kind,
                    n.text, n.canonical_key, n.created_at_unix_ms, n.updated_at_unix_ms,
-                   n.valid_from_unix_ms, n.valid_to_unix_ms, n.confidence,
+                   n.valid_from_unix_ms, n.valid_to_unix_ms, n.valid_to_event_id, n.confidence,
                    n.token_estimate, n.observation_count
             FROM cue_index c
             JOIN memory_nodes n ON n.id = c.node_id
@@ -892,26 +1383,44 @@ impl SqliteMemoryStore {
               AND c.project_id = ?2
               AND COALESCE(c.environment_id, '') = COALESCE(?3, '')
               AND c.term = ?4
-            ORDER BY c.weight DESC, n.updated_at_unix_ms DESC
+              AND (?6 IS NULL OR n.valid_from_unix_ms <= ?6)
+            ORDER BY c.weight DESC,
+                     n.valid_from_unix_ms DESC,
+                     COALESCE((
+                         SELECT e.id
+                         FROM node_spans s
+                         JOIN ledger_events e
+                           ON e.tenant_id = s.tenant_id
+                          AND e.project_id = s.project_id
+                          AND e.trace_id = s.trace_id
+                          AND e.span_id = s.span_id
+                          AND e.seq = s.seq
+                         WHERE s.node_id = n.id
+                         ORDER BY e.observed_at_unix_ms, e.id
+                         LIMIT 1
+                     ), 0) DESC,
+                     n.id
             LIMIT ?5
             ",
         )?;
         for term in query_terms {
             let rows = stmt.query_map(
-                params![tenant_id, project_id, environment_id, term, sql_limit],
+                params![
+                    tenant_id,
+                    project_id,
+                    environment_id,
+                    term,
+                    sql_limit,
+                    as_of_unix_ms
+                ],
                 read_node,
             )?;
             for row in rows {
                 nodes.push(row?);
             }
         }
-        nodes.sort_by(|left, right| {
-            right
-                .updated_at_unix_ms
-                .cmp(&left.updated_at_unix_ms)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        nodes.dedup_by(|left, right| left.id == right.id);
+        let mut seen = BTreeSet::new();
+        nodes.retain(|node| seen.insert(node.id.clone()));
         nodes.truncate(limit);
         Ok(nodes)
     }
@@ -923,22 +1432,49 @@ impl SqliteMemoryStore {
         environment_id: Option<&str>,
         limit: usize,
     ) -> MemoryResult<Vec<MemoryNode>> {
+        self.recent_nodes_observed_by(tenant_id, project_id, environment_id, limit, None)
+    }
+
+    pub fn recent_nodes_observed_by(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        environment_id: Option<&str>,
+        limit: usize,
+        as_of_unix_ms: Option<i64>,
+    ) -> MemoryResult<Vec<MemoryNode>> {
         let limit = sqlite_limit("recent_nodes limit", limit)?;
         let mut stmt = self.conn.prepare(
             "
             SELECT id, tenant_id, project_id, environment_id, kind, text, canonical_key,
                    created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
-                   valid_to_unix_ms, confidence, token_estimate, observation_count
+                   valid_to_unix_ms, valid_to_event_id, confidence, token_estimate,
+                   observation_count
             FROM memory_nodes
             WHERE tenant_id = ?1
               AND project_id = ?2
               AND COALESCE(environment_id, '') = COALESCE(?3, '')
-            ORDER BY updated_at_unix_ms DESC
+              AND (?5 IS NULL OR valid_from_unix_ms <= ?5)
+            ORDER BY valid_from_unix_ms DESC,
+                     COALESCE((
+                         SELECT e.id
+                         FROM node_spans s
+                         JOIN ledger_events e
+                           ON e.tenant_id = s.tenant_id
+                          AND e.project_id = s.project_id
+                          AND e.trace_id = s.trace_id
+                          AND e.span_id = s.span_id
+                          AND e.seq = s.seq
+                         WHERE s.node_id = memory_nodes.id
+                         ORDER BY e.observed_at_unix_ms, e.id
+                         LIMIT 1
+                     ), 0) DESC,
+                     id
             LIMIT ?4
             ",
         )?;
         let rows = stmt.query_map(
-            params![tenant_id, project_id, environment_id, limit],
+            params![tenant_id, project_id, environment_id, limit, as_of_unix_ms],
             read_node,
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -951,6 +1487,22 @@ impl SqliteMemoryStore {
         environment_id: Option<&str>,
     ) -> MemoryResult<Vec<MemoryNode>> {
         self.recent_nodes(tenant_id, project_id, environment_id, 10_000)
+    }
+
+    pub fn all_nodes_observed_by(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        environment_id: Option<&str>,
+        as_of_unix_ms: i64,
+    ) -> MemoryResult<Vec<MemoryNode>> {
+        self.recent_nodes_observed_by(
+            tenant_id,
+            project_id,
+            environment_id,
+            10_000,
+            Some(as_of_unix_ms),
+        )
     }
 
     pub fn edges_for_scope(
@@ -974,15 +1526,30 @@ impl SqliteMemoryStore {
     }
 
     pub fn cited_spans_for_node(&self, node_id: &str) -> MemoryResult<Vec<CitedSpan>> {
+        self.cited_spans_for_node_as_of(node_id, None)
+    }
+
+    pub fn cited_spans_for_node_as_of(
+        &self,
+        node_id: &str,
+        as_of_unix_ms: Option<i64>,
+    ) -> MemoryResult<Vec<CitedSpan>> {
         let mut stmt = self.conn.prepare(
             "
-            SELECT tenant_id, project_id, trace_id, span_id, seq
-            FROM node_spans
-            WHERE node_id = ?1
-            ORDER BY seq
+            SELECT s.tenant_id, s.project_id, s.trace_id, s.span_id, s.seq
+            FROM node_spans s
+            LEFT JOIN ledger_events e
+              ON e.tenant_id = s.tenant_id
+             AND e.project_id = s.project_id
+             AND e.trace_id = s.trace_id
+             AND e.span_id = s.span_id
+             AND e.seq = s.seq
+            WHERE s.node_id = ?1
+              AND (?2 IS NULL OR e.observed_at_unix_ms IS NULL OR e.observed_at_unix_ms <= ?2)
+            ORDER BY s.seq
             ",
         )?;
-        let rows = stmt.query_map(params![node_id], |row| {
+        let rows = stmt.query_map(params![node_id, as_of_unix_ms], |row| {
             Ok(CitedSpan {
                 tenant_id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -1379,6 +1946,63 @@ impl SqliteMemoryStore {
         Ok(())
     }
 
+    fn event_id_for_spans(&self, cited_spans: &[CitedSpan]) -> MemoryResult<Option<i64>> {
+        for span in cited_spans {
+            if let Some(event_id) = self.event_id_for_span(span)? {
+                return Ok(Some(event_id));
+            }
+        }
+        Ok(None)
+    }
+
+    fn first_event_id_for_node(&self, node_id: &str) -> MemoryResult<Option<i64>> {
+        self.conn
+            .query_row(
+                "
+                SELECT e.id
+                FROM node_spans s
+                JOIN ledger_events e
+                  ON e.tenant_id = s.tenant_id
+                 AND e.project_id = s.project_id
+                 AND e.trace_id = s.trace_id
+                 AND e.span_id = s.span_id
+                 AND e.seq = s.seq
+                WHERE s.node_id = ?1
+                ORDER BY e.observed_at_unix_ms, e.id
+                LIMIT 1
+                ",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn event_id_for_span(&self, span: &CitedSpan) -> MemoryResult<Option<i64>> {
+        self.conn
+            .query_row(
+                "
+                SELECT id
+                FROM ledger_events
+                WHERE tenant_id = ?1
+                  AND project_id = ?2
+                  AND trace_id = ?3
+                  AND span_id = ?4
+                  AND seq = ?5
+                ",
+                params![
+                    span.tenant_id,
+                    span.project_id,
+                    span.trace_id,
+                    span.span_id,
+                    span.seq
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn reindex_node(&self, node: &MemoryNode) -> MemoryResult<()> {
         self.conn
             .execute("DELETE FROM cue_index WHERE node_id = ?1", params![node.id])?;
@@ -1413,6 +2037,10 @@ fn merge_node_text(existing: &str, incoming: &str) -> String {
     } else {
         format!("{} {}", existing.trim(), incoming)
     }
+}
+
+fn revision_key(canonical_key: &str, valid_from_unix_ms: i64) -> String {
+    format!("{canonical_key}|rev:{valid_from_unix_ms}")
 }
 
 fn validate_required_identifier(field: &str, value: &str) -> MemoryResult<()> {
@@ -1557,9 +2185,10 @@ fn read_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryNode> {
         updated_at_unix_ms: row.get(8)?,
         valid_from_unix_ms: row.get(9)?,
         valid_to_unix_ms: row.get(10)?,
-        confidence: row.get(11)?,
-        token_estimate: row.get(12)?,
-        observation_count: row.get(13)?,
+        valid_to_event_id: row.get(11)?,
+        confidence: row.get(12)?,
+        token_estimate: row.get(13)?,
+        observation_count: row.get(14)?,
     })
 }
 
@@ -1753,7 +2382,7 @@ mod tests {
             StoreScope::new("tenant", "project", None),
             MemoryNodeKind::Fact,
             "Checkout uses DATABASE_URL.",
-            2,
+            1,
             &[span],
         )?;
 
@@ -1761,6 +2390,293 @@ mod tests {
         assert!(!second_created);
         assert_eq!(node.observation_count, 2);
         assert_eq!(store.cited_spans_for_node(&node.id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn restating_invalidated_memory_creates_new_temporal_version() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "trace".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let (old, created) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            1_000,
+            std::slice::from_ref(&span),
+        )?;
+        assert!(created);
+        assert!(store.invalidate_node(&old.id, 2_000, None)?);
+
+        let (new, second_created) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            3_000,
+            &[span],
+        )?;
+
+        assert!(second_created);
+        assert_ne!(old.id, new.id);
+        assert_eq!(
+            store.node_by_id(&old.id)?.unwrap().valid_to_unix_ms,
+            Some(2_000)
+        );
+        assert_eq!(new.valid_from_unix_ms, 3_000);
+        assert_eq!(new.valid_to_unix_ms, None);
+        assert_eq!(store.stats()?.nodes, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn equal_time_invalidation_can_replace_later_close_event() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "trace".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let (node, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            1_000,
+            &[span],
+        )?;
+
+        assert!(store.invalidate_node(&node.id, 3_000, Some(30))?);
+        assert!(store.invalidate_node(&node.id, 3_000, Some(20))?);
+        assert!(!store.invalidate_node(&node.id, 3_000, Some(40))?);
+        let node = store.node_by_id(&node.id)?.unwrap();
+        assert_eq!(node.valid_to_unix_ms, Some(3_000));
+        assert_eq!(node.valid_to_event_id, Some(20));
+        Ok(())
+    }
+
+    #[test]
+    fn observed_by_queries_filter_future_rows_before_limits() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let old_span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "old".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let future_span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "future".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let (old, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            1_000,
+            &[old_span],
+        )?;
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL future detail.",
+            3_000,
+            &[future_span],
+        )?;
+
+        let recent = store.recent_nodes_observed_by("tenant", "project", None, 1, Some(1_500))?;
+        let seeded = store.seed_nodes_observed_by(
+            "tenant",
+            "project",
+            None,
+            &[String::from("checkout")],
+            1,
+            Some(1_500),
+        )?;
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, old.id);
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].id, old.id);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_neighbors_respect_same_timestamp_ledger_order() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        for label in ["earlier", "current", "later"] {
+            let mut event = LedgerEvent::direct_memory_write(
+                "tenant",
+                "project",
+                MemoryNodeKind::Fact,
+                format!("{label} token alpha"),
+            );
+            event.trace_id = label.to_string();
+            event.span_id = "span".to_string();
+            event.observed_at_unix_ms = 3_000;
+            event.ingested_at_unix_ms = 3_000;
+            store.append_event(&event)?;
+        }
+        let events = store.pending_events(10)?;
+        for event in &events {
+            store.upsert_node(
+                StoreScope::new("tenant", "project", None),
+                MemoryNodeKind::Fact,
+                &event.text,
+                event.observed_at_unix_ms,
+                &[event.cited_span()],
+            )?;
+        }
+        let later = events
+            .iter()
+            .find(|event| event.trace_id == "later")
+            .unwrap();
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "earlier token alpha",
+            3_000,
+            &[later.cited_span()],
+        )?;
+        let earlier_node = store
+            .all_nodes("tenant", "project", None)?
+            .into_iter()
+            .find(|node| node.text == "earlier token alpha")
+            .unwrap();
+        assert_eq!(earlier_node.observation_count, 1);
+        let current = events
+            .iter()
+            .find(|event| event.trace_id == "current")
+            .unwrap();
+        let neighbors = store.projection_neighbors_for_event(current, "token alpha", 10)?;
+        let texts: Vec<_> = neighbors.iter().map(|node| node.text.as_str()).collect();
+
+        assert!(texts.contains(&"earlier token alpha"));
+        assert!(!texts.contains(&"current token alpha"));
+        assert!(!texts.contains(&"later token alpha"));
+        Ok(())
+    }
+
+    #[test]
+    fn projection_neighbors_respect_same_timestamp_closure_order() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let mut origin = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "origin boundary token alpha",
+        );
+        origin.trace_id = "origin".to_string();
+        origin.span_id = "span".to_string();
+        origin.observed_at_unix_ms = 1_000;
+        origin.ingested_at_unix_ms = 1_000;
+        store.append_event(&origin)?;
+        for label in ["earlier", "current", "later"] {
+            let mut event = LedgerEvent::direct_memory_write(
+                "tenant",
+                "project",
+                MemoryNodeKind::Fact,
+                format!("{label} closer"),
+            );
+            event.trace_id = label.to_string();
+            event.span_id = "span".to_string();
+            event.observed_at_unix_ms = 3_000;
+            event.ingested_at_unix_ms = 3_000;
+            store.append_event(&event)?;
+        }
+        let events = store.pending_events(10)?;
+        let event_for = |trace_id: &str| {
+            events
+                .iter()
+                .find(|event| event.trace_id == trace_id)
+                .unwrap()
+        };
+        let origin = event_for("origin");
+        for label in ["earlier", "current", "later"] {
+            let target_text = format!("{label} boundary token alpha");
+            let closer = event_for(label);
+            let (target, _) = store.upsert_node(
+                StoreScope::new("tenant", "project", None),
+                MemoryNodeKind::Fact,
+                &target_text,
+                1_000,
+                &[origin.cited_span()],
+            )?;
+            let (closer_node, _) = store.upsert_node(
+                StoreScope::new("tenant", "project", None),
+                MemoryNodeKind::Fact,
+                &closer.text,
+                3_000,
+                &[closer.cited_span()],
+            )?;
+            store.invalidate_node(&target.id, 3_000, closer.id)?;
+            store.insert_edge(
+                StoreScope::new("tenant", "project", None),
+                &closer_node.id,
+                &target.id,
+                MemoryEdgeKind::Contradicts,
+                0.8,
+                3_000,
+            )?;
+        }
+
+        let current = event_for("current");
+        let neighbors =
+            store.projection_neighbors_for_event(current, "boundary token alpha", 10)?;
+        let texts: Vec<_> = neighbors.iter().map(|node| node.text.as_str()).collect();
+
+        assert!(!texts.contains(&"earlier boundary token alpha"));
+        assert!(texts.contains(&"current boundary token alpha"));
+        assert!(texts.contains(&"later boundary token alpha"));
+        Ok(())
+    }
+
+    #[test]
+    fn late_older_version_closes_at_next_projected_version() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let future_span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "future".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let older_span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "older".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let (future, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            3_000,
+            &[future_span],
+        )?;
+        let (older, created) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            1_000,
+            &[older_span],
+        )?;
+
+        assert!(created);
+        assert_ne!(future.id, older.id);
+        assert_eq!(older.valid_to_unix_ms, Some(3_000));
+        assert!(older.is_active_at(Some(1_500)));
+        assert!(!older.is_active_at(Some(3_500)));
+        assert!(future.is_active_at(Some(3_500)));
         Ok(())
     }
 

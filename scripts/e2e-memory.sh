@@ -159,6 +159,38 @@ json_assert "$TMP_DIR/import-jsonl.json" 'assert data["import"]["rows_seen"] == 
   > "$TMP_DIR/query-procedure.json"
 json_assert "$TMP_DIR/query-procedure.json" 'assert data["evidence"] and any(item["kind"] == "procedure" for item in data["evidence"])'
 
+cat > "$TMP_DIR/temporal-spans.jsonl" <<'JSONL'
+{"tenant_id":"local","project_id":"demo","trace_id":"trace-temporal","span_id":"span-old","seq":1,"name":"fact","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":1000,"payload":{"memory":"Use the legacy API token for deploys."}}
+{"tenant_id":"local","project_id":"demo","trace_id":"trace-temporal","span_id":"span-new","seq":2,"name":"fact","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":2000,"payload":{"memory":"Do not use the legacy API token; it is deprecated. Use the scoped API token instead."}}
+JSONL
+
+"$BIN" --db "$DB" import-jsonl \
+  --path "$TMP_DIR/temporal-spans.jsonl" \
+  > "$TMP_DIR/import-temporal-jsonl.json"
+json_assert "$TMP_DIR/import-temporal-jsonl.json" 'assert data["import"]["rows_seen"] == 2 and data["import"]["events_inserted"] == 2 and data["project"]["events_projected"] == 2'
+
+"$BIN" --db "$DB" query \
+  --tenant local \
+  --project demo \
+  --modes semantic \
+  --as-of-unix-ms 1500 \
+  --json \
+  "legacy API token" \
+  > "$TMP_DIR/query-temporal-before.json"
+json_assert "$TMP_DIR/query-temporal-before.json" 'assert data["evidence"] and any("Use the legacy API token" in item["text"] for item in data["evidence"])'
+json_assert "$TMP_DIR/query-temporal-before.json" 'assert not any("scoped API token" in item["text"] for item in data["evidence"]) and not data["contradictions"] and not data["stale_assumptions"]'
+
+"$BIN" --db "$DB" query \
+  --tenant local \
+  --project demo \
+  --modes semantic \
+  --as-of-unix-ms 2500 \
+  --json \
+  "legacy API token" \
+  > "$TMP_DIR/query-temporal-after.json"
+json_assert "$TMP_DIR/query-temporal-after.json" 'assert data["evidence"] and any("scoped API token" in item["text"] for item in data["evidence"])'
+json_assert "$TMP_DIR/query-temporal-after.json" 'assert not any("for deploys" in item["text"] for item in data["evidence"]) and data["contradictions"] and data["stale_assumptions"]'
+
 start_server
 json_assert "$TMP_DIR/readyz.json" 'assert data["status"] == "ok" and data["database"] == "ok"'
 
@@ -173,6 +205,16 @@ json_assert "$TMP_DIR/http-remember-duplicate.json" 'assert data["ingested"] is 
 api_post "/v1/query" '{"question":"checkout database migrations","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null},"max_tokens":800,"require_fresh":false,"modes":["gotcha","semantic","episodic","procedural","state"]}' \
   > "$TMP_DIR/http-query.json"
 json_assert "$TMP_DIR/http-query.json" 'assert data["evidence"] and "DATABASE_URL" in data["answer"]'
+
+api_post "/v1/query" '{"question":"legacy API token","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":1500},"modes":["semantic"]}' \
+  > "$TMP_DIR/http-query-temporal-before.json"
+json_assert "$TMP_DIR/http-query-temporal-before.json" 'assert data["evidence"] and any("Use the legacy API token" in item["text"] for item in data["evidence"])'
+json_assert "$TMP_DIR/http-query-temporal-before.json" 'assert not any("scoped API token" in item["text"] for item in data["evidence"]) and not data["contradictions"] and not data["stale_assumptions"]'
+
+api_post "/v1/query" '{"question":"legacy API token","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":2500},"modes":["semantic"]}' \
+  > "$TMP_DIR/http-query-temporal-after.json"
+json_assert "$TMP_DIR/http-query-temporal-after.json" 'assert data["evidence"] and any("scoped API token" in item["text"] for item in data["evidence"])'
+json_assert "$TMP_DIR/http-query-temporal-after.json" 'assert not any("for deploys" in item["text"] for item in data["evidence"]) and data["contradictions"] and data["stale_assumptions"]'
 
 maintenance_status="$(
   curl -sS \

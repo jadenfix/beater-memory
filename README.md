@@ -36,6 +36,8 @@ The current implementation includes:
   maintenance, backup, and restore
 - graph projection integrity checks and orphan repair for edges, citations, and
   cue index entries
+- as-of temporal query windows that exclude future or invalidated facts while
+  still surfacing stale assumptions from contradiction edges
 - ledger validation that rejects malformed events before they enter the
   append-only log
 - query validation that rejects malformed scopes, empty questions, and unusable

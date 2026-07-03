@@ -57,7 +57,7 @@ impl Distiller for HeuristicDistiller {
         let kind = classify_memory_kind(event, &body);
         let op = classify_op(&body);
         let target_node_id = if op == BeliefRevisionOp::Invalidate {
-            best_target(&body, neighbors)
+            best_target(&body, kind, neighbors)
         } else {
             None
         };
@@ -144,11 +144,15 @@ fn classify_op(text: &str) -> BeliefRevisionOp {
     }
 }
 
-fn best_target(text: &str, neighbors: &[MemoryNode]) -> Option<String> {
+fn best_target(text: &str, kind: MemoryNodeKind, neighbors: &[MemoryNode]) -> Option<String> {
     neighbors
         .iter()
-        .filter(|node| node.valid_to_unix_ms.is_none())
-        .map(|node| (overlap_score(text, &node.text), node))
+        .filter(|node| node.kind != MemoryNodeKind::Episode)
+        .filter(|node| node.kind != MemoryNodeKind::EntityCue)
+        .map(|node| {
+            let kind_bonus = if node.kind == kind { 0.08 } else { 0.0 };
+            (overlap_score(text, &node.text) + kind_bonus, node)
+        })
         .filter(|(score, _)| *score >= 0.12)
         .max_by(|left, right| left.0.total_cmp(&right.0))
         .map(|(_, node)| node.id.clone())
@@ -191,6 +195,7 @@ mod tests {
             updated_at_unix_ms: 1,
             valid_from_unix_ms: 1,
             valid_to_unix_ms: None,
+            valid_to_event_id: None,
             confidence: 0.7,
             token_estimate: 8,
             observation_count: 1,
@@ -205,5 +210,54 @@ mod tests {
 
         assert_eq!(memories[1].op, BeliefRevisionOp::Invalidate);
         assert_eq!(memories[1].target_node_id.as_deref(), Some("node_old"));
+    }
+
+    #[test]
+    fn invalidations_prefer_typed_memory_over_episode_scaffolding() {
+        let episode = MemoryNode {
+            id: "node_episode".to_string(),
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            environment_id: None,
+            kind: MemoryNodeKind::Episode,
+            text: "memory.write fact: Use the old checkout token.".to_string(),
+            canonical_key: "episode:trace:span:1".to_string(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            valid_from_unix_ms: 1,
+            valid_to_unix_ms: None,
+            valid_to_event_id: None,
+            confidence: 0.7,
+            token_estimate: 8,
+            observation_count: 1,
+        };
+        let fact = MemoryNode {
+            id: "node_fact".to_string(),
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            environment_id: None,
+            kind: MemoryNodeKind::Fact,
+            text: "Use the old checkout token.".to_string(),
+            canonical_key: "fact:old checkout token".to_string(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            valid_from_unix_ms: 1,
+            valid_to_unix_ms: None,
+            valid_to_event_id: None,
+            confidence: 0.7,
+            token_estimate: 8,
+            observation_count: 1,
+        };
+
+        let memories = HeuristicDistiller::default().distill(
+            &event(
+                MemoryNodeKind::Fact,
+                "Do not use the old checkout token; it is deprecated.",
+            ),
+            &[episode, fact],
+        );
+
+        assert_eq!(memories[1].op, BeliefRevisionOp::Invalidate);
+        assert_eq!(memories[1].target_node_id.as_deref(), Some("node_fact"));
     }
 }
