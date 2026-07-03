@@ -219,11 +219,34 @@ impl<'a> StoreScope<'a> {
 
 /// Operational counts for the memory database.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StoreStats {
     pub ledger_events: i64,
     pub pending_events: i64,
     pub nodes: i64,
     pub active_nodes: i64,
+    #[serde(default)]
+    pub total_node_tokens: i64,
+    #[serde(default)]
+    pub active_node_tokens: i64,
+    #[serde(default)]
+    pub active_episode_nodes: i64,
+    #[serde(default)]
+    pub active_fact_nodes: i64,
+    #[serde(default)]
+    pub active_entity_cue_nodes: i64,
+    #[serde(default)]
+    pub active_tag_nodes: i64,
+    #[serde(default)]
+    pub active_procedure_nodes: i64,
+    #[serde(default)]
+    pub active_state_nodes: i64,
+    #[serde(default)]
+    pub active_gotcha_nodes: i64,
+    #[serde(default)]
+    pub active_anti_memory_nodes: i64,
+    #[serde(default)]
+    pub active_topic_nodes: i64,
     pub edges: i64,
     pub audit_events: i64,
 }
@@ -1640,11 +1663,44 @@ impl SqliteMemoryStore {
         let nodes: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM memory_nodes", [], |row| row.get(0))?;
+        let now = now_unix_ms();
         let active_nodes: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memory_nodes WHERE valid_to_unix_ms IS NULL",
+            "
+            SELECT COUNT(*)
+            FROM memory_nodes
+            WHERE valid_from_unix_ms <= ?1
+              AND (valid_to_unix_ms IS NULL OR valid_to_unix_ms > ?1)
+            ",
+            params![now],
+            |row| row.get(0),
+        )?;
+        let total_node_tokens: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(token_estimate), 0) FROM memory_nodes",
             [],
             |row| row.get(0),
         )?;
+        let active_node_tokens: i64 = self.conn.query_row(
+            "
+            SELECT COALESCE(SUM(token_estimate), 0)
+            FROM memory_nodes
+            WHERE valid_from_unix_ms <= ?1
+              AND (valid_to_unix_ms IS NULL OR valid_to_unix_ms > ?1)
+            ",
+            params![now],
+            |row| row.get(0),
+        )?;
+        let active_episode_nodes = self.active_node_count_by_kind(MemoryNodeKind::Episode, now)?;
+        let active_fact_nodes = self.active_node_count_by_kind(MemoryNodeKind::Fact, now)?;
+        let active_entity_cue_nodes =
+            self.active_node_count_by_kind(MemoryNodeKind::EntityCue, now)?;
+        let active_tag_nodes = self.active_node_count_by_kind(MemoryNodeKind::Tag, now)?;
+        let active_procedure_nodes =
+            self.active_node_count_by_kind(MemoryNodeKind::Procedure, now)?;
+        let active_state_nodes = self.active_node_count_by_kind(MemoryNodeKind::State, now)?;
+        let active_gotcha_nodes = self.active_node_count_by_kind(MemoryNodeKind::Gotcha, now)?;
+        let active_anti_memory_nodes =
+            self.active_node_count_by_kind(MemoryNodeKind::AntiMemory, now)?;
+        let active_topic_nodes = self.active_node_count_by_kind(MemoryNodeKind::Topic, now)?;
         let edges: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0))?;
@@ -1656,9 +1712,36 @@ impl SqliteMemoryStore {
             pending_events,
             nodes,
             active_nodes,
+            total_node_tokens,
+            active_node_tokens,
+            active_episode_nodes,
+            active_fact_nodes,
+            active_entity_cue_nodes,
+            active_tag_nodes,
+            active_procedure_nodes,
+            active_state_nodes,
+            active_gotcha_nodes,
+            active_anti_memory_nodes,
+            active_topic_nodes,
             edges,
             audit_events,
         })
+    }
+
+    fn active_node_count_by_kind(&self, kind: MemoryNodeKind, now: i64) -> MemoryResult<i64> {
+        self.conn
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM memory_nodes
+                WHERE valid_from_unix_ms <= ?2
+                  AND (valid_to_unix_ms IS NULL OR valid_to_unix_ms > ?2)
+                  AND kind = ?1
+                ",
+                params![kind.as_str(), now],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn append_audit(&self, record: &AuditRecord) -> MemoryResult<i64> {
@@ -2502,6 +2585,77 @@ mod tests {
         assert_eq!(node.observation_count, 2);
         assert_eq!(store.cited_spans_for_node(&node.id)?.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn stats_report_token_totals_and_active_kind_counts() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "trace".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let (fact, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            1,
+            std::slice::from_ref(&span),
+        )?;
+        let (procedure, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Procedure,
+            "Run migrations before restarting checkout workers.",
+            2,
+            &[span],
+        )?;
+        let (future, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Future checkout token is active later.",
+            now_unix_ms() + 1_000_000,
+            &[],
+        )?;
+        assert!(store.invalidate_node(&fact.id, 3, Some(30))?);
+        assert!(store.invalidate_node(&procedure.id, now_unix_ms() + 1_000_000, Some(31))?);
+
+        let stats = store.stats()?;
+
+        assert_eq!(stats.nodes, 3);
+        assert_eq!(stats.active_nodes, 1);
+        assert_eq!(stats.active_fact_nodes, 0);
+        assert_eq!(stats.active_procedure_nodes, 1);
+        assert_eq!(
+            stats.active_node_tokens,
+            i64::from(procedure.token_estimate)
+        );
+        assert_eq!(
+            stats.total_node_tokens,
+            i64::from(fact.token_estimate)
+                + i64::from(procedure.token_estimate)
+                + i64::from(future.token_estimate)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn store_stats_deserializes_without_memory_economics_fields() {
+        let stats: StoreStats = serde_json::from_value(serde_json::json!({
+            "ledger_events": 1,
+            "pending_events": 0,
+            "nodes": 2,
+            "active_nodes": 2,
+            "edges": 1,
+            "audit_events": 0
+        }))
+        .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(stats.total_node_tokens, 0);
+        assert_eq!(stats.active_node_tokens, 0);
+        assert_eq!(stats.active_fact_nodes, 0);
+        assert_eq!(stats.active_procedure_nodes, 0);
     }
 
     #[test]

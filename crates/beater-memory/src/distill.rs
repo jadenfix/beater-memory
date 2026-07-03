@@ -232,6 +232,9 @@ impl<P: DistillationProvider> Distiller for ProviderDistiller<P> {
                     }
                     metrics.repair_attempts += 1;
                     metrics.provider_calls += 1;
+                    metrics.input_tokens += estimate_distillation_input_tokens(event, neighbors)
+                        + estimate_tokens(&raw)
+                        + estimate_tokens(&error);
                     let repaired = match self.provider.repair(DistillationRepairPrompt {
                         event,
                         neighbors,
@@ -577,6 +580,7 @@ mod tests {
         assert_eq!(outcome.metrics.schema_errors, 1);
         assert_eq!(outcome.metrics.repair_attempts, 1);
         assert_eq!(outcome.metrics.repair_successes, 1);
+        assert!(outcome.metrics.input_tokens > estimate_distillation_input_tokens(&event, &[]));
     }
 
     #[test]

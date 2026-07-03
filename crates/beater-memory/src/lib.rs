@@ -38,8 +38,9 @@ pub use reconstruct::{
 };
 pub use server::{
     AuditHttpQuery, AuditHttpResponse, LiveResponse, MaintenanceHttpRequest, MemoryServerConfig,
-    ProjectHttpRequest, QueryHttpRequest, ReadyResponse, RememberHttpRequest, RememberHttpResponse,
-    ServiceMetricsSnapshot, memory_router, serve, serve_with_shutdown, try_memory_router,
+    ProjectHttpRequest, QueryHttpRequest, QueryTierMetrics, ReadyResponse, RememberHttpRequest,
+    RememberHttpResponse, ServiceMetricsSnapshot, memory_router, serve, serve_with_shutdown,
+    try_memory_router,
 };
 pub use store::{
     AuditEvent, AuditPruneReport, AuditRecord, BackupReport, GraphIntegrityReport,

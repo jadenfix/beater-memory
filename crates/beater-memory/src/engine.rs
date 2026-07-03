@@ -14,10 +14,17 @@ use serde::{Deserialize, Serialize};
 
 /// Result of one projection pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProjectReport {
     pub events_seen: usize,
     pub events_projected: usize,
     pub events_skipped: usize,
+    #[serde(default)]
+    pub source_token_estimate: u32,
+    #[serde(default)]
+    pub projected_memory_token_estimate: u32,
+    #[serde(default)]
+    pub stored_memories_touched: usize,
     #[serde(default)]
     pub distillation_outputs: usize,
     #[serde(default)]
@@ -127,6 +134,7 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 events_seen: 1,
                 ..ProjectReport::default()
             };
+            event_report.record_source_tokens(&event);
             let Some(event_id) = event.id else {
                 event_report.events_skipped = 1;
                 report.absorb(event_report);
@@ -169,15 +177,22 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                         match self.apply_distilled(&event, memory, &neighbors)? {
                             ApplyOutcome::Added(node) => {
                                 event_report.memories_added += 1;
+                                event_report.record_projected_node(&node);
                                 projected_nodes.push(node);
                             }
                             ApplyOutcome::Updated(node) => {
                                 event_report.memories_updated += 1;
+                                event_report.record_projected_node(&node);
                                 projected_nodes.push(node);
                             }
-                            ApplyOutcome::Invalidated { replacement } => {
-                                event_report.memories_invalidated += 1;
+                            ApplyOutcome::Invalidated {
+                                replacement,
+                                invalidated_count,
+                            } => {
+                                event_report.memories_invalidated += invalidated_count;
+                                event_report.stored_memories_touched += invalidated_count;
                                 if let Some(node) = replacement {
+                                    event_report.record_projected_node(&node);
                                     projected_nodes.push(node);
                                 }
                             }
@@ -278,14 +293,18 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             }
             BeliefRevisionOp::Invalidate => {
                 let replacement = self.replacement_for_invalidation(event, &memory)?;
+                let mut invalidated_count = 0;
                 let targets = self.invalidation_targets(&memory, neighbors, replacement.as_ref());
                 for target in targets {
-                    if self.store.invalidate_node(
+                    let invalidated = self.store.invalidate_node(
                         &target.id,
                         event.observed_at_unix_ms,
                         event.id,
-                    )? && let Some(newer) = replacement.as_ref()
-                    {
+                    )?;
+                    if invalidated {
+                        invalidated_count += 1;
+                    }
+                    if invalidated && let Some(newer) = replacement.as_ref() {
                         self.store.insert_edge(
                             StoreScope::new(
                                 &event.tenant_id,
@@ -312,7 +331,10 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                         )?;
                     }
                 }
-                Ok(ApplyOutcome::Invalidated { replacement })
+                Ok(ApplyOutcome::Invalidated {
+                    replacement,
+                    invalidated_count,
+                })
             }
         }
     }
@@ -535,6 +557,8 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                     self.apply_late_invalidation(&projected_event, memory, node)
                 })?;
                 if invalidated {
+                    report.memories_invalidated += 1;
+                    report.stored_memories_touched += 1;
                     return Ok(report);
                 }
             }
@@ -660,6 +684,9 @@ impl ProjectReport {
         self.events_seen += other.events_seen;
         self.events_projected += other.events_projected;
         self.events_skipped += other.events_skipped;
+        self.source_token_estimate += other.source_token_estimate;
+        self.projected_memory_token_estimate += other.projected_memory_token_estimate;
+        self.stored_memories_touched += other.stored_memories_touched;
         self.distillation_outputs += other.distillation_outputs;
         self.distillation_provider_calls += other.distillation_provider_calls;
         self.distillation_provider_errors += other.distillation_provider_errors;
@@ -688,12 +715,24 @@ impl ProjectReport {
         self.distillation_output_tokens += metrics.output_tokens;
         self.distillation_elapsed_ms += metrics.elapsed_ms;
     }
+
+    fn record_source_tokens(&mut self, event: &LedgerEvent) {
+        self.source_token_estimate += crate::estimate_tokens(&event.text);
+    }
+
+    fn record_projected_node(&mut self, node: &MemoryNode) {
+        self.projected_memory_token_estimate += node.token_estimate;
+        self.stored_memories_touched += 1;
+    }
 }
 
 enum ApplyOutcome {
     Added(MemoryNode),
     Updated(MemoryNode),
-    Invalidated { replacement: Option<MemoryNode> },
+    Invalidated {
+        replacement: Option<MemoryNode>,
+        invalidated_count: usize,
+    },
     Noop,
 }
 
@@ -750,6 +789,9 @@ mod tests {
         assert_eq!(report.events_projected, 1);
         assert_eq!(report.events_skipped, 0);
         assert!(report.memories_added >= 2);
+        assert!(report.source_token_estimate > 0);
+        assert!(report.projected_memory_token_estimate > 0);
+        assert!(report.stored_memories_touched >= report.memories_added);
 
         let answer = engine.query(&MemoryQuery::new(
             "How do we fix checkout database failures?",
@@ -1689,6 +1731,60 @@ mod tests {
     }
 
     #[test]
+    fn project_report_counts_actual_multi_target_invalidations() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct InvalidateCheckoutToken;
+
+        impl Distiller for InvalidateCheckoutToken {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                _neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op: BeliefRevisionOp::Invalidate,
+                    node_kind: MemoryNodeKind::Fact,
+                    text: "Do not use checkout token alpha; use checkout token beta.".to_string(),
+                    target_node_id: None,
+                    cited_spans: vec![event.cited_span()],
+                }]))
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, InvalidateCheckoutToken);
+        let scope = StoreScope::new("tenant", "project", None);
+        let (first, _) = engine.store().upsert_node(
+            scope,
+            MemoryNodeKind::Fact,
+            "Use checkout token alpha for deploys.",
+            1_000,
+            &[],
+        )?;
+        let (second, _) = engine.store().upsert_node(
+            scope,
+            MemoryNodeKind::Fact,
+            "Checkout token alpha unlocks deploys.",
+            1_001,
+            &[],
+        )?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Do not use checkout token alpha; use checkout token beta.",
+            2_000,
+        ))?;
+
+        let report = engine.project_pending(100)?;
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+
+        assert_eq!(report.events_projected, 1);
+        assert_eq!(report.memories_invalidated, 2);
+        assert_eq!(report.stored_memories_touched, 3);
+        assert_eq!(node_valid_to(&nodes, &first.text), Some(Some(2_000)));
+        assert_eq!(node_valid_to(&nodes, &second.text), Some(Some(2_000)));
+        Ok(())
+    }
+
+    #[test]
     fn as_of_query_uses_fact_validity_windows() -> MemoryResult<()> {
         let engine = MemoryEngine::in_memory()?;
         engine.ingest_event(&event_at(
@@ -2176,7 +2272,14 @@ mod tests {
             "Use crowd token alpha.",
             1_000,
         ))?;
-        engine.project_pending(100)?;
+        let late_report = engine.project_pending(100)?;
+        assert_eq!(late_report.memories_invalidated, 1);
+        assert_eq!(
+            late_report.stored_memories_touched,
+            late_report.memories_added
+                + late_report.memories_updated
+                + late_report.memories_invalidated
+        );
 
         let query = MemoryQuery::new(
             "crowd token alpha",
