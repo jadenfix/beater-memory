@@ -509,6 +509,15 @@ async fn main() -> anyhow::Result<()> {
                 println!();
                 println!("tokens: {}", answer.token_estimate);
                 println!("tier: {:?}", answer.tier_used);
+                if let Some(routing) = answer.routing.as_ref() {
+                    let routed_modes = serde_json::to_string(&routing.routed_modes)?;
+                    let reason = serde_json::to_string(&routing.reason)?;
+                    println!("routing: {routed_modes} via {}", reason.trim_matches('"'));
+                    if let Some(reconstruction_modes) = routing.reconstruction_modes.as_ref() {
+                        let reconstruction_modes = serde_json::to_string(reconstruction_modes)?;
+                        println!("reconstruction routing: {reconstruction_modes}");
+                    }
+                }
                 println!("evidence: {}", answer.evidence.len());
                 if !answer.contradictions.is_empty() {
                     println!("contradictions: {}", answer.contradictions.len());

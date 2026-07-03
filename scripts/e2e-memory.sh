@@ -161,6 +161,8 @@ json_assert "$TMP_DIR/remember-incident-alpha.json" 'assert data["events_project
   "incident alpha" \
   > "$TMP_DIR/query-reconstruction-expands.json"
 json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["tier_used"] == "active_reconstruction" and data["reconstruction"]["reason"] == "forced"'
+json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["routing"]["routed_modes"] == ["semantic", "episodic"]'
+json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["routing"]["reconstruction_modes"] == ["semantic", "episodic"]'
 json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["reconstruction"]["accepted_node_ids"] and data["reconstruction"]["tokens_spent"] <= 200 and data["reconstruction"]["steps_used"] <= 2'
 
 cat > "$TMP_DIR/spans.jsonl" <<'JSONL'
@@ -180,6 +182,7 @@ json_assert "$TMP_DIR/import-jsonl.json" 'assert data["import"]["rows_seen"] == 
   "deploy procedure cargo test" \
   > "$TMP_DIR/query-procedure.json"
 json_assert "$TMP_DIR/query-procedure.json" 'assert data["evidence"] and any(item["kind"] == "procedure" for item in data["evidence"])'
+json_assert "$TMP_DIR/query-procedure.json" 'assert data["routing"]["routed_modes"] == ["procedural"]'
 
 cat > "$TMP_DIR/temporal-spans.jsonl" <<'JSONL'
 {"tenant_id":"local","project_id":"demo","trace_id":"trace-temporal","span_id":"span-old","seq":1,"name":"fact","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":1000,"payload":{"memory":"Use the legacy API token for deploys."}}
@@ -203,6 +206,7 @@ json_assert "$TMP_DIR/import-temporal-jsonl.json" 'assert data["import"]["rows_s
   "legacy API token" \
   > "$TMP_DIR/query-temporal-reconstruction-before.json"
 json_assert "$TMP_DIR/query-temporal-reconstruction-before.json" 'assert data["tier_used"] == "active_reconstruction" and data["reconstruction"]["mode"] == "force" and data["reconstruction"]["reason"] == "forced"'
+json_assert "$TMP_DIR/query-temporal-reconstruction-before.json" 'assert data["routing"]["reconstruction_modes"] == ["semantic"]'
 json_assert "$TMP_DIR/query-temporal-reconstruction-before.json" 'assert data["evidence"] and any("Use the legacy API token" in item["text"] for item in data["evidence"])'
 json_assert "$TMP_DIR/query-temporal-reconstruction-before.json" 'assert not any("scoped API token" in item["text"] for item in data["evidence"])'
 
@@ -239,9 +243,10 @@ api_post "/v1/remember" '{"tenant_id":"local","project_id":"demo","kind":"gotcha
   > "$TMP_DIR/http-remember-duplicate.json"
 json_assert "$TMP_DIR/http-remember-duplicate.json" 'assert data["ingested"] is False'
 
-api_post "/v1/query" '{"question":"checkout database migrations","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null},"max_tokens":800,"require_fresh":false,"modes":["gotcha","semantic","episodic","procedural","state"]}' \
+api_post "/v1/query" '{"question":"checkout database migrations","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null},"max_tokens":800,"require_fresh":false,"modes":["semantic","episodic","procedural","gotcha","state"]}' \
   > "$TMP_DIR/http-query.json"
 json_assert "$TMP_DIR/http-query.json" 'assert data["evidence"] and "DATABASE_URL" in data["answer"]'
+json_assert "$TMP_DIR/http-query.json" 'assert data["routing"]["routed_modes"] == ["semantic", "episodic", "procedural", "gotcha", "state"]'
 
 api_post "/v1/remember" '{"tenant_id":"local","project_id":"demo","kind":"fact","text":"HTTP incident alpha blocked deploys."}' \
   > "$TMP_DIR/http-remember-incident-alpha.json"
@@ -250,6 +255,8 @@ json_assert "$TMP_DIR/http-remember-incident-alpha.json" 'assert data["ingested"
 api_post "/v1/query" '{"question":"HTTP incident alpha","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null},"modes":["semantic","episodic"],"max_tokens":10,"reconstruction_mode":"force","max_reconstruction_steps":2,"max_reconstruction_tokens":200}' \
   > "$TMP_DIR/http-query-reconstruction-expands.json"
 json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["tier_used"] == "active_reconstruction" and data["reconstruction"]["reason"] == "forced"'
+json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["routing"]["routed_modes"] == ["semantic", "episodic"]'
+json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["routing"]["reconstruction_modes"] == ["semantic", "episodic"]'
 json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["reconstruction"]["accepted_node_ids"] and data["reconstruction"]["tokens_spent"] <= 200 and data["reconstruction"]["steps_used"] <= 2'
 
 api_post "/v1/query" '{"question":"legacy API token","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":1500},"modes":["semantic"]}' \
@@ -260,6 +267,7 @@ json_assert "$TMP_DIR/http-query-temporal-before.json" 'assert not any("scoped A
 api_post "/v1/query" '{"question":"legacy API token","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":1500},"modes":["semantic"],"reconstruction_mode":"force","max_reconstruction_steps":2,"max_reconstruction_tokens":500}' \
   > "$TMP_DIR/http-query-temporal-reconstruction-before.json"
 json_assert "$TMP_DIR/http-query-temporal-reconstruction-before.json" 'assert data["tier_used"] == "active_reconstruction" and data["reconstruction"]["mode"] == "force" and data["reconstruction"]["reason"] == "forced"'
+json_assert "$TMP_DIR/http-query-temporal-reconstruction-before.json" 'assert data["routing"]["reconstruction_modes"] == ["semantic"]'
 json_assert "$TMP_DIR/http-query-temporal-reconstruction-before.json" 'assert data["evidence"] and any("Use the legacy API token" in item["text"] for item in data["evidence"])'
 json_assert "$TMP_DIR/http-query-temporal-reconstruction-before.json" 'assert not any("scoped API token" in item["text"] for item in data["evidence"])'
 

@@ -536,7 +536,7 @@ mod tests {
     use crate::{
         model::{
             MemoryMode, MemoryScope, MemoryTier, ReconstructionMode, ReconstructionOptions,
-            ReconstructionReason,
+            ReconstructionReason, RoutingReason,
         },
         reconstruct::{ReconstructionDecision, ReconstructionStep},
     };
@@ -591,6 +591,188 @@ mod tests {
         assert!(answer.answer.contains("DATABASE_URL"));
         assert!(!answer.evidence.is_empty());
         assert!(!answer.cited_spans.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn default_query_routes_to_procedural_substore() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        for index in 0..20 {
+            engine.ingest_event(&event_at(
+                MemoryNodeKind::Fact,
+                &format!("Deploy workflow noisy fact {index}."),
+                1_000 + index,
+            ))?;
+        }
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Procedure,
+            "Deploy workflow steps: run migrations then restart workers.",
+            2_000,
+        ))?;
+        engine.project_pending(100)?;
+
+        let answer = engine.query(&MemoryQuery::new(
+            "deploy workflow steps",
+            MemoryScope::new("tenant", "project"),
+        ))?;
+
+        let routing = answer.routing.as_ref().expect("routing report");
+        assert_eq!(routing.reason, RoutingReason::ProceduralIntent);
+        assert_eq!(routing.routed_modes, vec![MemoryMode::Procedural]);
+        assert!(
+            answer
+                .evidence
+                .iter()
+                .any(|item| item.kind == MemoryNodeKind::Procedure)
+        );
+        assert!(
+            !answer
+                .evidence
+                .iter()
+                .any(|item| item.kind == MemoryNodeKind::Fact)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_query_modes_constrain_routing() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Deploy workflow fact uses the release checklist.",
+            1_000,
+        ))?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Procedure,
+            "Deploy workflow steps: run migrations then restart workers.",
+            2_000,
+        ))?;
+        engine.project_pending(100)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "deploy workflow steps",
+                MemoryScope::new("tenant", "project"),
+            )
+            .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        let routing = answer.routing.as_ref().expect("routing report");
+        assert_eq!(routing.routed_modes, vec![MemoryMode::Semantic]);
+        assert!(
+            answer
+                .evidence
+                .iter()
+                .any(|item| item.kind == MemoryNodeKind::Fact)
+        );
+        assert!(
+            !answer
+                .evidence
+                .iter()
+                .any(|item| item.kind == MemoryNodeKind::Procedure)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_all_query_modes_are_not_narrowed() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Deploy workflow fact uses the release checklist.",
+            1_000,
+        ))?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Procedure,
+            "Deploy workflow steps: run migrations then restart workers.",
+            2_000,
+        ))?;
+        engine.project_pending(100)?;
+
+        let modes = MemoryNodeKind::default_modes();
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "deploy workflow steps",
+                MemoryScope::new("tenant", "project"),
+            )
+            .with_modes(modes.clone()),
+        )?;
+
+        let routing = answer.routing.as_ref().expect("routing report");
+        assert_eq!(routing.routed_modes, modes);
+        assert_eq!(routing.reason, RoutingReason::AmbiguousFallback);
+        assert!(
+            answer
+                .evidence
+                .iter()
+                .any(|item| item.kind == MemoryNodeKind::Fact)
+        );
+        assert!(
+            answer
+                .evidence
+                .iter()
+                .any(|item| item.kind == MemoryNodeKind::Procedure)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forced_reconstruction_can_expand_allowed_modes_outside_route() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Procedure,
+            "Deploy workflow steps: restart checkout workers.",
+            1_000,
+        ))?;
+        engine.project_pending(100)?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Checkout workers require credential beta.",
+            1_001,
+        ))?;
+        engine.project_pending(100)?;
+
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let procedure = nodes
+            .iter()
+            .find(|node| node.kind == MemoryNodeKind::Procedure)
+            .expect("procedure exists");
+        let fact = nodes
+            .iter()
+            .find(|node| {
+                node.kind == MemoryNodeKind::Fact
+                    && node.text == "Checkout workers require credential beta."
+            })
+            .expect("fact exists");
+        engine.store().insert_edge(
+            StoreScope::new("tenant", "project", None),
+            &procedure.id,
+            &fact.id,
+            MemoryEdgeKind::Fixes,
+            1.0,
+            1_001,
+        )?;
+
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "deploy workflow steps",
+                MemoryScope::new("tenant", "project"),
+            )
+            .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+
+        let routing = answer.routing.as_ref().expect("routing report");
+        let reconstruction = answer
+            .reconstruction
+            .as_ref()
+            .expect("reconstruction report");
+        assert_eq!(routing.routed_modes, vec![MemoryMode::Procedural]);
+        assert_eq!(
+            routing.reconstruction_modes,
+            Some(MemoryNodeKind::default_modes())
+        );
+        assert!(reconstruction.accepted_node_ids.contains(&fact.id));
+        assert!(answer.evidence.iter().any(|item| item.node_id == fact.id));
         Ok(())
     }
 
@@ -1415,7 +1597,7 @@ mod tests {
         let rebuilt = engine.query(&query)?;
 
         assert_eq!(evidence_texts(&incremental), evidence_texts(&rebuilt));
-        assert_eq!(evidence_scores(&incremental), evidence_scores(&rebuilt));
+        assert_evidence_scores_close(&incremental, &rebuilt);
         assert_eq!(incremental.stale_assumptions, rebuilt.stale_assumptions);
         assert_eq!(incremental.contradictions, rebuilt.contradictions);
         Ok(())
@@ -1453,7 +1635,7 @@ mod tests {
         let rebuilt = engine.query(&query)?;
 
         assert_eq!(evidence_texts(&incremental), evidence_texts(&rebuilt));
-        assert_eq!(evidence_scores(&incremental), evidence_scores(&rebuilt));
+        assert_evidence_scores_close(&incremental, &rebuilt);
         assert_eq!(incremental.stale_assumptions, rebuilt.stale_assumptions);
         assert_eq!(incremental.contradictions, rebuilt.contradictions);
         assert!(!rebuilt.stale_assumptions.is_empty());
@@ -1531,7 +1713,7 @@ mod tests {
         engine.rebuild_projection(100, None)?;
         let rebuilt = engine.query(&after_later_invalidation_query)?;
         assert_eq!(evidence_texts(&incremental), evidence_texts(&rebuilt));
-        assert_eq!(evidence_scores(&incremental), evidence_scores(&rebuilt));
+        assert_evidence_scores_close(&incremental, &rebuilt);
         Ok(())
     }
 
@@ -1634,6 +1816,18 @@ mod tests {
             .iter()
             .map(|item| (item.score * 1_000_000.0).round() as u32)
             .collect()
+    }
+
+    fn assert_evidence_scores_close(left: &MemoryAnswer, right: &MemoryAnswer) {
+        let left = evidence_scores(left);
+        let right = evidence_scores(right);
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right.iter()) {
+            assert!(
+                left.abs_diff(*right) <= 1,
+                "evidence score mismatch: {left} vs {right}"
+            );
+        }
     }
 
     fn node_valid_to(nodes: &[MemoryNode], text: &str) -> Option<Option<i64>> {

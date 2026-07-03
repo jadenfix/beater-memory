@@ -78,6 +78,30 @@ pub enum ReconstructionReason {
     CompositionalQuery,
 }
 
+/// Why the read router selected a query's effective memory substores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingReason {
+    SemanticIntent,
+    EpisodicIntent,
+    ProceduralIntent,
+    GotchaIntent,
+    StateIntent,
+    AmbiguousFallback,
+    EmptyRouteFallback,
+}
+
+/// Diagnostic report for deterministic typed-substore routing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoutingReport {
+    pub allowed_modes: Vec<MemoryMode>,
+    pub routed_modes: Vec<MemoryMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruction_modes: Option<Vec<MemoryMode>>,
+    pub reason: RoutingReason,
+    pub confidence: f32,
+}
+
 /// Query-time bounds for active reconstruction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconstructionOptions {
@@ -352,13 +376,15 @@ impl MemoryScope {
 }
 
 /// Answer-shaped memory request.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MemoryQuery {
     pub question: String,
     pub scope: MemoryScope,
     pub max_tokens: u32,
     pub require_fresh: bool,
     pub modes: Vec<MemoryMode>,
+    #[serde(skip_serializing)]
+    pub modes_explicit: bool,
     #[serde(default, skip_serializing_if = "is_default_reconstruction_options")]
     pub reconstruction: ReconstructionOptions,
 }
@@ -372,6 +398,7 @@ impl MemoryQuery {
             max_tokens: 1_200,
             require_fresh: false,
             modes: MemoryNodeKind::default_modes(),
+            modes_explicit: false,
             reconstruction: ReconstructionOptions::default(),
         }
     }
@@ -391,6 +418,7 @@ impl MemoryQuery {
     #[must_use]
     pub fn with_modes(mut self, modes: Vec<MemoryMode>) -> Self {
         self.modes = modes;
+        self.modes_explicit = true;
         self
     }
 
@@ -416,6 +444,39 @@ impl MemoryQuery {
         }
         self.reconstruction.validate()?;
         Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryQuery {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawMemoryQuery {
+            question: String,
+            scope: MemoryScope,
+            max_tokens: u32,
+            require_fresh: bool,
+            #[serde(default)]
+            modes: Option<Vec<MemoryMode>>,
+            #[serde(default)]
+            modes_explicit: bool,
+            #[serde(default)]
+            reconstruction: ReconstructionOptions,
+        }
+
+        let raw = RawMemoryQuery::deserialize(deserializer)?;
+        let modes_explicit = raw.modes_explicit || raw.modes.is_some();
+        Ok(Self {
+            question: raw.question,
+            scope: raw.scope,
+            max_tokens: raw.max_tokens,
+            require_fresh: raw.require_fresh,
+            modes: raw.modes.unwrap_or_else(MemoryNodeKind::default_modes),
+            modes_explicit,
+            reconstruction: raw.reconstruction,
+        })
     }
 }
 
@@ -546,6 +607,8 @@ pub struct MemoryAnswer {
     pub token_estimate: u32,
     pub tier_used: MemoryTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconstruction: Option<ReconstructionReport>,
 }
 
@@ -561,6 +624,7 @@ impl MemoryAnswer {
             suggested_next_queries: Vec::new(),
             token_estimate: 0,
             tier_used,
+            routing: None,
             reconstruction: None,
         }
     }
@@ -698,6 +762,7 @@ mod tests {
         assert!(query.modes.contains(&MemoryMode::Semantic));
         assert!(query.modes.contains(&MemoryMode::Gotcha));
         assert!(!query.require_fresh);
+        assert!(!query.modes_explicit);
         assert_eq!(query.reconstruction, ReconstructionOptions::default());
         query.validate().unwrap_or_else(|err| panic!("{err}"));
     }
@@ -719,6 +784,7 @@ mod tests {
         .unwrap_or_else(|err| panic!("{err}"));
 
         assert_eq!(query.reconstruction, ReconstructionOptions::default());
+        assert!(query.modes_explicit);
 
         let query: MemoryQuery = serde_json::from_value(serde_json::json!({
             "question": "what changed?",
@@ -738,15 +804,18 @@ mod tests {
         assert_eq!(query.reconstruction.mode, ReconstructionMode::Auto);
         assert_eq!(query.reconstruction.max_steps, 4);
         assert_eq!(query.reconstruction.max_tokens, 2_000);
+        assert!(query.modes_explicit);
     }
 
     #[test]
     fn query_serialization_omits_default_reconstruction_options() {
-        let query = MemoryQuery::new("what changed?", MemoryScope::new("tenant", "project"));
+        let query = MemoryQuery::new("what changed?", MemoryScope::new("tenant", "project"))
+            .with_modes(vec![MemoryMode::Semantic]);
 
         let value = serde_json::to_value(query).unwrap_or_else(|err| panic!("{err}"));
 
         assert!(value.get("reconstruction").is_none());
+        assert!(value.get("modes_explicit").is_none());
     }
 
     #[test]

@@ -877,10 +877,15 @@ async fn query(
         .as_ref()
         .ok()
         .and_then(|answer| answer.reconstruction.as_ref());
+    let audit_routing = result
+        .as_ref()
+        .ok()
+        .and_then(|answer| answer.routing.as_ref());
     let success_detail = serde_json::json!({
         "tenant_id": tenant_id,
         "project_id": project_id,
         "max_tokens": max_tokens,
+        "routing": audit_routing,
         "reconstruction_mode": reconstruction_mode,
         "max_reconstruction_steps": max_reconstruction_steps,
         "max_reconstruction_tokens": max_reconstruction_tokens,
@@ -1901,6 +1906,64 @@ mod tests {
         assert_eq!(query_event.detail["max_reconstruction_steps"], 2);
         assert_eq!(query_event.detail["max_reconstruction_tokens"], 500);
         assert_eq!(query_event.detail["reconstruction"]["reason"], "forced");
+    }
+
+    #[tokio::test]
+    async fn query_response_and_audit_record_routing_detail() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let remember = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "kind": "procedure",
+            "text": "Deploy workflow steps: run migrations then restart workers."
+        });
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/remember", remember))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query = serde_json::json!({
+            "question": "deploy workflow steps",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null}
+        });
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let answer: MemoryAnswer =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        let routing = answer.routing.expect("routing report should be present");
+        assert_eq!(routing.reason, crate::RoutingReason::ProceduralIntent);
+        assert_eq!(routing.routed_modes, vec![MemoryMode::Procedural]);
+
+        let response = app
+            .oneshot(get_request("/v1/audit?limit=10"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let audit: AuditHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        let query_event = audit
+            .events
+            .iter()
+            .find(|event| event.action == "query")
+            .expect("query audit event should exist");
+
+        assert_eq!(query_event.detail["routing"]["reason"], "procedural_intent");
+        assert_eq!(
+            query_event.detail["routing"]["routed_modes"],
+            serde_json::json!(["procedural"])
+        );
     }
 
     #[tokio::test]

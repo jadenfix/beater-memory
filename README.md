@@ -25,6 +25,8 @@ The current implementation includes:
 - distiller output validation before graph projection writes
 - typed nodes and edges for facts, episodes, procedures, state, gotchas, and
   anti-memory
+- deterministic typed-substore read routing with conservative fallback and
+  response/audit diagnostics
 - lexical cue seeding plus graph activation ranking
 - `beater.js` journal import from `.beater/journal.db`
 - canonical span JSONL import aligned with `beater-agents` span kinds
@@ -220,9 +222,9 @@ The public API exports:
   `ReconstructionCandidate`, `ReconstructionDecision`, and
   `ReconstructionStep`
 - `MemoryQuery` and `MemoryAnswer`
-- `MemoryTier`, `MemoryNodeKind`, `MemoryEdgeKind`, `BeliefRevisionOp`,
-  `ReconstructionMode`, `ReconstructionOptions`, `ReconstructionReason`, and
-  `ReconstructionReport`
+- `MemoryTier`, `MemoryMode`, `MemoryNodeKind`, `MemoryEdgeKind`,
+  `BeliefRevisionOp`, `RoutingReason`, `RoutingReport`, `ReconstructionMode`,
+  `ReconstructionOptions`, `ReconstructionReason`, and `ReconstructionReport`
 - import helpers for `beater.js` journals and canonical JSONL
 - evidence token budgeting helpers
 

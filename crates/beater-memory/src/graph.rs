@@ -3,14 +3,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use crate::{
     error::MemoryResult,
     model::{
-        ActivationWeights, Contradiction, Evidence, MemoryAnswer, MemoryEdgeKind, MemoryNodeKind,
-        MemoryQuery, MemoryTier, ReconstructionMode, ReconstructionReason, ReconstructionReport,
-        StaleAssumption, blend_activation, budget_evidence, estimate_tokens,
+        ActivationWeights, Contradiction, Evidence, MemoryAnswer, MemoryEdgeKind, MemoryMode,
+        MemoryNodeKind, MemoryQuery, MemoryTier, ReconstructionMode, ReconstructionReason,
+        ReconstructionReport, RoutingReport, StaleAssumption, blend_activation, budget_evidence,
+        estimate_tokens,
     },
     reconstruct::{
         ActiveReconstructor, ReconstructionCandidate, ReconstructionDecision, ReconstructionStep,
     },
-    store::{MemoryEdge, MemoryNode, SqliteMemoryStore},
+    route::{
+        fallback_route_after_empty_evidence, modes_accept_kind, route_memory_query,
+        support_kinds_for_modes,
+    },
+    store::{MemoryEdge, MemoryNode, SqliteMemoryStore, StoreScope},
     text::{concise, now_unix_ms, overlap_score, terms, top_terms},
 };
 
@@ -20,23 +25,132 @@ pub(crate) fn answer_query(
     weights: ActivationWeights,
     reconstructor: &impl ActiveReconstructor,
 ) -> MemoryResult<MemoryAnswer> {
-    let env = query.scope.environment_id.as_deref();
     let now = now_unix_ms();
     let effective_as_of = query.scope.as_of_unix_ms.unwrap_or(now);
+    let mut routing = route_memory_query(&query.question, &query.modes, query.modes_explicit);
+    let mut context = retrieve_with_modes(store, query, weights, effective_as_of, &routing)?;
+    if context.selected.is_empty() && routing.routed_modes != routing.allowed_modes {
+        routing = fallback_route_after_empty_evidence(&routing);
+        context = retrieve_with_modes(store, query, weights, effective_as_of, &routing)?;
+    }
+
+    let selected = std::mem::take(&mut context.selected);
+    let escalation_reason = escalation_reason(query, &selected);
+    let reconstruction_modes = if escalation_reason.is_some() {
+        routing.allowed_modes.clone()
+    } else {
+        routing.routed_modes.clone()
+    };
+    if escalation_reason.is_some() && routing.routed_modes != routing.allowed_modes {
+        let allowed_route = fallback_route_after_empty_evidence(&routing);
+        let mut allowed_context =
+            retrieve_with_modes(store, query, weights, effective_as_of, &allowed_route)?;
+        allowed_context.selected.clear();
+        context = allowed_context;
+    }
+
+    let RetrievalContext {
+        nodes,
+        visible_edges,
+        ranking_edges,
+        node_by_id,
+        selected: _,
+    } = context;
+    let (selected, reconstruction) = if let Some(reason) = escalation_reason {
+        reconstruct_active(
+            ReconstructionRequest {
+                store,
+                query,
+                routed_modes: &reconstruction_modes,
+                selected,
+                nodes: &nodes,
+                edges: &ranking_edges,
+                as_of_unix_ms: Some(effective_as_of),
+                reason,
+            },
+            reconstructor,
+        )?
+    } else {
+        (selected, None)
+    };
+    if reconstruction.is_some() {
+        routing.reconstruction_modes = Some(reconstruction_modes.clone());
+    }
+    let stale_modes = if reconstruction.is_some() {
+        reconstruction_modes.as_slice()
+    } else {
+        routing.routed_modes.as_slice()
+    };
+    let cited_spans = selected
+        .iter()
+        .flat_map(|item| item.cited_spans.iter().cloned())
+        .collect::<BTreeMapKeyedSpans>()
+        .into_vec();
+    let selected_ids: BTreeSet<_> = selected.iter().map(|item| item.node_id.clone()).collect();
+    let contradictions = contradictions_for(&visible_edges, &selected_ids, &node_by_id);
+    let stale_assumptions = stale_assumptions_for(
+        &selected,
+        &contradictions,
+        &node_by_id,
+        query,
+        stale_modes,
+        Some(effective_as_of),
+    );
+    let suggested_next_queries = suggested_queries(&query.question, &selected);
+    let answer = synthesize_answer(&selected, &contradictions);
+    let token_estimate =
+        estimate_tokens(&answer) + selected.iter().map(|item| item.token_estimate).sum::<u32>();
+    let tier_used = if reconstruction.is_some() {
+        MemoryTier::ActiveReconstruction
+    } else {
+        MemoryTier::Activation
+    };
+
+    Ok(MemoryAnswer {
+        answer,
+        evidence: selected,
+        cited_spans,
+        contradictions,
+        stale_assumptions,
+        suggested_next_queries,
+        token_estimate,
+        tier_used,
+        routing: Some(routing),
+        reconstruction,
+    })
+}
+
+struct RetrievalContext {
+    nodes: Vec<MemoryNode>,
+    visible_edges: Vec<MemoryEdge>,
+    ranking_edges: Vec<MemoryEdge>,
+    node_by_id: HashMap<String, MemoryNode>,
+    selected: Vec<Evidence>,
+}
+
+fn retrieve_with_modes(
+    store: &SqliteMemoryStore,
+    query: &MemoryQuery,
+    weights: ActivationWeights,
+    effective_as_of: i64,
+    routing: &RoutingReport,
+) -> MemoryResult<RetrievalContext> {
+    let env = query.scope.environment_id.as_deref();
     let query_terms = terms(&query.question);
-    let seeds = store.seed_nodes_observed_by(
-        &query.scope.tenant_id,
-        &query.scope.project_id,
-        env,
+    let support_kinds = support_kinds_for_modes(&routing.routed_modes);
+    let seeds = store.seed_nodes_observed_by_kinds(
+        StoreScope::new(&query.scope.tenant_id, &query.scope.project_id, env),
         &query_terms,
         64,
         Some(effective_as_of),
+        &support_kinds,
     )?;
-    let mut history_nodes = store.all_nodes_observed_by(
+    let mut history_nodes = store.all_nodes_observed_by_kinds(
         &query.scope.tenant_id,
         &query.scope.project_id,
         env,
         effective_as_of,
+        &support_kinds,
     )?;
     merge_seed_nodes(&mut history_nodes, seeds);
     let mut nodes = history_nodes.clone();
@@ -62,7 +176,7 @@ pub(crate) fn answer_query(
         if node.kind == crate::model::MemoryNodeKind::EntityCue {
             continue;
         }
-        if !query.accepts_kind(node.kind) {
+        if !modes_accept_kind(&routing.routed_modes, node.kind) {
             continue;
         }
         if query.require_fresh && !node.is_active_at(Some(effective_as_of)) {
@@ -98,57 +212,12 @@ pub(crate) fn answer_query(
     }
 
     let selected = budget_evidence(evidence, query.max_tokens);
-    let escalation_reason = escalation_reason(query, &selected);
-    let (selected, reconstruction) = if let Some(reason) = escalation_reason {
-        reconstruct_active(
-            ReconstructionRequest {
-                store,
-                query,
-                selected,
-                nodes: &nodes,
-                edges: &ranking_edges,
-                as_of_unix_ms: Some(effective_as_of),
-                reason,
-            },
-            reconstructor,
-        )?
-    } else {
-        (selected, None)
-    };
-    let cited_spans = selected
-        .iter()
-        .flat_map(|item| item.cited_spans.iter().cloned())
-        .collect::<BTreeMapKeyedSpans>()
-        .into_vec();
-    let selected_ids: BTreeSet<_> = selected.iter().map(|item| item.node_id.clone()).collect();
-    let contradictions = contradictions_for(&visible_edges, &selected_ids, &node_by_id);
-    let stale_assumptions = stale_assumptions_for(
-        &selected,
-        &contradictions,
-        &node_by_id,
-        query,
-        Some(effective_as_of),
-    );
-    let suggested_next_queries = suggested_queries(&query.question, &selected);
-    let answer = synthesize_answer(&selected, &contradictions);
-    let token_estimate =
-        estimate_tokens(&answer) + selected.iter().map(|item| item.token_estimate).sum::<u32>();
-    let tier_used = if reconstruction.is_some() {
-        MemoryTier::ActiveReconstruction
-    } else {
-        MemoryTier::Activation
-    };
-
-    Ok(MemoryAnswer {
-        answer,
-        evidence: selected,
-        cited_spans,
-        contradictions,
-        stale_assumptions,
-        suggested_next_queries,
-        token_estimate,
-        tier_used,
-        reconstruction,
+    Ok(RetrievalContext {
+        nodes,
+        visible_edges,
+        ranking_edges,
+        node_by_id,
+        selected,
     })
 }
 
@@ -199,6 +268,7 @@ fn is_compositional_query(question: &str) -> bool {
 struct ReconstructionRequest<'a> {
     store: &'a SqliteMemoryStore,
     query: &'a MemoryQuery,
+    routed_modes: &'a [MemoryMode],
     selected: Vec<Evidence>,
     nodes: &'a [MemoryNode],
     edges: &'a [MemoryEdge],
@@ -213,6 +283,7 @@ fn reconstruct_active(
     let ReconstructionRequest {
         store,
         query,
+        routed_modes,
         selected,
         nodes,
         edges,
@@ -230,7 +301,7 @@ fn reconstruct_active(
         && let Some(seed) = nodes
             .iter()
             .filter(|node| node.kind != MemoryNodeKind::EntityCue)
-            .filter(|node| query.accepts_kind(node.kind))
+            .filter(|node| modes_accept_kind(routed_modes, node.kind))
             .find(|node| overlap_score(&query.question, &node.text) > 0.0)
     {
         frontier.push_back(seed.id.clone());
@@ -251,15 +322,16 @@ fn reconstruct_active(
         steps_used = step_index + 1;
 
         let remaining_tokens = query.reconstruction.max_tokens.saturating_sub(tokens_spent);
-        let candidates = reconstruction_candidates(
+        let candidates = reconstruction_candidates(CandidateRequest {
             query,
-            &expanded_node_id,
-            &node_by_id,
+            routed_modes,
+            expanded_node_id: &expanded_node_id,
+            nodes: &node_by_id,
             edges,
-            &selected_ids,
-            &expanded,
+            selected_ids: &selected_ids,
+            expanded_ids: &expanded,
             as_of_unix_ms,
-        );
+        });
         let (candidates, budget_pruned_node_ids) =
             budget_reconstruction_candidates(candidates, remaining_tokens);
         pruned_node_ids.extend(budget_pruned_node_ids);
@@ -364,15 +436,28 @@ fn budget_reconstruction_candidates(
     (selected, pruned)
 }
 
-fn reconstruction_candidates(
-    query: &MemoryQuery,
-    expanded_node_id: &str,
-    nodes: &HashMap<String, MemoryNode>,
-    edges: &[MemoryEdge],
-    selected_ids: &BTreeSet<String>,
-    expanded_ids: &BTreeSet<String>,
+struct CandidateRequest<'a> {
+    query: &'a MemoryQuery,
+    routed_modes: &'a [MemoryMode],
+    expanded_node_id: &'a str,
+    nodes: &'a HashMap<String, MemoryNode>,
+    edges: &'a [MemoryEdge],
+    selected_ids: &'a BTreeSet<String>,
+    expanded_ids: &'a BTreeSet<String>,
     as_of_unix_ms: Option<i64>,
-) -> Vec<ReconstructionCandidate> {
+}
+
+fn reconstruction_candidates(request: CandidateRequest<'_>) -> Vec<ReconstructionCandidate> {
+    let CandidateRequest {
+        query,
+        routed_modes,
+        expanded_node_id,
+        nodes,
+        edges,
+        selected_ids,
+        expanded_ids,
+        as_of_unix_ms,
+    } = request;
     let mut candidates = BTreeMap::new();
     for edge in edges {
         let neighbor_id = if edge.from_node_id == expanded_node_id {
@@ -391,7 +476,7 @@ fn reconstruction_candidates(
         let Some(node) = nodes.get(neighbor_id) else {
             continue;
         };
-        if node.kind == MemoryNodeKind::EntityCue || !query.accepts_kind(node.kind) {
+        if node.kind == MemoryNodeKind::EntityCue || !modes_accept_kind(routed_modes, node.kind) {
             continue;
         }
         if query.require_fresh && !node.is_active_at(as_of_unix_ms) {
@@ -631,6 +716,7 @@ fn stale_assumptions_for(
     contradictions: &[Contradiction],
     nodes: &HashMap<String, MemoryNode>,
     query: &MemoryQuery,
+    routed_modes: &[MemoryMode],
     as_of_unix_ms: Option<i64>,
 ) -> Vec<StaleAssumption> {
     let mut out = BTreeMap::new();
@@ -649,7 +735,7 @@ fn stale_assumptions_for(
     for node in nodes
         .values()
         .filter(|node| node.kind != crate::model::MemoryNodeKind::EntityCue)
-        .filter(|node| query.accepts_kind(node.kind))
+        .filter(|node| modes_accept_kind(routed_modes, node.kind))
         .filter(|node| node_is_stale_at(node, as_of_unix_ms))
         .filter(|node| !has_visible_family_successor(node, nodes, as_of_unix_ms))
         .filter(|node| overlap_score(&query.question, &node.text) > 0.001)

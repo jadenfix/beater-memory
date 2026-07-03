@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
 
-use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -1360,18 +1361,37 @@ impl SqliteMemoryStore {
         limit: usize,
         as_of_unix_ms: Option<i64>,
     ) -> MemoryResult<Vec<MemoryNode>> {
+        self.seed_nodes_observed_by_kinds(
+            StoreScope::new(tenant_id, project_id, environment_id),
+            query_terms,
+            limit,
+            as_of_unix_ms,
+            &[],
+        )
+    }
+
+    pub(crate) fn seed_nodes_observed_by_kinds(
+        &self,
+        scope: StoreScope<'_>,
+        query_terms: &[String],
+        limit: usize,
+        as_of_unix_ms: Option<i64>,
+        kinds: &[MemoryNodeKind],
+    ) -> MemoryResult<Vec<MemoryNode>> {
         let sql_limit = sqlite_limit("seed_nodes limit", limit)?;
         if query_terms.is_empty() {
-            return self.recent_nodes_observed_by(
-                tenant_id,
-                project_id,
-                environment_id,
+            return self.recent_nodes_observed_by_kinds(
+                scope.tenant_id,
+                scope.project_id,
+                scope.environment_id,
                 limit,
                 as_of_unix_ms,
+                kinds,
             );
         }
         let mut nodes = Vec::new();
-        let mut stmt = self.conn.prepare(
+        let kind_filter = kind_filter_clause("n", 7, kinds.len());
+        let sql = format!(
             "
             SELECT DISTINCT n.id, n.tenant_id, n.project_id, n.environment_id, n.kind,
                    n.text, n.canonical_key, n.created_at_unix_ms, n.updated_at_unix_ms,
@@ -1384,6 +1404,7 @@ impl SqliteMemoryStore {
               AND COALESCE(c.environment_id, '') = COALESCE(?3, '')
               AND c.term = ?4
               AND (?6 IS NULL OR n.valid_from_unix_ms <= ?6)
+              {kind_filter}
             ORDER BY c.weight DESC,
                      n.valid_from_unix_ms DESC,
                      COALESCE((
@@ -1401,20 +1422,20 @@ impl SqliteMemoryStore {
                      ), 0) DESC,
                      n.id
             LIMIT ?5
-            ",
-        )?;
+            "
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         for term in query_terms {
-            let rows = stmt.query_map(
-                params![
-                    tenant_id,
-                    project_id,
-                    environment_id,
-                    term,
-                    sql_limit,
-                    as_of_unix_ms
-                ],
-                read_node,
-            )?;
+            let values = query_values(
+                scope.tenant_id,
+                scope.project_id,
+                scope.environment_id,
+                Some(term.as_str()),
+                sql_limit,
+                as_of_unix_ms,
+                kinds,
+            );
+            let rows = stmt.query_map(params_from_iter(values.iter()), read_node)?;
             for row in rows {
                 nodes.push(row?);
             }
@@ -1443,8 +1464,28 @@ impl SqliteMemoryStore {
         limit: usize,
         as_of_unix_ms: Option<i64>,
     ) -> MemoryResult<Vec<MemoryNode>> {
+        self.recent_nodes_observed_by_kinds(
+            tenant_id,
+            project_id,
+            environment_id,
+            limit,
+            as_of_unix_ms,
+            &[],
+        )
+    }
+
+    pub fn recent_nodes_observed_by_kinds(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        environment_id: Option<&str>,
+        limit: usize,
+        as_of_unix_ms: Option<i64>,
+        kinds: &[MemoryNodeKind],
+    ) -> MemoryResult<Vec<MemoryNode>> {
         let limit = sqlite_limit("recent_nodes limit", limit)?;
-        let mut stmt = self.conn.prepare(
+        let kind_filter = kind_filter_clause("memory_nodes", 6, kinds.len());
+        let sql = format!(
             "
             SELECT id, tenant_id, project_id, environment_id, kind, text, canonical_key,
                    created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
@@ -1455,6 +1496,7 @@ impl SqliteMemoryStore {
               AND project_id = ?2
               AND COALESCE(environment_id, '') = COALESCE(?3, '')
               AND (?5 IS NULL OR valid_from_unix_ms <= ?5)
+              {kind_filter}
             ORDER BY valid_from_unix_ms DESC,
                      COALESCE((
                          SELECT e.id
@@ -1471,12 +1513,19 @@ impl SqliteMemoryStore {
                      ), 0) DESC,
                      id
             LIMIT ?4
-            ",
-        )?;
-        let rows = stmt.query_map(
-            params![tenant_id, project_id, environment_id, limit, as_of_unix_ms],
-            read_node,
-        )?;
+            "
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let values = query_values(
+            tenant_id,
+            project_id,
+            environment_id,
+            None,
+            limit,
+            as_of_unix_ms,
+            kinds,
+        );
+        let rows = stmt.query_map(params_from_iter(values.iter()), read_node)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1502,6 +1551,24 @@ impl SqliteMemoryStore {
             environment_id,
             10_000,
             Some(as_of_unix_ms),
+        )
+    }
+
+    pub fn all_nodes_observed_by_kinds(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        environment_id: Option<&str>,
+        as_of_unix_ms: i64,
+        kinds: &[MemoryNodeKind],
+    ) -> MemoryResult<Vec<MemoryNode>> {
+        self.recent_nodes_observed_by_kinds(
+            tenant_id,
+            project_id,
+            environment_id,
+            10_000,
+            Some(as_of_unix_ms),
+            kinds,
         )
     }
 
@@ -2068,6 +2135,50 @@ fn sqlite_limit(field: &str, limit: usize) -> MemoryResult<i64> {
         .map_err(|_| MemoryError::invalid(format!("{field} exceeds SQLite LIMIT range")))
 }
 
+fn kind_filter_clause(alias: &str, first_index: usize, count: usize) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    let placeholders = (first_index..first_index + count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("AND {alias}.kind IN ({placeholders})")
+}
+
+fn query_values(
+    tenant_id: &str,
+    project_id: &str,
+    environment_id: Option<&str>,
+    term: Option<&str>,
+    limit: i64,
+    as_of_unix_ms: Option<i64>,
+    kinds: &[MemoryNodeKind],
+) -> Vec<Value> {
+    let mut values = vec![
+        Value::Text(tenant_id.to_string()),
+        Value::Text(project_id.to_string()),
+        optional_text(environment_id),
+    ];
+    if let Some(term) = term {
+        values.push(Value::Text(term.to_string()));
+    }
+    values.push(Value::Integer(limit));
+    values.push(as_of_unix_ms.map(Value::Integer).unwrap_or(Value::Null));
+    values.extend(
+        kinds
+            .iter()
+            .map(|kind| Value::Text(kind.as_str().to_string())),
+    );
+    values
+}
+
+fn optional_text(value: Option<&str>) -> Value {
+    value
+        .map(|value| Value::Text(value.to_string()))
+        .unwrap_or(Value::Null)
+}
+
 fn configure_connection(conn: &Connection) -> MemoryResult<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(
@@ -2506,6 +2617,104 @@ mod tests {
         assert_eq!(recent[0].id, old.id);
         assert_eq!(seeded.len(), 1);
         assert_eq!(seeded[0].id, old.id);
+        Ok(())
+    }
+
+    #[test]
+    fn observed_by_kind_filter_applies_before_limits() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        for index in 0..3 {
+            let span = CitedSpan {
+                tenant_id: "tenant".to_string(),
+                project_id: "project".to_string(),
+                trace_id: format!("fact-{index}"),
+                span_id: "span".to_string(),
+                seq: 1,
+            };
+            store.upsert_node(
+                StoreScope::new("tenant", "project", None),
+                MemoryNodeKind::Fact,
+                &format!("Deploy noisy fact {index}."),
+                2_000 + i64::from(index),
+                &[span],
+            )?;
+        }
+        let procedure_span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "procedure".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let (procedure, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Procedure,
+            "Deploy procedure: run migrations.",
+            1_000,
+            &[procedure_span],
+        )?;
+
+        let unfiltered = store.recent_nodes_observed_by("tenant", "project", None, 1, None)?;
+        let filtered = store.recent_nodes_observed_by_kinds(
+            "tenant",
+            "project",
+            None,
+            1,
+            None,
+            &[MemoryNodeKind::Procedure],
+        )?;
+
+        assert_eq!(unfiltered.len(), 1);
+        assert_eq!(unfiltered[0].kind, MemoryNodeKind::Fact);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, procedure.id);
+        Ok(())
+    }
+
+    #[test]
+    fn seed_kind_filter_applies_before_limits() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        for index in 0..3 {
+            let span = CitedSpan {
+                tenant_id: "tenant".to_string(),
+                project_id: "project".to_string(),
+                trace_id: format!("fact-seed-{index}"),
+                span_id: "span".to_string(),
+                seq: 1,
+            };
+            store.upsert_node(
+                StoreScope::new("tenant", "project", None),
+                MemoryNodeKind::Fact,
+                &format!("Deploy seed noisy fact {index}."),
+                2_000 + i64::from(index),
+                &[span],
+            )?;
+        }
+        let procedure_span = CitedSpan {
+            tenant_id: "tenant".to_string(),
+            project_id: "project".to_string(),
+            trace_id: "procedure-seed".to_string(),
+            span_id: "span".to_string(),
+            seq: 1,
+        };
+        let (procedure, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Procedure,
+            "Deploy seed procedure: run migrations.",
+            1_000,
+            &[procedure_span],
+        )?;
+
+        let filtered = store.seed_nodes_observed_by_kinds(
+            StoreScope::new("tenant", "project", None),
+            &[String::from("deploy")],
+            1,
+            None,
+            &[MemoryNodeKind::Procedure],
+        )?;
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, procedure.id);
         Ok(())
     }
 

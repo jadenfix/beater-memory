@@ -49,7 +49,17 @@ edges are projections that can be rebuilt.
      before retrieval begins.
    - HTTP query requests are normalized into the same `MemoryQuery` type and
      validated before entering the DB-backed retrieval worker.
-   - Tier 0: lexical cue seeding through `cue_index`
+   - Deterministic router: query-shape rules choose an effective subset of the
+     caller-allowed memory modes (`semantic`, `episodic`, `procedural`,
+     `gotcha`, `state`) before store reads when the query uses the default
+     all-mode set. Explicit non-default `modes` are treated as the caller's
+     exact route for compatibility. Ambiguous markerless queries and
+     empty-evidence narrowed routes fall back to the allowed modes; multi-intent
+     queries keep a conservative multi-mode route. When active reconstruction
+     widens the read beyond the initial route, the answer records the
+     reconstruction modes separately. `EntityCue` nodes remain graph support
+     rather than answer evidence.
+   - Tier 0: routed lexical cue seeding through `cue_index`
    - Tier 1: LLM-free graph activation using personalized PageRank-style
      propagation, ACT-R-like base-level activation, edge weights, and freshness
    - `as_of_unix_ms` is a validity boundary: future memories and facts
