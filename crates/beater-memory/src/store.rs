@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MemoryError, MemoryResult},
-    model::{CitedSpan, MemoryEdgeKind, MemoryNodeKind, estimate_tokens},
+    model::{CitedSpan, DistilledMemory, MemoryEdgeKind, MemoryNodeKind, estimate_tokens},
     text::{canonical_key, now_unix_ms, stable_id, terms},
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const SQLITE_APPLICATION_ID: i64 = 0x424D_454D;
 
 /// An append-only observation imported from a journal, span store, or direct write.
@@ -202,6 +202,16 @@ pub struct MemoryEdge {
     pub to_node_id: String,
     pub kind: MemoryEdgeKind,
     pub weight: f32,
+    pub created_at_unix_ms: i64,
+}
+
+/// Durable accepted distillation output used for replay-safe provider rebuilds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DistillationBatch {
+    pub ledger_event_id: i64,
+    pub distiller_kind: String,
+    pub distiller_fingerprint: String,
+    pub memories: Vec<DistilledMemory>,
     pub created_at_unix_ms: i64,
 }
 
@@ -565,6 +575,22 @@ impl SqliteMemoryStore {
             CREATE INDEX IF NOT EXISTS idx_cue_scope
                 ON cue_index(tenant_id, project_id, environment_id, term);
 
+            CREATE TABLE IF NOT EXISTS distillation_batches(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ledger_event_id INTEGER NOT NULL,
+                distiller_kind TEXT NOT NULL,
+                distiller_fingerprint TEXT NOT NULL,
+                memories_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(ledger_event_id) REFERENCES ledger_events(id) ON DELETE CASCADE,
+                UNIQUE(ledger_event_id, distiller_kind, distiller_fingerprint)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_distillation_batches_event
+                ON distillation_batches(ledger_event_id);
+            CREATE INDEX IF NOT EXISTS idx_distillation_batches_fingerprint
+                ON distillation_batches(distiller_kind, distiller_fingerprint, ledger_event_id);
+
             CREATE TABLE IF NOT EXISTS audit_events(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred_at_unix_ms INTEGER NOT NULL,
@@ -848,6 +874,123 @@ impl SqliteMemoryStore {
             .optional()?
             .unwrap_or(false);
         Ok(pending)
+    }
+
+    pub(crate) fn put_distillation_batch(
+        &self,
+        ledger_event_id: i64,
+        distiller_kind: &str,
+        distiller_fingerprint: &str,
+        memories: &[DistilledMemory],
+    ) -> MemoryResult<()> {
+        validate_required_identifier("distiller_kind", distiller_kind)?;
+        validate_required_identifier("distiller_fingerprint", distiller_fingerprint)?;
+        if memories.is_empty() {
+            return Err(MemoryError::invalid(
+                "distillation batch memories must not be empty",
+            ));
+        }
+        self.conn.execute(
+            "
+            INSERT INTO distillation_batches(
+                ledger_event_id, distiller_kind, distiller_fingerprint,
+                memories_json, created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(ledger_event_id, distiller_kind, distiller_fingerprint) DO UPDATE SET
+                memories_json = excluded.memories_json,
+                created_at_unix_ms = excluded.created_at_unix_ms
+            ",
+            params![
+                ledger_event_id,
+                distiller_kind,
+                distiller_fingerprint,
+                serde_json::to_string(memories)?,
+                now_unix_ms(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn distillation_batch(
+        &self,
+        ledger_event_id: i64,
+        distiller_fingerprint: &str,
+    ) -> MemoryResult<Option<DistillationBatch>> {
+        self.conn
+            .query_row(
+                "
+                SELECT ledger_event_id, distiller_kind, distiller_fingerprint,
+                       memories_json, created_at_unix_ms
+                FROM distillation_batches
+                WHERE ledger_event_id = ?1
+                  AND distiller_fingerprint = ?2
+                ",
+                params![ledger_event_id, distiller_fingerprint],
+                |row| read_distillation_batch(row, 0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn projected_events_missing_distillation_batches(
+        &self,
+        distiller_kind: &str,
+        distiller_fingerprint: &str,
+    ) -> MemoryResult<i64> {
+        validate_required_identifier("distiller_kind", distiller_kind)?;
+        validate_required_identifier("distiller_fingerprint", distiller_fingerprint)?;
+        let missing = self.conn.query_row(
+            "
+            SELECT COUNT(*)
+            FROM ledger_events e
+            WHERE e.projected_at_unix_ms IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM distillation_batches b
+                  WHERE b.ledger_event_id = e.id
+                    AND b.distiller_kind = ?1
+                    AND b.distiller_fingerprint = ?2
+              )
+            ",
+            params![distiller_kind, distiller_fingerprint],
+            |row| row.get(0),
+        )?;
+        Ok(missing)
+    }
+
+    pub(crate) fn pending_events_with_distillation_batches(
+        &self,
+        distiller_kind: &str,
+        distiller_fingerprint: &str,
+        limit: usize,
+    ) -> MemoryResult<Vec<(LedgerEvent, DistillationBatch)>> {
+        validate_required_identifier("distiller_kind", distiller_kind)?;
+        validate_required_identifier("distiller_fingerprint", distiller_fingerprint)?;
+        let limit = sqlite_limit("pending events with distillation batches limit", limit)?;
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT e.id, e.source, e.tenant_id, e.project_id, e.environment_id,
+                   e.trace_id, e.span_id, e.seq, e.span_kind, e.name, e.status,
+                   e.text, e.payload_json, e.observed_at_unix_ms,
+                   e.ingested_at_unix_ms, e.projected_at_unix_ms,
+                   b.ledger_event_id, b.distiller_kind, b.distiller_fingerprint,
+                   b.memories_json, b.created_at_unix_ms
+            FROM ledger_events e
+            JOIN distillation_batches b
+              ON b.ledger_event_id = e.id
+             AND b.distiller_kind = ?1
+             AND b.distiller_fingerprint = ?2
+            WHERE e.projected_at_unix_ms IS NULL
+            ORDER BY e.observed_at_unix_ms, e.id
+            LIMIT ?3
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![distiller_kind, distiller_fingerprint, limit],
+            |row| Ok((read_ledger_event(row)?, read_distillation_batch(row, 16)?)),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn active_neighbors(
@@ -2297,7 +2440,7 @@ impl SqliteMemoryStore {
         self.with_immediate_transaction(|store| store.reset_projection_in_transaction())
     }
 
-    fn reset_projection_in_transaction(&self) -> MemoryResult<ProjectionResetReport> {
+    pub(crate) fn reset_projection_in_transaction(&self) -> MemoryResult<ProjectionResetReport> {
         let edges_removed = self.conn.execute("DELETE FROM memory_edges", [])? as i64;
         let node_spans_removed = self.conn.execute("DELETE FROM node_spans", [])? as i64;
         let cue_index_entries_removed = self.conn.execute("DELETE FROM cue_index", [])? as i64;
@@ -2737,6 +2880,27 @@ fn read_ledger_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEvent> {
         observed_at_unix_ms: row.get(13)?,
         ingested_at_unix_ms: row.get(14)?,
         projected_at_unix_ms: row.get(15)?,
+    })
+}
+
+fn read_distillation_batch(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<DistillationBatch> {
+    let memories_json: String = row.get(offset + 3)?;
+    let memories = serde_json::from_str(&memories_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 3,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })?;
+    Ok(DistillationBatch {
+        ledger_event_id: row.get(offset)?,
+        distiller_kind: row.get(offset + 1)?,
+        distiller_fingerprint: row.get(offset + 2)?,
+        memories,
+        created_at_unix_ms: row.get(offset + 4)?,
     })
 }
 
@@ -3932,6 +4096,54 @@ mod tests {
         assert_eq!(store.stats()?.audit_events, 1);
         let events = store.recent_audit_events(10)?;
         assert_eq!(events[0].action, "newest");
+        Ok(())
+    }
+
+    #[test]
+    fn distillation_batches_survive_projection_reset() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        store.append_event(&event)?;
+        let stored_event = store
+            .pending_events(1)?
+            .into_iter()
+            .next()
+            .expect("event should be pending");
+        let event_id = stored_event.id.expect("event should have id");
+        let memories = vec![DistilledMemory::add(
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            stored_event.cited_span(),
+        )];
+
+        store.put_distillation_batch(event_id, "test", "fingerprint", &memories)?;
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            1_000,
+            &[stored_event.cited_span()],
+        )?;
+        store.mark_projected(event_id, 2_000)?;
+
+        let reset = store.reset_projection()?;
+        let batch = store
+            .distillation_batch(event_id, "fingerprint")?
+            .expect("batch should survive reset");
+        let replayable =
+            store.pending_events_with_distillation_batches("test", "fingerprint", 10)?;
+
+        assert_eq!(reset.ledger_events_reset, 1);
+        assert_eq!(reset.nodes_removed, 1);
+        assert_eq!(batch.memories, memories);
+        assert_eq!(replayable.len(), 1);
+        assert_eq!(replayable[0].0.id, Some(event_id));
+        assert_eq!(replayable[0].1.memories, memories);
         Ok(())
     }
 

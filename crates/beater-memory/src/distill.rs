@@ -2,7 +2,7 @@ use crate::{
     error::{MemoryError, MemoryResult},
     model::{BeliefRevisionOp, DistilledMemory, MemoryNodeKind, estimate_tokens},
     store::{LedgerEvent, MemoryNode},
-    text::{concise, overlap_score},
+    text::{concise, overlap_score, stable_id},
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -35,6 +35,17 @@ pub trait Distiller {
     fn supports_projection_rebuild(&self) -> bool {
         false
     }
+
+    fn distillation_replay_key(&self) -> Option<DistillationReplayKey> {
+        None
+    }
+}
+
+/// Stable key for durable accepted distillation batches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DistillationReplayKey {
+    pub kind: &'static str,
+    pub fingerprint: String,
 }
 
 /// Provider/economics counters from one distillation attempt.
@@ -87,6 +98,10 @@ pub trait DistillationProvider {
         Err(MemoryError::invalid(
             "distillation provider does not support repair",
         ))
+    }
+
+    fn distillation_replay_key(&self, _max_repairs: usize) -> Option<DistillationReplayKey> {
+        None
     }
 }
 
@@ -204,6 +219,24 @@ impl CommandDistillationProviderConfig {
         }
         Ok(())
     }
+
+    #[must_use]
+    pub fn replay_fingerprint(&self) -> String {
+        self.replay_fingerprint_with_max_repairs(self.max_repairs)
+    }
+
+    #[must_use]
+    pub fn replay_fingerprint_with_max_repairs(&self, max_repairs: usize) -> String {
+        let args = serde_json::to_string(&self.args).unwrap_or_else(|_| "[]".to_string());
+        stable_id(
+            "distiller_command",
+            &[
+                &self.command.to_string_lossy(),
+                &args,
+                &max_repairs.to_string(),
+            ],
+        )
+    }
 }
 
 fn default_command_provider_timeout_ms() -> u64 {
@@ -244,6 +277,13 @@ impl Distiller for RuntimeDistiller {
         match self {
             Self::Heuristic(distiller) => distiller.supports_projection_rebuild(),
             Self::Command(distiller) => distiller.supports_projection_rebuild(),
+        }
+    }
+
+    fn distillation_replay_key(&self) -> Option<DistillationReplayKey> {
+        match self {
+            Self::Heuristic(distiller) => distiller.distillation_replay_key(),
+            Self::Command(distiller) => distiller.distillation_replay_key(),
         }
     }
 }
@@ -360,6 +400,13 @@ impl DistillationProvider for CommandDistillationProvider {
             neighbors: prompt.neighbors,
             raw_output: Some(prompt.raw_output),
             error: Some(prompt.error),
+        })
+    }
+
+    fn distillation_replay_key(&self, max_repairs: usize) -> Option<DistillationReplayKey> {
+        Some(DistillationReplayKey {
+            kind: "command",
+            fingerprint: self.config.replay_fingerprint_with_max_repairs(max_repairs),
         })
     }
 }
@@ -546,6 +593,10 @@ impl<P: DistillationProvider> Distiller for ProviderDistiller<P> {
 
     fn supports_projection_rebuild(&self) -> bool {
         false
+    }
+
+    fn distillation_replay_key(&self) -> Option<DistillationReplayKey> {
+        self.provider.distillation_replay_key(self.max_repairs)
     }
 }
 
@@ -1036,5 +1087,19 @@ mod tests {
         assert_eq!(outcome.metrics.schema_errors, 2);
         assert_eq!(outcome.metrics.repair_attempts, 2);
         assert_eq!(outcome.metrics.repair_successes, 1);
+    }
+
+    #[test]
+    fn command_provider_replay_fingerprint_uses_effective_max_repairs() {
+        let config = CommandDistillationProviderConfig::new("provider").with_max_repairs(1);
+        let provider = CommandDistillationProvider::new(config);
+        let one_repair = provider
+            .distillation_replay_key(1)
+            .expect("command provider should expose replay key");
+        let two_repairs = provider
+            .distillation_replay_key(2)
+            .expect("command provider should expose replay key");
+
+        assert_ne!(one_repair.fingerprint, two_repairs.fingerprint);
     }
 }

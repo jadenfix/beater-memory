@@ -120,7 +120,8 @@ api_post() {
 }
 
 PROVIDER="$TMP_DIR/provider-distiller.py"
-cat > "$PROVIDER" <<'PY'
+write_provider() {
+  cat > "$PROVIDER" <<'PY'
 #!/usr/bin/env python3
 import json
 import sys
@@ -150,7 +151,21 @@ print(json.dumps({
     ]
 }))
 PY
-chmod +x "$PROVIDER"
+  chmod +x "$PROVIDER"
+}
+
+write_failing_provider() {
+  cat > "$PROVIDER" <<'PY'
+#!/usr/bin/env python3
+import sys
+
+print("provider should not be called during durable replay", file=sys.stderr)
+sys.exit(42)
+PY
+  chmod +x "$PROVIDER"
+}
+
+write_provider
 
 "$BIN" --db "$DB" init > "$TMP_DIR/init.json"
 json_assert "$TMP_DIR/init.json" 'assert data["ledger_events"] == 0'
@@ -171,6 +186,21 @@ json_assert "$TMP_DIR/manage-write-only.json" 'assert data["events_projected"] =
 json_assert "$TMP_DIR/stats-managed.json" 'assert data["pending_events"] == 0 and data["nodes"] > 0'
 "$BIN" --db "$DB" --distiller provider-command stats > "$TMP_DIR/stats-lazy-distiller.json"
 json_assert "$TMP_DIR/stats-lazy-distiller.json" 'assert data["pending_events"] == 0 and data["nodes"] > 0'
+set +e
+"$BIN" --db "$DB" \
+  --distiller provider-command \
+  --distiller-command "$PROVIDER" \
+  rebuild-projection --yes-clear-projections \
+  > "$TMP_DIR/provider-missing-batch-rebuild.json" 2> "$TMP_DIR/provider-missing-batch-rebuild.err"
+provider_missing_batch_status=$?
+set -e
+if [ "$provider_missing_batch_status" -eq 0 ]; then
+  echo "expected provider-backed rebuild without durable batches to be rejected" >&2
+  exit 1
+fi
+grep -q "durable distillation batches" "$TMP_DIR/provider-missing-batch-rebuild.err"
+"$BIN" --db "$DB" stats > "$TMP_DIR/stats-after-missing-batch-rebuild.json"
+json_assert "$TMP_DIR/stats-after-missing-batch-rebuild.json" 'assert data["pending_events"] == 0 and data["nodes"] > 0'
 
 "$BIN" --db "$PROVIDER_DB" remember \
   --tenant local \
@@ -195,19 +225,22 @@ json_assert "$TMP_DIR/provider-cli-manage.json" 'assert data["distillation_provi
   "Provider command CLI marker" \
   > "$TMP_DIR/provider-cli-query.json"
 json_assert "$TMP_DIR/provider-cli-query.json" 'assert data["evidence"] and any("Provider distilled:" in item["text"] for item in data["evidence"])'
-set +e
+write_failing_provider
 "$BIN" --db "$PROVIDER_DB" \
   --distiller provider-command \
   --distiller-command "$PROVIDER" \
+  --distiller-arg --ignored-provider-flag \
   rebuild-projection --yes-clear-projections \
-  > "$TMP_DIR/provider-cli-rebuild.json" 2> "$TMP_DIR/provider-cli-rebuild.err"
-provider_rebuild_status=$?
-set -e
-if [ "$provider_rebuild_status" -eq 0 ]; then
-  echo "expected provider-backed rebuild to be rejected" >&2
-  exit 1
-fi
-grep -q "replay-safe distiller" "$TMP_DIR/provider-cli-rebuild.err"
+  > "$TMP_DIR/provider-cli-rebuild.json"
+json_assert "$TMP_DIR/provider-cli-rebuild.json" 'assert data["completed"] is True and data["project"]["events_projected"] == 1 and data["project"]["distillation_provider_calls"] == 0 and data["project"]["distillation_replayed_batches"] == 1'
+"$BIN" --db "$PROVIDER_DB" query \
+  --tenant local \
+  --project provider \
+  --json \
+  "Provider command CLI marker" \
+  > "$TMP_DIR/provider-cli-query-after-rebuild.json"
+json_assert "$TMP_DIR/provider-cli-query-after-rebuild.json" 'assert data["evidence"] and any("Provider distilled:" in item["text"] for item in data["evidence"])'
+write_provider
 
 "$BIN" --db "$DB" remember \
   --tenant local \
@@ -626,6 +659,7 @@ assert value("beater_memory_query_tier_requests_total", 'tier="activation"') > 0
 assert value("beater_memory_query_tier_requests_total", 'tier="active_reconstruction"') > 0
 assert value("beater_memory_query_tier_tokens_total", 'tier="activation",token_kind="answer"') > 0
 assert plain_value("beater_memory_distillation_provider_calls_total") == 0
+assert plain_value("beater_memory_distillation_replay_batches_total") == 0
 PY
 
 stop_server
@@ -646,10 +680,10 @@ api_post "/v1/query" '{"question":"Provider command HTTP marker","scope":{"tenan
 json_assert "$TMP_DIR/provider-http-query.json" 'assert data["evidence"] and any("Provider distilled:" in item["text"] for item in data["evidence"])'
 
 api_get "/v1/metrics" > "$TMP_DIR/provider-http-metrics.json"
-json_assert "$TMP_DIR/provider-http-metrics.json" 'assert data["manage_requests"] == 1 and data["distillation_provider_calls"] == 1 and data["distillation_rejections"] == 0'
+json_assert "$TMP_DIR/provider-http-metrics.json" 'assert data["manage_requests"] == 1 and data["distillation_provider_calls"] == 1 and data["distillation_rejections"] == 0 and data["distillation_replayed_batches"] == 0'
 
 api_get "/v1/audit?limit=20" > "$TMP_DIR/provider-http-audit.json"
-json_assert "$TMP_DIR/provider-http-audit.json" 'assert any(event["action"] == "manage" and event["outcome"] == "success" and event["detail"]["project"]["distillation_provider_calls"] == 1 for event in data["events"])'
+json_assert "$TMP_DIR/provider-http-audit.json" 'assert any(event["action"] == "manage" and event["outcome"] == "success" and event["detail"]["project"]["distillation_provider_calls"] == 1 and event["detail"]["project"]["distillation_replayed_batches"] == 0 for event in data["events"])'
 
 api_get "/v1/metrics/prometheus" > "$TMP_DIR/provider-http-prometheus.txt"
 python3 - "$TMP_DIR/provider-http-prometheus.txt" <<'PY'
@@ -663,6 +697,10 @@ match = re.search(r'^beater_memory_distillation_provider_calls_total ([0-9.]+)$'
 if not match:
     raise SystemExit("missing provider calls metric")
 assert float(match.group(1)) == 1
+match = re.search(r'^beater_memory_distillation_replay_batches_total ([0-9.]+)$', text, re.M)
+if not match:
+    raise SystemExit("missing replay batches metric")
+assert float(match.group(1)) == 0
 PY
 
 echo "beater-memory e2e passed"

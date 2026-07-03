@@ -231,9 +231,18 @@ malformed output. It must write provider JSON on stdout:
 
 Provider projection reports, HTTP metrics, Prometheus metrics, and audit detail
 include provider calls, provider errors, schema errors, repairs, rejections,
-token estimates, and elapsed milliseconds. Projection rebuild is refused when a
-provider-backed distiller is selected, because provider outputs are not yet
-durably batched for replay.
+durable replay batches, token estimates, and elapsed milliseconds. Accepted
+command-provider batches are stored with the projected ledger event, so
+`rebuild-projection` can replay those batches without calling the provider when
+the same command replay fingerprint is selected. Rebuild fails before clearing
+projections if any already projected event is missing a matching durable batch.
+Replay-safe provider batches may use `add` and `noop` freely; `update` and
+`invalidate` must include an explicit `target_node_id` after validation so
+rebuild does not re-resolve targets against a different neighbor set.
+The current command fingerprint includes the command path string, JSON command
+arguments, and effective repair budget; it does not include provider file
+contents, environment variables, cwd-dependent behavior, timeout, or model
+settings unless those settings are encoded in the command arguments.
 
 ## Operations
 
@@ -319,7 +328,7 @@ The public API exports:
 - `LedgerEvent`
 - `Distiller`, `HeuristicDistiller`, `ProviderDistiller`,
   `DistillationProvider`, `DistillationPrompt`, `DistillationRepairPrompt`,
-  `DistillOutcome`, and `DistillMetrics`
+  `DistillationReplayKey`, `DistillOutcome`, and `DistillMetrics`
 - `ActiveReconstructor`, `DeterministicReconstructor`,
   `ReconstructionCandidate`, `ReconstructionDecision`, and
   `ReconstructionStep`

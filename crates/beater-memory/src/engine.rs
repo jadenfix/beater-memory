@@ -1,7 +1,7 @@
 use crate::{
     distill::{
-        DistillMetrics, DistillOutcome, Distiller, DistillerConfig, HeuristicDistiller,
-        RuntimeDistiller,
+        DistillMetrics, DistillOutcome, DistillationReplayKey, Distiller, DistillerConfig,
+        HeuristicDistiller, RuntimeDistiller,
     },
     error::{MemoryError, MemoryResult},
     graph::answer_query,
@@ -43,6 +43,8 @@ pub struct ProjectReport {
     #[serde(default)]
     pub distillation_rejections: usize,
     #[serde(default)]
+    pub distillation_replayed_batches: usize,
+    #[serde(default)]
     pub distillation_input_tokens: u32,
     #[serde(default)]
     pub distillation_output_tokens: u32,
@@ -63,6 +65,16 @@ pub struct ProjectionRebuildReport {
     pub batch_size: usize,
     pub max_events: Option<usize>,
     pub completed: bool,
+}
+
+struct EventProjection<'a> {
+    event: &'a LedgerEvent,
+    event_id: i64,
+    report: ProjectReport,
+    neighbors: &'a [MemoryNode],
+    memories: Vec<DistilledMemory>,
+    replay_key: Option<&'a DistillationReplayKey>,
+    replayed_batch: bool,
 }
 
 /// Memory engine facade: ledger import, projection, and answer-shaped reads.
@@ -185,47 +197,16 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             }
             event_report.distillation_outputs += outcome.memories.len();
             let memories = outcome.memories;
-
+            let replay_key = self.distiller.distillation_replay_key();
             let (mut event_report, projected_nodes) =
-                self.store.with_immediate_transaction(|store| {
-                    let mut event_report = event_report;
-                    if !store.event_is_pending(event_id)? {
-                        event_report.events_skipped = 1;
-                        return Ok((event_report, Vec::new()));
-                    }
-
-                    let mut projected_nodes = Vec::new();
-                    for memory in memories {
-                        match self.apply_distilled(&event, memory, &neighbors)? {
-                            ApplyOutcome::Added(node) => {
-                                event_report.memories_added += 1;
-                                event_report.record_projected_node(&node);
-                                projected_nodes.push(node);
-                            }
-                            ApplyOutcome::Updated(node) => {
-                                event_report.memories_updated += 1;
-                                event_report.record_projected_node(&node);
-                                projected_nodes.push(node);
-                            }
-                            ApplyOutcome::Invalidated {
-                                replacement,
-                                invalidated_count,
-                            } => {
-                                event_report.memories_invalidated += invalidated_count;
-                                event_report.stored_memories_touched += invalidated_count;
-                                if let Some(node) = replacement {
-                                    event_report.record_projected_node(&node);
-                                    projected_nodes.push(node);
-                                }
-                            }
-                            ApplyOutcome::Noop => event_report.memories_nooped += 1,
-                        }
-                    }
-                    event_report.edges_added +=
-                        self.link_projected_nodes(&event, &projected_nodes)?;
-                    store.mark_projected(event_id, now_unix_ms())?;
-                    event_report.events_projected = 1;
-                    Ok((event_report, projected_nodes))
+                self.project_event_memories(EventProjection {
+                    event: &event,
+                    event_id,
+                    report: event_report,
+                    neighbors: &neighbors,
+                    memories,
+                    replay_key: replay_key.as_ref(),
+                    replayed_batch: false,
                 })?;
             if event_report.events_projected == 1 {
                 let late_report =
@@ -235,6 +216,81 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             report.absorb(event_report);
         }
         Ok(report)
+    }
+
+    fn project_event_memories(
+        &self,
+        projection: EventProjection<'_>,
+    ) -> MemoryResult<(ProjectReport, Vec<MemoryNode>)> {
+        self.store
+            .with_immediate_transaction(|_| self.project_event_memories_in_transaction(projection))
+    }
+
+    fn project_event_memories_in_transaction(
+        &self,
+        projection: EventProjection<'_>,
+    ) -> MemoryResult<(ProjectReport, Vec<MemoryNode>)> {
+        let mut event_report = projection.report;
+        if !self.store.event_is_pending(projection.event_id)? {
+            event_report.events_skipped = 1;
+            return Ok((event_report, Vec::new()));
+        }
+        if let Some(replay_key) = projection.replay_key {
+            Self::validate_replayable_distillation_memories(
+                projection.event,
+                &projection.memories,
+                "durable distilled memory",
+            )?;
+            self.store.put_distillation_batch(
+                projection.event_id,
+                replay_key.kind,
+                &replay_key.fingerprint,
+                &projection.memories,
+            )?;
+        } else if projection.replayed_batch {
+            Self::validate_replayable_distillation_memories(
+                projection.event,
+                &projection.memories,
+                "stored distilled memory",
+            )?;
+        }
+
+        let mut projected_nodes = Vec::new();
+        for memory in projection.memories {
+            match self.apply_distilled(projection.event, memory, projection.neighbors)? {
+                ApplyOutcome::Added(node) => {
+                    event_report.memories_added += 1;
+                    event_report.record_projected_node(&node);
+                    projected_nodes.push(node);
+                }
+                ApplyOutcome::Updated(node) => {
+                    event_report.memories_updated += 1;
+                    event_report.record_projected_node(&node);
+                    projected_nodes.push(node);
+                }
+                ApplyOutcome::Invalidated {
+                    replacement,
+                    invalidated_count,
+                } => {
+                    event_report.memories_invalidated += invalidated_count;
+                    event_report.stored_memories_touched += invalidated_count;
+                    if let Some(node) = replacement {
+                        event_report.record_projected_node(&node);
+                        projected_nodes.push(node);
+                    }
+                }
+                ApplyOutcome::Noop => event_report.memories_nooped += 1,
+            }
+        }
+        event_report.edges_added +=
+            self.link_projected_nodes(projection.event, &projected_nodes)?;
+        self.store
+            .mark_projected(projection.event_id, now_unix_ms())?;
+        event_report.events_projected = 1;
+        if projection.replayed_batch {
+            event_report.distillation_replayed_batches += 1;
+        }
+        Ok((event_report, projected_nodes))
     }
 
     pub fn manage_pending(&self, limit: usize) -> MemoryResult<ProjectReport> {
@@ -255,11 +311,26 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         if max_events.is_some_and(|max_events| max_events == 0) {
             return Err(MemoryError::invalid("max_events must be greater than 0"));
         }
-        if !self.distiller.supports_projection_rebuild() {
-            return Err(MemoryError::invalid(
-                "projection rebuild requires a replay-safe distiller",
-            ));
+        if self.distiller.supports_projection_rebuild() {
+            return self.rebuild_projection_live(batch_size, max_events);
         }
+        if let Some(replay_key) = self.distiller.distillation_replay_key() {
+            return self.rebuild_projection_from_distillation_batches(
+                batch_size,
+                max_events,
+                &replay_key,
+            );
+        }
+        Err(MemoryError::invalid(
+            "projection rebuild requires a replay-safe distiller",
+        ))
+    }
+
+    fn rebuild_projection_live(
+        &self,
+        batch_size: usize,
+        max_events: Option<usize>,
+    ) -> MemoryResult<ProjectionRebuildReport> {
         let reset = self.store.reset_projection()?;
         let mut project = ProjectReport::default();
         let mut remaining = max_events.unwrap_or(usize::MAX);
@@ -279,6 +350,109 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             }
             remaining = remaining.saturating_sub(projected);
         }
+        Ok(ProjectionRebuildReport {
+            reset,
+            project,
+            batch_size,
+            max_events,
+            completed,
+        })
+    }
+
+    fn rebuild_projection_from_distillation_batches(
+        &self,
+        batch_size: usize,
+        max_events: Option<usize>,
+        replay_key: &DistillationReplayKey,
+    ) -> MemoryResult<ProjectionRebuildReport> {
+        let (reset, project, completed) = self.store.with_immediate_transaction(|store| {
+            let missing = store.projected_events_missing_distillation_batches(
+                replay_key.kind,
+                &replay_key.fingerprint,
+            )?;
+            if missing > 0 {
+                return Err(MemoryError::invalid(format!(
+                    "projection rebuild requires durable distillation batches for all projected events; missing {missing}"
+                )));
+            }
+
+            let reset = store.reset_projection_in_transaction()?;
+            let mut project = ProjectReport::default();
+            let mut remaining = max_events.unwrap_or(usize::MAX);
+            let completed;
+            loop {
+                if remaining == 0 {
+                    completed = store.stats()?.pending_events == 0;
+                    break;
+                }
+                let limit = batch_size.min(remaining);
+                let events = store.pending_events_with_distillation_batches(
+                    replay_key.kind,
+                    &replay_key.fingerprint,
+                    limit,
+                )?;
+                if events.is_empty() {
+                    completed = store.stats()?.pending_events == 0;
+                    break;
+                }
+                let mut projected = 0_usize;
+                for (event, batch) in events {
+                    let mut event_report = ProjectReport {
+                        events_seen: 1,
+                        ..ProjectReport::default()
+                    };
+                    event_report.record_source_tokens(&event);
+                    let Some(event_id) = event.id else {
+                        event_report.events_skipped = 1;
+                        project.absorb(event_report);
+                        continue;
+                    };
+                    if !store.event_is_pending(event_id)? {
+                        event_report.events_skipped = 1;
+                        project.absorb(event_report);
+                        continue;
+                    }
+                    let neighbors = store.active_neighbors(
+                        &event.tenant_id,
+                        &event.project_id,
+                        event.environment_id.as_deref(),
+                        &event.text,
+                        24,
+                        event.observed_at_unix_ms,
+                    )?;
+                    let outcome = DistillOutcome {
+                        memories: batch.memories,
+                        metrics: DistillMetrics::default(),
+                        rejected: false,
+                    };
+                    let outcome = self.validate_distill_outcome(
+                        &event,
+                        &neighbors,
+                        "stored distilled memory",
+                        outcome,
+                    )?;
+                    event_report.distillation_outputs += outcome.memories.len();
+                    let (event_report, _projected_nodes) =
+                        self.project_event_memories_in_transaction(EventProjection {
+                            event: &event,
+                            event_id,
+                            report: event_report,
+                            neighbors: &neighbors,
+                            memories: outcome.memories,
+                            replay_key: None,
+                            replayed_batch: true,
+                        })?;
+                    projected += event_report.events_projected;
+                    project.absorb(event_report);
+                }
+                if projected == 0 {
+                    completed = store.stats()?.pending_events == 0;
+                    break;
+                }
+                remaining = remaining.saturating_sub(projected);
+            }
+            Ok((reset, project, completed))
+        })?;
         Ok(ProjectionRebuildReport {
             reset,
             project,
@@ -423,6 +597,12 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         if outcome.rejected {
             return Ok(outcome);
         }
+        if outcome.memories.is_empty() {
+            return Err(MemoryError::invalid(format!(
+                "invalid {context} for event trace_id={} span_id={} seq={}: accepted distillation must include at least one memory",
+                event.trace_id, event.span_id, event.seq
+            )));
+        }
         for memory in &mut outcome.memories {
             if memory.op == BeliefRevisionOp::Add {
                 memory.target_node_id = None;
@@ -446,6 +626,29 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             }
         }
         Ok(outcome)
+    }
+
+    fn validate_replayable_distillation_memories(
+        event: &LedgerEvent,
+        memories: &[DistilledMemory],
+        context: &str,
+    ) -> MemoryResult<()> {
+        for memory in memories {
+            if matches!(
+                memory.op,
+                BeliefRevisionOp::Update | BeliefRevisionOp::Invalidate
+            ) && memory.target_node_id.is_none()
+            {
+                return Err(MemoryError::invalid(format!(
+                    "invalid {context} for event trace_id={} span_id={} seq={}: replayable {} memories must include target_node_id",
+                    event.trace_id,
+                    event.span_id,
+                    event.seq,
+                    memory.op.as_str()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_distilled_memory(
@@ -891,6 +1094,7 @@ impl ProjectReport {
         self.distillation_repair_attempts += other.distillation_repair_attempts;
         self.distillation_repair_successes += other.distillation_repair_successes;
         self.distillation_rejections += other.distillation_rejections;
+        self.distillation_replayed_batches += other.distillation_replayed_batches;
         self.distillation_input_tokens += other.distillation_input_tokens;
         self.distillation_output_tokens += other.distillation_output_tokens;
         self.distillation_elapsed_ms += other.distillation_elapsed_ms;
@@ -937,13 +1141,19 @@ enum ApplyOutcome {
 mod tests {
     use crate::{
         distill::{
-            DistillationPrompt, DistillationProvider, DistillationRepairPrompt, ProviderDistiller,
+            DistillationPrompt, DistillationProvider, DistillationRepairPrompt,
+            DistillationReplayKey, ProviderDistiller,
         },
         model::{
             MemoryMode, MemoryScope, MemoryTier, ReconstructionMode, ReconstructionOptions,
             ReconstructionReason, RoutingReason,
         },
         reconstruct::{ReconstructionDecision, ReconstructionStep},
+    };
+
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;
@@ -1746,6 +1956,37 @@ mod tests {
         }
     }
 
+    const TEST_REPLAY_FINGERPRINT: &str = "test-replay-fingerprint";
+
+    #[derive(Clone)]
+    struct ReplayAddProvider {
+        calls: Arc<AtomicUsize>,
+        succeed_calls: usize,
+    }
+
+    impl DistillationProvider for ReplayAddProvider {
+        fn distill(&self, prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call > self.succeed_calls {
+                return Err(MemoryError::invalid("provider should not be called"));
+            }
+            Ok(provider_memory_json(
+                prompt.event,
+                BeliefRevisionOp::Add,
+                MemoryNodeKind::Fact,
+                &prompt.event.text,
+                None,
+            ))
+        }
+
+        fn distillation_replay_key(&self, _max_repairs: usize) -> Option<DistillationReplayKey> {
+            Some(DistillationReplayKey {
+                kind: "test",
+                fingerprint: TEST_REPLAY_FINGERPRINT.to_string(),
+            })
+        }
+    }
+
     #[test]
     fn provider_distiller_skips_late_replay_and_rejects_rebuild() -> MemoryResult<()> {
         let engine = MemoryEngine::new(
@@ -1793,7 +2034,326 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_projection_rejects_provider_distiller_before_reset() -> MemoryResult<()> {
+    fn rebuild_projection_replays_provider_batches_without_provider_calls() -> MemoryResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(ReplayAddProvider {
+                calls: Arc::clone(&calls),
+                succeed_calls: 1,
+            }),
+        );
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        ))?;
+        let first = engine.project_pending(100)?;
+        let before = engine.query(
+            &MemoryQuery::new("DATABASE_URL", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        let rebuilt = engine.rebuild_projection(10, None)?;
+        let after = engine.query(
+            &MemoryQuery::new("DATABASE_URL", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        assert_eq!(first.events_projected, 1);
+        assert_eq!(first.distillation_provider_calls, 1);
+        assert_eq!(rebuilt.project.events_projected, 1);
+        assert_eq!(rebuilt.project.distillation_provider_calls, 0);
+        assert_eq!(rebuilt.project.distillation_replayed_batches, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(evidence_texts(&before), evidence_texts(&after));
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_missing_provider_batch_fails_before_reset() -> MemoryResult<()> {
+        let store = SqliteMemoryStore::in_memory()?;
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        store.append_event(&event)?;
+        let stored_event = store
+            .pending_events(1)?
+            .into_iter()
+            .next()
+            .expect("event should be pending");
+        let event_id = stored_event.id.expect("event should have id");
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            event.observed_at_unix_ms,
+            &[stored_event.cited_span()],
+        )?;
+        store.mark_projected(event_id, 1_234)?;
+        let before = store.stats()?;
+        let engine = MemoryEngine::new(
+            store,
+            ProviderDistiller::new(ReplayAddProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                succeed_calls: 0,
+            }),
+        );
+
+        let err = engine.rebuild_projection(10, None).unwrap_err();
+        let after = engine.store().stats()?;
+
+        assert!(err.to_string().contains("durable distillation batches"));
+        assert_eq!(after.pending_events, before.pending_events);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.edges, before.edges);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_corrupt_provider_batch_rolls_back_reset() -> MemoryResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(ReplayAddProvider {
+                calls: Arc::clone(&calls),
+                succeed_calls: 1,
+            }),
+        );
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        ))?;
+        let report = engine.project_pending(100)?;
+        assert_eq!(report.events_projected, 1);
+        let before = engine.store().stats()?;
+        engine
+            .store()
+            .connection()
+            .execute("UPDATE distillation_batches SET memories_json = '[]'", [])?;
+
+        let err = engine.rebuild_projection(10, None).unwrap_err();
+        let after = engine.store().stats()?;
+
+        assert!(err.to_string().contains("accepted distillation"));
+        assert_eq!(after.pending_events, before.pending_events);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.edges, before.edges);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_targetless_provider_revision_batch_rolls_back_reset() -> MemoryResult<()>
+    {
+        let store = SqliteMemoryStore::in_memory()?;
+        let old_event = event_at(MemoryNodeKind::Fact, "Use checkout token.", 1_000);
+        store.append_event(&old_event)?;
+        let old_event = store
+            .pending_events(1)?
+            .into_iter()
+            .next()
+            .expect("old event should be pending");
+        let old_event_id = old_event.id.expect("old event should have id");
+        let old_memory = DistilledMemory::add(
+            MemoryNodeKind::Fact,
+            "Use checkout token.",
+            old_event.cited_span(),
+        );
+        store.put_distillation_batch(
+            old_event_id,
+            "test",
+            TEST_REPLAY_FINGERPRINT,
+            std::slice::from_ref(&old_memory),
+        )?;
+        store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Use checkout token.",
+            old_event.observed_at_unix_ms,
+            &[old_event.cited_span()],
+        )?;
+        store.mark_projected(old_event_id, 1_500)?;
+
+        let current_event = event_at(MemoryNodeKind::Fact, "Do not use checkout token.", 2_000);
+        store.append_event(&current_event)?;
+        let current_event = store
+            .pending_events(1)?
+            .into_iter()
+            .next()
+            .expect("current event should be pending");
+        let current_event_id = current_event.id.expect("current event should have id");
+        let current_memory = DistilledMemory {
+            op: BeliefRevisionOp::Invalidate,
+            node_kind: MemoryNodeKind::Fact,
+            text: "Do not use checkout token.".to_string(),
+            target_node_id: None,
+            cited_spans: vec![current_event.cited_span()],
+        };
+        store.put_distillation_batch(
+            current_event_id,
+            "test",
+            TEST_REPLAY_FINGERPRINT,
+            &[current_memory],
+        )?;
+        let before = store.stats()?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = MemoryEngine::new(
+            store,
+            ProviderDistiller::new(ReplayAddProvider {
+                calls: Arc::clone(&calls),
+                succeed_calls: 0,
+            }),
+        );
+
+        let err = engine.rebuild_projection(10, None).unwrap_err();
+        let after = engine.store().stats()?;
+
+        assert!(err.to_string().contains("replayable invalidate"));
+        assert_eq!(after.pending_events, before.pending_events);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.edges, before.edges);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_provider_output_does_not_store_distillation_batch() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct InvalidReplayProvider;
+
+        impl DistillationProvider for InvalidReplayProvider {
+            fn distill(&self, prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+                Ok(provider_memory_json(
+                    prompt.event,
+                    BeliefRevisionOp::Add,
+                    MemoryNodeKind::Fact,
+                    " ",
+                    None,
+                ))
+            }
+
+            fn distillation_replay_key(
+                &self,
+                _max_repairs: usize,
+            ) -> Option<DistillationReplayKey> {
+                Some(DistillationReplayKey {
+                    kind: "test",
+                    fingerprint: TEST_REPLAY_FINGERPRINT.to_string(),
+                })
+            }
+        }
+
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(InvalidReplayProvider),
+        );
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        ))?;
+        let event_id = engine
+            .store()
+            .pending_events(1)?
+            .into_iter()
+            .next()
+            .and_then(|event| event.id)
+            .expect("event should have id");
+
+        let report = engine.project_pending(100)?;
+
+        assert_eq!(report.events_projected, 0);
+        assert_eq!(report.events_skipped, 1);
+        assert_eq!(report.distillation_rejections, 1);
+        assert!(
+            engine
+                .store()
+                .distillation_batch(event_id, TEST_REPLAY_FINGERPRINT)?
+                .is_none()
+        );
+        assert_eq!(engine.store().stats()?.pending_events, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn targetless_provider_revision_is_not_persisted_for_replay() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct TargetlessInvalidateProvider;
+
+        impl DistillationProvider for TargetlessInvalidateProvider {
+            fn distill(&self, prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+                Ok(provider_memory_json(
+                    prompt.event,
+                    BeliefRevisionOp::Invalidate,
+                    MemoryNodeKind::Fact,
+                    "Do not use checkout token.",
+                    None,
+                ))
+            }
+
+            fn distillation_replay_key(
+                &self,
+                _max_repairs: usize,
+            ) -> Option<DistillationReplayKey> {
+                Some(DistillationReplayKey {
+                    kind: "test",
+                    fingerprint: TEST_REPLAY_FINGERPRINT.to_string(),
+                })
+            }
+        }
+
+        let store = SqliteMemoryStore::in_memory()?;
+        let seed = event_at(MemoryNodeKind::Fact, "Use checkout token.", 1_000);
+        let (existing, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Use checkout token.",
+            seed.observed_at_unix_ms,
+            &[seed.cited_span()],
+        )?;
+        let engine = MemoryEngine::new(store, ProviderDistiller::new(TargetlessInvalidateProvider));
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Do not use checkout token.",
+            2_000,
+        ))?;
+        let event_id = engine
+            .store()
+            .pending_events(1)?
+            .into_iter()
+            .next()
+            .and_then(|event| event.id)
+            .expect("event should have id");
+
+        let err = engine.project_pending(100).unwrap_err();
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let existing = nodes
+            .iter()
+            .find(|node| node.id == existing.id)
+            .expect("existing node remains");
+
+        assert!(err.to_string().contains("replayable invalidate"));
+        assert!(
+            engine
+                .store()
+                .distillation_batch(event_id, TEST_REPLAY_FINGERPRINT)?
+                .is_none()
+        );
+        assert_eq!(existing.valid_to_unix_ms, None);
+        assert_eq!(engine.store().stats()?.pending_events, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_rejects_provider_without_replay_key_before_reset() -> MemoryResult<()> {
         let engine = MemoryEngine::new(
             SqliteMemoryStore::in_memory()?,
             ProviderDistiller::new(FakeProvider {
@@ -1837,6 +2397,7 @@ mod tests {
         assert_eq!(report.distillation_outputs, 0);
         assert_eq!(report.distillation_provider_calls, 0);
         assert_eq!(report.distillation_schema_errors, 0);
+        assert_eq!(report.distillation_replayed_batches, 0);
     }
 
     #[test]
