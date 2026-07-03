@@ -6,7 +6,8 @@ use beater_memory::{
     DistillerConfig, EvalOptions, EvalSuite, LedgerEvent, MaintenanceOptions, MemoryEngine,
     MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig, ProjectReport,
     ReconstructionMode, ReconstructionOptions, ReconstructorConfig, RuntimeDistiller,
-    RuntimeReconstructor, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite, serve,
+    RuntimeReconstructor, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite_with_source,
+    serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -751,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::File::open(&suite).with_context(|| format!("open {}", suite.display()))?;
             let suite_definition: EvalSuite = serde_json::from_reader(suite_file)
                 .with_context(|| format!("parse {}", suite.display()))?;
-            let report = run_eval_suite(
+            let report = run_eval_suite_with_source(
                 &suite_definition,
                 &EvalOptions {
                     max_tokens,
@@ -759,6 +760,7 @@ async fn main() -> anyhow::Result<()> {
                     max_reconstruction_steps,
                     max_reconstruction_tokens,
                 },
+                Some(suite.display().to_string()),
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             if report.failed > 0 {

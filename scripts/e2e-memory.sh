@@ -457,7 +457,12 @@ json_assert "$TMP_DIR/query-temporal-after-known.json" 'assert data["contradicti
 
 cat > "$TMP_DIR/eval-suite.json" <<'JSON'
 {
+  "contract_version": 1,
   "name": "lme-v2-shaped-smoke",
+  "source": {
+    "name": "e2e-smoke",
+    "revision": "local"
+  },
   "tenant_id": "local",
   "project_id": "eval",
   "cases": [
@@ -570,17 +575,200 @@ cat > "$TMP_DIR/eval-suite.json" <<'JSON'
   ]
 }
 JSON
-"$BIN" eval --suite "$TMP_DIR/eval-suite.json" > "$TMP_DIR/eval-report.json"
+"$BIN" eval --suite "$TMP_DIR/eval-suite.json" > "$TMP_DIR/eval-report.json" 2> "$TMP_DIR/eval-report.err"
+if [ -s "$TMP_DIR/eval-report.err" ]; then
+  cat "$TMP_DIR/eval-report.err" >&2
+  exit 1
+fi
 json_assert "$TMP_DIR/eval-report.json" 'assert data["suite"] == "lme-v2-shaped-smoke" and data["cases"] == 6 and data["passed"] == 6 and data["failed"] == 0'
+json_assert "$TMP_DIR/eval-report.json" 'assert data["contract_version"] == 1 and data["score_kind"] == "effective_expectation_pass_rate"'
+json_assert "$TMP_DIR/eval-report.json" 'assert data["source"]["suite_path"].endswith("eval-suite.json") and data["source"]["suite"]["name"] == "e2e-smoke"'
+json_assert "$TMP_DIR/eval-report.json" 'assert data["checks_total"] >= 6 and data["checks_matched"] == data["checks_total"] and data["checks_failed"] == 0'
 json_assert "$TMP_DIR/eval-report.json" 'assert data["score"] == 1.0 and data["context_saturation_gap"] == 0.0'
 json_assert "$TMP_DIR/eval-report.json" 'assert data["source_tokens_per_stored_memory"] > 0 and data["projected_tokens_per_stored_memory"] > 0 and data["tokens_into_context_total"] > 0'
 json_assert "$TMP_DIR/eval-report.json" 'assert any(row["ability"] == "premise_awareness" and row["score"] == 1.0 for row in data["ability_scores"])'
 json_assert "$TMP_DIR/eval-report.json" 'assert any(row["tier"] == "active_reconstruction" and row["requests"] >= 1 for row in data["tier_metrics"])'
-"$BIN" eval --suite "$TMP_DIR/eval-suite.json" --max-reconstruction-steps 1 > "$TMP_DIR/eval-report-step-override.json"
+json_assert "$TMP_DIR/eval-report.json" 'assert all(case["score_kind"] == "effective_expectation_pass_rate" and case["content_score"] == 1.0 and case["checks_total"] >= 1 and case["source_events"] >= 1 for case in data["case_reports"])'
+json_assert "$TMP_DIR/eval-report.json" 'assert all(case["expectations"] and case["answer_excerpt"] for case in data["case_reports"])'
+json_assert "$TMP_DIR/eval-report.json" 'assert any(case["evidence_node_ids"] for case in data["case_reports"])'
+json_assert "$TMP_DIR/eval-report.json" 'assert all(case["routed_modes"] and case["source_token_estimate"] > 0 and case["projected_memory_token_estimate"] > 0 and case["stored_memories_touched"] > 0 for case in data["case_reports"])'
+json_assert "$TMP_DIR/eval-report.json" 'assert (lambda workflow: workflow["routed_modes"] == ["procedural"] and workflow["reconstruction_reason"] == "forced" and workflow["reconstruction_steps"] >= 1 and workflow["reconstruction_provider_calls"] == 0 and workflow["reconstruction_provider_errors"] == 0 and workflow["reconstruction_provider_schema_errors"] == 0)([case for case in data["case_reports"] if case["id"] == "workflow"][0])'
+"$BIN" eval --suite "$TMP_DIR/eval-suite.json" --max-reconstruction-steps 1 > "$TMP_DIR/eval-report-step-override.json" 2> "$TMP_DIR/eval-report-step-override.err"
+if [ -s "$TMP_DIR/eval-report-step-override.err" ]; then
+  cat "$TMP_DIR/eval-report-step-override.err" >&2
+  exit 1
+fi
 json_assert "$TMP_DIR/eval-report-step-override.json" 'assert data["passed"] == 6 and any(case["id"] == "workflow" and case["tier_used"] == "active_reconstruction" for case in data["case_reports"])'
+
+cat > "$TMP_DIR/eval-default-version-suite.json" <<'JSON'
+{
+  "name": "default-version-smoke",
+  "cases": [
+    {
+      "id": "default-version",
+      "question": "what database is configured?",
+      "events": [
+        {"kind": "fact", "text": "Checkout uses DATABASE_URL."}
+      ],
+      "expected_evidence_contains": ["DATABASE_URL"]
+    }
+  ]
+}
+JSON
+"$BIN" eval --suite "$TMP_DIR/eval-default-version-suite.json" > "$TMP_DIR/eval-default-version-report.json" 2> "$TMP_DIR/eval-default-version.err"
+if [ -s "$TMP_DIR/eval-default-version.err" ]; then
+  cat "$TMP_DIR/eval-default-version.err" >&2
+  exit 1
+fi
+json_assert "$TMP_DIR/eval-default-version-report.json" 'assert data["contract_version"] == 1 and data["score_kind"] == "effective_expectation_pass_rate" and data["passed"] == 1'
+
+cat > "$TMP_DIR/eval-future-version-suite.json" <<'JSON'
+{
+  "contract_version": 2,
+  "name": "future-version-smoke",
+  "cases": [
+    {
+      "id": "future-version",
+      "question": "what database is configured?",
+      "events": [
+        {"kind": "fact", "text": "Checkout uses DATABASE_URL."}
+      ],
+      "expected_evidence_contains": ["DATABASE_URL"]
+    }
+  ]
+}
+JSON
+set +e
+"$BIN" eval --suite "$TMP_DIR/eval-future-version-suite.json" > "$TMP_DIR/eval-future-version-report.json" 2> "$TMP_DIR/eval-future-version.err"
+future_version_status=$?
+set -e
+if [ "$future_version_status" -eq 0 ]; then
+  echo "expected future eval contract version to fail" >&2
+  exit 1
+fi
+if [ -s "$TMP_DIR/eval-future-version-report.json" ]; then
+  echo "expected future eval contract version to produce no report JSON" >&2
+  cat "$TMP_DIR/eval-future-version-report.json" >&2
+  exit 1
+fi
+grep -q "unsupported eval contract_version" "$TMP_DIR/eval-future-version.err"
+
+cat > "$TMP_DIR/eval-isolated-suite.json" <<'JSON'
+{
+  "contract_version": 1,
+  "name": "default-isolation-smoke",
+  "tenant_id": "local",
+  "project_id": "isolated-eval",
+  "cases": [
+    {
+      "id": "writes-alpha",
+      "question": "what token did this case write?",
+      "events": [
+        {"kind": "fact", "text": "The isolated alpha token is in the first case.", "observed_at_unix_ms": 1000}
+      ],
+      "expected_evidence_contains": ["isolated alpha token"]
+    },
+    {
+      "id": "cannot-see-alpha",
+      "question": "where is the isolated alpha token?",
+      "events": [
+        {"kind": "fact", "text": "The second isolated case has unrelated filler.", "observed_at_unix_ms": 2000}
+      ],
+      "expected_evidence_contains": ["isolated alpha token"]
+    }
+  ]
+}
+JSON
+set +e
+"$BIN" eval --suite "$TMP_DIR/eval-isolated-suite.json" > "$TMP_DIR/eval-isolated-report.json" 2> "$TMP_DIR/eval-isolated.err"
+isolated_eval_status=$?
+set -e
+if [ "$isolated_eval_status" -eq 0 ]; then
+  echo "expected default isolation suite to fail one case" >&2
+  exit 1
+fi
+json_assert "$TMP_DIR/eval-isolated-report.json" 'assert data["failed"] == 1 and data["case_reports"][0]["passed"] is True and data["case_reports"][1]["passed"] is False'
+json_assert "$TMP_DIR/eval-isolated-report.json" 'assert data["case_reports"][0]["project_id"] != data["case_reports"][1]["project_id"]'
+
+cat > "$TMP_DIR/eval-shared-haystack-suite.json" <<'JSON'
+{
+  "contract_version": 1,
+  "name": "shared-haystack-no-future-leak",
+  "tenant_id": "local",
+  "project_id": "shared-eval",
+  "shared_haystack": true,
+  "cases": [
+    {
+      "id": "before-beta",
+      "question": "where is the shared beta token?",
+      "events": [
+        {"kind": "fact", "text": "The first shared case only mentions alpha.", "observed_at_unix_ms": 1000}
+      ],
+      "expected_evidence_contains": ["shared beta token"]
+    },
+    {
+      "id": "writes-beta",
+      "question": "where is the shared beta token?",
+      "events": [
+        {"kind": "fact", "text": "The shared beta token is in the second case.", "observed_at_unix_ms": 2000}
+      ],
+      "expected_evidence_contains": ["shared beta token"]
+    },
+    {
+      "id": "after-alpha",
+      "question": "what did the first shared case mention?",
+      "events": [
+        {"kind": "fact", "text": "The third shared case is filler.", "observed_at_unix_ms": 3000}
+      ],
+      "expected_evidence_contains": ["first shared case only mentions alpha"]
+    }
+  ]
+}
+JSON
+set +e
+"$BIN" eval --suite "$TMP_DIR/eval-shared-haystack-suite.json" > "$TMP_DIR/eval-shared-haystack-report.json" 2> "$TMP_DIR/eval-shared-haystack.err"
+shared_eval_status=$?
+set -e
+if [ "$shared_eval_status" -eq 0 ]; then
+  echo "expected shared haystack future-leak guard suite to fail one case" >&2
+  exit 1
+fi
+json_assert "$TMP_DIR/eval-shared-haystack-report.json" 'assert data["failed"] == 1 and data["case_reports"][0]["id"] == "before-beta" and data["case_reports"][0]["passed"] is False'
+json_assert "$TMP_DIR/eval-shared-haystack-report.json" 'assert data["case_reports"][1]["passed"] is True and data["case_reports"][2]["passed"] is True'
+grep -q "eval suite shared-haystack-no-future-leak failed 1/3 case(s)" "$TMP_DIR/eval-shared-haystack.err"
+
+cat > "$TMP_DIR/eval-tier-gate-suite.json" <<'JSON'
+{
+  "contract_version": 1,
+  "name": "tier-gate-smoke",
+  "cases": [
+    {
+      "id": "tier-gate",
+      "question": "what database is configured?",
+      "events": [
+        {"kind": "fact", "text": "Checkout uses DATABASE_URL."}
+      ],
+      "expected_evidence_contains": ["DATABASE_URL"],
+      "expected_tier": "active_reconstruction"
+    }
+  ]
+}
+JSON
+set +e
+"$BIN" eval --suite "$TMP_DIR/eval-tier-gate-suite.json" > "$TMP_DIR/eval-tier-gate-report.json" 2> "$TMP_DIR/eval-tier-gate.err"
+tier_gate_status=$?
+set -e
+if [ "$tier_gate_status" -eq 0 ]; then
+  echo "expected eval tier gate suite to fail" >&2
+  exit 1
+fi
+json_assert "$TMP_DIR/eval-tier-gate-report.json" 'assert data["score"] == 0.0 and data["failed"] == 1'
+json_assert "$TMP_DIR/eval-tier-gate-report.json" 'assert data["case_reports"][0]["content_score"] == 1.0 and data["case_reports"][0]["score"] == 0.0 and data["case_reports"][0]["hard_gate_failed"] is True'
+grep -q "eval suite tier-gate-smoke failed 1/1 case(s)" "$TMP_DIR/eval-tier-gate.err"
 
 cat > "$TMP_DIR/eval-failing-suite.json" <<'JSON'
 {
+  "contract_version": 1,
   "name": "failing-smoke",
   "cases": [
     {
@@ -603,6 +791,7 @@ if [ "$eval_status" -eq 0 ]; then
   exit 1
 fi
 json_assert "$TMP_DIR/eval-failing-report.json" 'assert data["failed"] == 1 and data["case_reports"][0]["failure_reasons"]'
+grep -q "eval suite failing-smoke failed 1/1 case(s)" "$TMP_DIR/eval-failing.err"
 
 start_server "$DB" --reconstructor provider-command --reconstructor-command "$RECONSTRUCTOR" --reconstructor-timeout-ms 1000
 json_assert "$TMP_DIR/readyz.json" 'assert data["status"] == "ok" and data["database"] == "ok"'

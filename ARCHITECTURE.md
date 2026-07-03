@@ -142,18 +142,24 @@ edges are projections that can be rebuilt.
 
 6. **Evaluation Harness**
    - CLI command: `beater-memory eval --suite <path>`
-   - Suites are deterministic JSON fixtures with LongMemEval-V2-style ability
-     labels, ledger observations, query settings, explicit content expectation
-     checks over answers, evidence, stale assumptions, and contradictions, plus
-     an optional retrieval-tier gate. Cases are isolated into per-case project
-     scopes by default; suites that model shared-haystack benchmarks opt in
-     with `shared_haystack: true`.
-   - The runner builds an isolated in-memory store, projects the suite, queries
-     every case, and reports accuracy by ability, context-saturation shortfall
-     when a full-context baseline score is supplied, write tokens per stored
-     memory, projected/source token ratio, latency by tier, and tokens placed
-     into answer context as selected evidence. It intentionally avoids F1/BLEU
-     as a correctness signal.
+   - Suites are deterministic JSON fixtures with `contract_version: 1`,
+     optional source metadata, LongMemEval-V2-style ability labels, ledger
+     observations, query settings, explicit content expectation checks over
+     answers, evidence, stale assumptions, and contradictions, plus optional
+     hard gates such as retrieval tier. Omitted versions are v1; unsupported
+     future versions are rejected before running.
+   - Cases are isolated into per-case project scopes by default. Suites that
+     model chronological shared-haystack benchmarks opt in with
+     `shared_haystack: true`; the runner then ingests, projects, and queries
+     cases in order so prior observations can help later cases but future
+     observations cannot leak backward.
+   - The runner builds an isolated in-memory store, reports effective score by
+     ability, raw `content_score` per case, matched/missing expectation rows,
+     context-saturation shortfall when a full-context baseline score is
+     supplied, write tokens per stored memory, projected/source token ratio,
+     latency by tier, routing/reconstruction telemetry, and tokens placed into
+     answer context as selected evidence. It intentionally avoids F1/BLEU as a
+     correctness signal.
 
 ## Why No Embeddings In The MVP
 
