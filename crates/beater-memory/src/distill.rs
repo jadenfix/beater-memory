@@ -1,16 +1,118 @@
 use crate::{
-    model::{BeliefRevisionOp, DistilledMemory, MemoryNodeKind},
+    error::{MemoryError, MemoryResult},
+    model::{BeliefRevisionOp, DistilledMemory, MemoryNodeKind, estimate_tokens},
     store::{LedgerEvent, MemoryNode},
     text::{concise, overlap_score},
 };
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 /// Offline/sleep-time distillation boundary.
 ///
-/// A provider-backed implementation can be added here later with constrained
-/// decoding. The engine only accepts this typed output, so malformed writes do
-/// not leak into the graph.
+/// Provider-backed implementations should return only typed, validated output.
+/// The engine revalidates this boundary before applying projection writes.
 pub trait Distiller {
-    fn distill(&self, event: &LedgerEvent, neighbors: &[MemoryNode]) -> Vec<DistilledMemory>;
+    fn distill(
+        &self,
+        event: &LedgerEvent,
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<DistillOutcome>;
+
+    fn supports_late_replay(&self) -> bool {
+        false
+    }
+}
+
+/// Provider/economics counters from one distillation attempt.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistillMetrics {
+    pub provider_calls: usize,
+    pub provider_errors: usize,
+    pub schema_errors: usize,
+    pub repair_attempts: usize,
+    pub repair_successes: usize,
+    pub rejected_outputs: usize,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub elapsed_ms: u64,
+}
+
+/// Distilled memory bundle plus counters. Rejected outcomes are not projected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistillOutcome {
+    pub memories: Vec<DistilledMemory>,
+    pub metrics: DistillMetrics,
+    pub rejected: bool,
+}
+
+impl DistillOutcome {
+    #[must_use]
+    pub fn accepted(memories: Vec<DistilledMemory>) -> Self {
+        Self {
+            memories,
+            metrics: DistillMetrics::default(),
+            rejected: false,
+        }
+    }
+
+    #[must_use]
+    pub fn rejected(metrics: DistillMetrics) -> Self {
+        Self {
+            memories: Vec::new(),
+            metrics,
+            rejected: true,
+        }
+    }
+}
+
+/// Synchronous provider interface for constrained distillation JSON.
+pub trait DistillationProvider {
+    fn distill(&self, prompt: DistillationPrompt<'_>) -> MemoryResult<String>;
+
+    fn repair(&self, _prompt: DistillationRepairPrompt<'_>) -> MemoryResult<String> {
+        Err(MemoryError::invalid(
+            "distillation provider does not support repair",
+        ))
+    }
+}
+
+/// Input passed to a provider-backed distiller.
+#[derive(Clone, Copy, Debug)]
+pub struct DistillationPrompt<'a> {
+    pub event: &'a LedgerEvent,
+    pub neighbors: &'a [MemoryNode],
+}
+
+/// Repair request for malformed provider output.
+#[derive(Clone, Copy, Debug)]
+pub struct DistillationRepairPrompt<'a> {
+    pub event: &'a LedgerEvent,
+    pub neighbors: &'a [MemoryNode],
+    pub raw_output: &'a str,
+    pub error: &'a str,
+}
+
+/// Provider-backed distiller with schema validation and bounded repair.
+#[derive(Clone, Debug)]
+pub struct ProviderDistiller<P> {
+    provider: P,
+    max_repairs: usize,
+}
+
+impl<P> ProviderDistiller<P> {
+    #[must_use]
+    pub fn new(provider: P) -> Self {
+        Self {
+            provider,
+            max_repairs: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_max_repairs(mut self, max_repairs: usize) -> Self {
+        self.max_repairs = max_repairs;
+        self
+    }
 }
 
 /// Deterministic first-principles distiller used by the local MVP.
@@ -35,16 +137,20 @@ impl HeuristicDistiller {
 }
 
 impl Distiller for HeuristicDistiller {
-    fn distill(&self, event: &LedgerEvent, neighbors: &[MemoryNode]) -> Vec<DistilledMemory> {
+    fn distill(
+        &self,
+        event: &LedgerEvent,
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<DistillOutcome> {
         let body = concise(&event.text, self.max_memory_chars);
         if body.trim().is_empty() {
-            return vec![DistilledMemory {
+            return Ok(DistillOutcome::accepted(vec![DistilledMemory {
                 op: BeliefRevisionOp::Noop,
                 node_kind: MemoryNodeKind::Episode,
                 text: String::new(),
                 target_node_id: None,
                 cited_spans: vec![event.cited_span()],
-            }];
+            }]));
         }
 
         let cited_span = event.cited_span();
@@ -69,8 +175,137 @@ impl Distiller for HeuristicDistiller {
             target_node_id,
             cited_spans: vec![cited_span],
         });
-        out
+        Ok(DistillOutcome::accepted(out))
     }
+
+    fn supports_late_replay(&self) -> bool {
+        true
+    }
+}
+
+impl<P: DistillationProvider> Distiller for ProviderDistiller<P> {
+    fn distill(
+        &self,
+        event: &LedgerEvent,
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<DistillOutcome> {
+        let started = Instant::now();
+        let mut metrics = DistillMetrics {
+            input_tokens: estimate_distillation_input_tokens(event, neighbors),
+            ..DistillMetrics::default()
+        };
+        metrics.provider_calls += 1;
+        let mut raw = match self
+            .provider
+            .distill(DistillationPrompt { event, neighbors })
+        {
+            Ok(raw) => raw,
+            Err(_) => {
+                metrics.provider_errors += 1;
+                metrics.rejected_outputs += 1;
+                metrics.elapsed_ms = elapsed_ms(started);
+                return Ok(DistillOutcome::rejected(metrics));
+            }
+        };
+        metrics.output_tokens += estimate_tokens(&raw);
+
+        let mut repairs_used = 0;
+        loop {
+            match parse_provider_output(&raw) {
+                Ok(memories) => {
+                    if repairs_used > 0 {
+                        metrics.repair_successes += 1;
+                    }
+                    metrics.elapsed_ms = elapsed_ms(started);
+                    return Ok(DistillOutcome {
+                        memories,
+                        metrics,
+                        rejected: false,
+                    });
+                }
+                Err(error) => {
+                    metrics.schema_errors += 1;
+                    if repairs_used >= self.max_repairs {
+                        metrics.rejected_outputs += 1;
+                        metrics.elapsed_ms = elapsed_ms(started);
+                        return Ok(DistillOutcome::rejected(metrics));
+                    }
+                    metrics.repair_attempts += 1;
+                    metrics.provider_calls += 1;
+                    let repaired = match self.provider.repair(DistillationRepairPrompt {
+                        event,
+                        neighbors,
+                        raw_output: &raw,
+                        error: &error,
+                    }) {
+                        Ok(repaired) => repaired,
+                        Err(_) => {
+                            metrics.provider_errors += 1;
+                            metrics.rejected_outputs += 1;
+                            metrics.elapsed_ms = elapsed_ms(started);
+                            return Ok(DistillOutcome::rejected(metrics));
+                        }
+                    };
+                    metrics.output_tokens += estimate_tokens(&repaired);
+                    raw = repaired;
+                    repairs_used += 1;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderOutput {
+    memories: Vec<ProviderMemory>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderMemory {
+    op: BeliefRevisionOp,
+    node_kind: MemoryNodeKind,
+    text: String,
+    target_node_id: Option<String>,
+    cited_spans: Vec<crate::model::CitedSpan>,
+}
+
+fn parse_provider_output(raw: &str) -> Result<Vec<DistilledMemory>, String> {
+    let output: ProviderOutput =
+        serde_json::from_str(raw).map_err(|err| format!("invalid provider JSON: {err}"))?;
+    if output.memories.is_empty() {
+        return Err("provider output must include at least one memory".to_string());
+    }
+    let memories = output
+        .memories
+        .into_iter()
+        .map(|memory| DistilledMemory {
+            op: memory.op,
+            node_kind: memory.node_kind,
+            text: memory.text,
+            target_node_id: memory.target_node_id,
+            cited_spans: memory.cited_spans,
+        })
+        .collect::<Vec<_>>();
+    for (index, memory) in memories.iter().enumerate() {
+        memory
+            .validate()
+            .map_err(|err| format!("invalid memory at index {index}: {err}"))?;
+    }
+    Ok(memories)
+}
+
+fn estimate_distillation_input_tokens(event: &LedgerEvent, neighbors: &[MemoryNode]) -> u32 {
+    estimate_tokens(&event.text)
+        + neighbors
+            .iter()
+            .map(|neighbor| estimate_tokens(&neighbor.text))
+            .sum::<u32>()
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn classify_memory_kind(event: &LedgerEvent, text: &str) -> MemoryNodeKind {
@@ -168,13 +403,16 @@ mod tests {
 
     #[test]
     fn emits_episode_plus_typed_memory() {
-        let memories = HeuristicDistiller::default().distill(
-            &event(
-                MemoryNodeKind::Gotcha,
-                "Checkout failed with DATABASE_URL missing. Fix by setting it.",
-            ),
-            &[],
-        );
+        let memories = HeuristicDistiller::default()
+            .distill(
+                &event(
+                    MemoryNodeKind::Gotcha,
+                    "Checkout failed with DATABASE_URL missing. Fix by setting it.",
+                ),
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("{err}"))
+            .memories;
 
         assert_eq!(memories.len(), 2);
         assert_eq!(memories[0].node_kind, MemoryNodeKind::Episode);
@@ -200,13 +438,16 @@ mod tests {
             token_estimate: 8,
             observation_count: 1,
         };
-        let memories = HeuristicDistiller::default().distill(
-            &event(
-                MemoryNodeKind::Fact,
-                "Do not use the old checkout token; it is deprecated.",
-            ),
-            &[neighbor],
-        );
+        let memories = HeuristicDistiller::default()
+            .distill(
+                &event(
+                    MemoryNodeKind::Fact,
+                    "Do not use the old checkout token; it is deprecated.",
+                ),
+                &[neighbor],
+            )
+            .unwrap_or_else(|err| panic!("{err}"))
+            .memories;
 
         assert_eq!(memories[1].op, BeliefRevisionOp::Invalidate);
         assert_eq!(memories[1].target_node_id.as_deref(), Some("node_old"));
@@ -249,15 +490,206 @@ mod tests {
             observation_count: 1,
         };
 
-        let memories = HeuristicDistiller::default().distill(
-            &event(
-                MemoryNodeKind::Fact,
-                "Do not use the old checkout token; it is deprecated.",
-            ),
-            &[episode, fact],
-        );
+        let memories = HeuristicDistiller::default()
+            .distill(
+                &event(
+                    MemoryNodeKind::Fact,
+                    "Do not use the old checkout token; it is deprecated.",
+                ),
+                &[episode, fact],
+            )
+            .unwrap_or_else(|err| panic!("{err}"))
+            .memories;
 
         assert_eq!(memories[1].op, BeliefRevisionOp::Invalidate);
         assert_eq!(memories[1].target_node_id.as_deref(), Some("node_fact"));
+    }
+
+    #[derive(Clone)]
+    struct FakeProvider {
+        raw: Result<String, String>,
+        repaired: Option<String>,
+    }
+
+    impl DistillationProvider for FakeProvider {
+        fn distill(&self, _prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+            self.raw
+                .clone()
+                .map_err(|err| MemoryError::invalid(format!("provider failed: {err}")))
+        }
+
+        fn repair(&self, prompt: DistillationRepairPrompt<'_>) -> MemoryResult<String> {
+            assert!(!prompt.raw_output.is_empty());
+            assert!(!prompt.error.is_empty());
+            self.repaired
+                .clone()
+                .ok_or_else(|| MemoryError::invalid("repair unavailable"))
+        }
+    }
+
+    fn provider_json(event: &LedgerEvent, text: &str) -> String {
+        serde_json::json!({
+            "memories": [{
+                "op": "add",
+                "node_kind": "fact",
+                "text": text,
+                "target_node_id": null,
+                "cited_spans": [event.cited_span()]
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn provider_distiller_accepts_valid_schema() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Ok(provider_json(&event, "Checkout uses DATABASE_URL.")),
+            repaired: None,
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!outcome.rejected);
+        assert_eq!(outcome.memories.len(), 1);
+        assert_eq!(outcome.metrics.provider_calls, 1);
+        assert_eq!(outcome.metrics.repair_attempts, 0);
+        assert!(outcome.metrics.input_tokens > 0);
+        assert!(outcome.metrics.output_tokens > 0);
+    }
+
+    #[test]
+    fn provider_distiller_repairs_invalid_schema_once() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Ok("{\"memories\":".to_string()),
+            repaired: Some(provider_json(&event, "Checkout uses DATABASE_URL.")),
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!outcome.rejected);
+        assert_eq!(outcome.metrics.provider_calls, 2);
+        assert_eq!(outcome.metrics.schema_errors, 1);
+        assert_eq!(outcome.metrics.repair_attempts, 1);
+        assert_eq!(outcome.metrics.repair_successes, 1);
+    }
+
+    #[test]
+    fn provider_distiller_rejects_after_failed_repair() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Ok("{\"memories\":".to_string()),
+            repaired: Some("{\"memories\":".to_string()),
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(outcome.rejected);
+        assert!(outcome.memories.is_empty());
+        assert_eq!(outcome.metrics.schema_errors, 2);
+        assert_eq!(outcome.metrics.rejected_outputs, 1);
+    }
+
+    #[test]
+    fn provider_distiller_rejects_transport_failure() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Err("timeout".to_string()),
+            repaired: None,
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(outcome.rejected);
+        assert_eq!(outcome.metrics.provider_errors, 1);
+        assert_eq!(outcome.metrics.rejected_outputs, 1);
+    }
+
+    #[test]
+    fn provider_distiller_rejects_unknown_fields() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let raw = serde_json::json!({
+            "memories": [{
+                "op": "add",
+                "node_kind": "fact",
+                "text": "Checkout uses DATABASE_URL.",
+                "target_node_id": null,
+                "cited_spans": [event.cited_span()],
+                "unexpected": true
+            }]
+        })
+        .to_string();
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Ok(raw),
+            repaired: None,
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(outcome.rejected);
+        assert_eq!(outcome.metrics.schema_errors, 1);
+        assert_eq!(outcome.metrics.repair_attempts, 1);
+        assert_eq!(outcome.metrics.rejected_outputs, 1);
+    }
+
+    #[test]
+    fn provider_distiller_rejects_empty_batches() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let distiller = ProviderDistiller::new(FakeProvider {
+            raw: Ok(serde_json::json!({ "memories": [] }).to_string()),
+            repaired: None,
+        });
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(outcome.rejected);
+        assert_eq!(outcome.metrics.schema_errors, 1);
+        assert_eq!(outcome.metrics.rejected_outputs, 1);
+    }
+
+    #[derive(Clone)]
+    struct TwoRepairProvider;
+
+    impl DistillationProvider for TwoRepairProvider {
+        fn distill(&self, _prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+            Ok("{\"memories\":".to_string())
+        }
+
+        fn repair(&self, prompt: DistillationRepairPrompt<'_>) -> MemoryResult<String> {
+            if prompt.raw_output == "{\"memories\":" {
+                Ok("{\"memories\":[]}".to_string())
+            } else {
+                Ok(provider_json(prompt.event, "Checkout uses DATABASE_URL."))
+            }
+        }
+    }
+
+    #[test]
+    fn provider_distiller_honors_max_repairs() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let distiller = ProviderDistiller::new(TwoRepairProvider).with_max_repairs(2);
+
+        let outcome = distiller
+            .distill(&event, &[])
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!outcome.rejected);
+        assert_eq!(outcome.metrics.provider_calls, 3);
+        assert_eq!(outcome.metrics.schema_errors, 2);
+        assert_eq!(outcome.metrics.repair_attempts, 2);
+        assert_eq!(outcome.metrics.repair_successes, 1);
     }
 }

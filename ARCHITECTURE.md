@@ -29,12 +29,24 @@ edges are projections that can be rebuilt.
 
 2. **Distiller**
    - Trait: `Distiller`
-   - Current implementation: `HeuristicDistiller`
-   - Output schema: `DistilledMemory { ADD | UPDATE | INVALIDATE | NOOP }`
-   - Projection validates required text, cited-span provenance, target IDs, and
-     invalidation/noop shape before touching graph tables.
-   - Future LLM distillers must still emit this constrained shape before
-     touching projections.
+   - Current implementations: `HeuristicDistiller` and provider-backed
+     `ProviderDistiller<P>`.
+   - Output schema: `DistilledMemory { ADD | UPDATE | INVALIDATE | NOOP }`;
+     provider JSON uses the enum's snake_case wire values (`"add"`,
+     `"update"`, `"invalidate"`, `"noop"`). Provider output is parsed through a
+     strict JSON batch schema; malformed JSON or invalid memories get bounded
+     repair attempts before rejection.
+   - Projection validates required text, cited-span provenance, scoped target
+     IDs, and invalidation/noop shape before touching graph tables. Targetless
+     invalidations with no resolvable neighbor are normalized to adds instead
+     of silently invalidating nothing.
+   - Provider-backed distillation runs before projection write transactions.
+     Rejected provider output leaves the ledger event pending and reports
+     provider, repair, rejection, token, and elapsed counters.
+   - Late-arrival replay is enabled only for distillers that opt into
+     deterministic replay. Provider-backed distillers skip late replay until
+     projected provider batches are durable, preserving rebuild consistency and
+     avoiding provider failures after a current event commits.
 
 3. **Typed Graph Projection**
    - Nodes: `Episode`, `Fact`, `EntityCue`, `Tag`, `Procedure`, `State`,
@@ -126,12 +138,15 @@ Production safeguards:
 - new databases are stamped with the Beater Memory SQLite `application_id`;
   existing SQLite files must already have that identity before migration runs
 - `PRAGMA user_version` records the supported schema version
-- each ledger event is projected inside `BEGIN IMMEDIATE ... COMMIT`
+- each ledger event's prepared distilled memories are applied inside
+  `BEGIN IMMEDIATE ... COMMIT`
 - `beater.js` and canonical JSONL imports append inside one immediate
   transaction, so malformed rows abort the batch with row context instead of
   leaving a partial import behind
 - projection rechecks `projected_at_unix_ms IS NULL` inside the transaction so
-  concurrent workers cannot double-count a stale pending row
+  concurrent workers cannot double-count a stale pending row; provider-backed
+  distillation happens before that transaction and is discarded if the row is no
+  longer pending
 - direct writes can apply an idempotency key to stabilize the ledger
   `trace_id + span_id + seq` for retry-safe ingestion
 - `health` runs schema, integrity, foreign-key, and count checks
