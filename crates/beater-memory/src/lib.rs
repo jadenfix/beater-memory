@@ -10,6 +10,7 @@ mod error;
 mod graph;
 mod imports;
 mod model;
+mod reconstruct;
 mod server;
 mod store;
 mod text;
@@ -23,7 +24,12 @@ pub use imports::{
 pub use model::{
     ActivationWeights, BeliefRevisionOp, CitedSpan, Contradiction, DistilledMemory, Evidence,
     MemoryAnswer, MemoryEdgeKind, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier,
+    ReconstructionMode, ReconstructionOptions, ReconstructionReason, ReconstructionReport,
     StaleAssumption, blend_activation, budget_evidence, estimate_tokens,
+};
+pub use reconstruct::{
+    ActiveReconstructor, DeterministicReconstructor, ReconstructionCandidate,
+    ReconstructionDecision, ReconstructionStep,
 };
 pub use server::{
     AuditHttpQuery, AuditHttpResponse, LiveResponse, MaintenanceHttpRequest, MemoryServerConfig,

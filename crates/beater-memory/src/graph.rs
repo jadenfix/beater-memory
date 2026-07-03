@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::{
     error::MemoryResult,
     model::{
-        ActivationWeights, Contradiction, Evidence, MemoryAnswer, MemoryEdgeKind, MemoryQuery,
-        MemoryTier, StaleAssumption, blend_activation, budget_evidence, estimate_tokens,
+        ActivationWeights, Contradiction, Evidence, MemoryAnswer, MemoryEdgeKind, MemoryNodeKind,
+        MemoryQuery, MemoryTier, ReconstructionMode, ReconstructionReason, ReconstructionReport,
+        StaleAssumption, blend_activation, budget_evidence, estimate_tokens,
+    },
+    reconstruct::{
+        ActiveReconstructor, ReconstructionCandidate, ReconstructionDecision, ReconstructionStep,
     },
     store::{MemoryEdge, MemoryNode, SqliteMemoryStore},
     text::{concise, now_unix_ms, overlap_score, terms, top_terms},
@@ -14,6 +18,7 @@ pub(crate) fn answer_query(
     store: &SqliteMemoryStore,
     query: &MemoryQuery,
     weights: ActivationWeights,
+    reconstructor: &impl ActiveReconstructor,
 ) -> MemoryResult<MemoryAnswer> {
     let env = query.scope.environment_id.as_deref();
     let now = now_unix_ms();
@@ -93,6 +98,23 @@ pub(crate) fn answer_query(
     }
 
     let selected = budget_evidence(evidence, query.max_tokens);
+    let escalation_reason = escalation_reason(query, &selected);
+    let (selected, reconstruction) = if let Some(reason) = escalation_reason {
+        reconstruct_active(
+            ReconstructionRequest {
+                store,
+                query,
+                selected,
+                nodes: &nodes,
+                edges: &ranking_edges,
+                as_of_unix_ms: Some(effective_as_of),
+                reason,
+            },
+            reconstructor,
+        )?
+    } else {
+        (selected, None)
+    };
     let cited_spans = selected
         .iter()
         .flat_map(|item| item.cited_spans.iter().cloned())
@@ -111,6 +133,11 @@ pub(crate) fn answer_query(
     let answer = synthesize_answer(&selected, &contradictions);
     let token_estimate =
         estimate_tokens(&answer) + selected.iter().map(|item| item.token_estimate).sum::<u32>();
+    let tier_used = if reconstruction.is_some() {
+        MemoryTier::ActiveReconstruction
+    } else {
+        MemoryTier::Activation
+    };
 
     Ok(MemoryAnswer {
         answer,
@@ -120,8 +147,274 @@ pub(crate) fn answer_query(
         stale_assumptions,
         suggested_next_queries,
         token_estimate,
-        tier_used: MemoryTier::Activation,
+        tier_used,
+        reconstruction,
     })
+}
+
+fn escalation_reason(query: &MemoryQuery, selected: &[Evidence]) -> Option<ReconstructionReason> {
+    match query.reconstruction.mode {
+        ReconstructionMode::Off => None,
+        ReconstructionMode::Force => Some(ReconstructionReason::Forced),
+        ReconstructionMode::Auto => {
+            let mut scores = selected.iter().map(|item| item.score).collect::<Vec<_>>();
+            scores.sort_by(|left, right| right.total_cmp(left));
+            let top_score = scores.first().copied().unwrap_or(0.0);
+            let second_score = scores.get(1).copied().unwrap_or(0.0);
+            if selected.is_empty() {
+                Some(ReconstructionReason::EmptyEvidence)
+            } else if top_score < 0.18 {
+                Some(ReconstructionReason::LowConfidence)
+            } else if second_score > 0.0 && (top_score - second_score) < 0.03 {
+                Some(ReconstructionReason::AmbiguousEvidence)
+            } else if is_compositional_query(&query.question) {
+                Some(ReconstructionReason::CompositionalQuery)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn is_compositional_query(question: &str) -> bool {
+    let lower = question.to_ascii_lowercase();
+    [
+        "because",
+        "caused",
+        "connected",
+        "depends",
+        "related",
+        "why",
+        "what led",
+        "after",
+        "before",
+        "chain",
+        "path",
+        "multi-hop",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+struct ReconstructionRequest<'a> {
+    store: &'a SqliteMemoryStore,
+    query: &'a MemoryQuery,
+    selected: Vec<Evidence>,
+    nodes: &'a [MemoryNode],
+    edges: &'a [MemoryEdge],
+    as_of_unix_ms: Option<i64>,
+    reason: ReconstructionReason,
+}
+
+fn reconstruct_active(
+    request: ReconstructionRequest<'_>,
+    reconstructor: &impl ActiveReconstructor,
+) -> MemoryResult<(Vec<Evidence>, Option<ReconstructionReport>)> {
+    let ReconstructionRequest {
+        store,
+        query,
+        selected,
+        nodes,
+        edges,
+        as_of_unix_ms,
+        reason,
+    } = request;
+    let node_by_id: HashMap<_, _> = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect();
+    let mut selected = selected;
+    let mut selected_ids: BTreeSet<_> = selected.iter().map(|item| item.node_id.clone()).collect();
+    let mut frontier: VecDeque<String> = selected_ids.iter().cloned().collect();
+    if frontier.is_empty()
+        && let Some(seed) = nodes
+            .iter()
+            .filter(|node| node.kind != MemoryNodeKind::EntityCue)
+            .filter(|node| query.accepts_kind(node.kind))
+            .find(|node| overlap_score(&query.question, &node.text) > 0.0)
+    {
+        frontier.push_back(seed.id.clone());
+    }
+    let mut expanded = BTreeSet::new();
+    let mut expanded_node_ids = Vec::new();
+    let mut accepted_node_ids = Vec::new();
+    let mut pruned_node_ids = Vec::new();
+    let mut tokens_spent = 0_u32;
+    let mut steps_used = 0_u8;
+
+    for step_index in 0..query.reconstruction.max_steps {
+        let Some(expanded_node_id) = pop_next_frontier(&mut frontier, &expanded) else {
+            break;
+        };
+        expanded.insert(expanded_node_id.clone());
+        expanded_node_ids.push(expanded_node_id.clone());
+        steps_used = step_index + 1;
+
+        let remaining_tokens = query.reconstruction.max_tokens.saturating_sub(tokens_spent);
+        let candidates = reconstruction_candidates(
+            query,
+            &expanded_node_id,
+            &node_by_id,
+            edges,
+            &selected_ids,
+            &expanded,
+            as_of_unix_ms,
+        );
+        let (candidates, budget_pruned_node_ids) =
+            budget_reconstruction_candidates(candidates, remaining_tokens);
+        pruned_node_ids.extend(budget_pruned_node_ids);
+        if remaining_tokens == 0 {
+            break;
+        }
+        let step = ReconstructionStep {
+            question: query.question.clone(),
+            step_index,
+            expanded_node_id,
+            remaining_tokens,
+            candidates,
+        };
+        match reconstructor.decide(&step) {
+            ReconstructionDecision::Accept { node_id } => {
+                if let Some(candidate) = step
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.node_id == node_id)
+                    && let Some(node) = node_by_id.get(&candidate.node_id)
+                    && candidate.token_estimate <= remaining_tokens
+                {
+                    let cited_spans = store.cited_spans_for_node_as_of(&node.id, as_of_unix_ms)?;
+                    tokens_spent += candidate.token_estimate;
+                    selected_ids.insert(node.id.clone());
+                    accepted_node_ids.push(node.id.clone());
+                    frontier.push_front(node.id.clone());
+                    selected.push(Evidence {
+                        node_id: node.id.clone(),
+                        kind: node.kind,
+                        text: node.text.clone(),
+                        score: candidate.score,
+                        token_estimate: node.token_estimate,
+                        cited_spans,
+                    });
+                } else if step
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.node_id == node_id)
+                {
+                    pruned_node_ids.push(node_id);
+                }
+            }
+            ReconstructionDecision::Prune { node_id } => {
+                if step
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.node_id == node_id)
+                {
+                    pruned_node_ids.push(node_id);
+                }
+            }
+            ReconstructionDecision::Stop => break,
+        }
+    }
+
+    selected = budget_evidence(selected, query.max_tokens);
+    Ok((
+        selected,
+        Some(ReconstructionReport {
+            mode: query.reconstruction.mode,
+            reason,
+            steps_used,
+            tokens_spent,
+            expanded_node_ids,
+            accepted_node_ids,
+            pruned_node_ids,
+        }),
+    ))
+}
+
+fn pop_next_frontier(
+    frontier: &mut VecDeque<String>,
+    expanded_ids: &BTreeSet<String>,
+) -> Option<String> {
+    while let Some(node_id) = frontier.pop_front() {
+        if !expanded_ids.contains(&node_id) {
+            return Some(node_id);
+        }
+    }
+    None
+}
+
+fn budget_reconstruction_candidates(
+    mut candidates: Vec<ReconstructionCandidate>,
+    max_tokens: u32,
+) -> (Vec<ReconstructionCandidate>, Vec<String>) {
+    candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+    let mut used = 0_u32;
+    let mut selected = Vec::new();
+    let mut pruned = Vec::new();
+    for candidate in candidates {
+        if candidate.token_estimate > max_tokens
+            || used.saturating_add(candidate.token_estimate) > max_tokens
+        {
+            pruned.push(candidate.node_id);
+            continue;
+        }
+        used += candidate.token_estimate;
+        selected.push(candidate);
+    }
+    (selected, pruned)
+}
+
+fn reconstruction_candidates(
+    query: &MemoryQuery,
+    expanded_node_id: &str,
+    nodes: &HashMap<String, MemoryNode>,
+    edges: &[MemoryEdge],
+    selected_ids: &BTreeSet<String>,
+    expanded_ids: &BTreeSet<String>,
+    as_of_unix_ms: Option<i64>,
+) -> Vec<ReconstructionCandidate> {
+    let mut candidates = BTreeMap::new();
+    for edge in edges {
+        let neighbor_id = if edge.from_node_id == expanded_node_id {
+            Some(edge.to_node_id.as_str())
+        } else if edge.to_node_id == expanded_node_id {
+            Some(edge.from_node_id.as_str())
+        } else {
+            None
+        };
+        let Some(neighbor_id) = neighbor_id else {
+            continue;
+        };
+        if selected_ids.contains(neighbor_id) || expanded_ids.contains(neighbor_id) {
+            continue;
+        }
+        let Some(node) = nodes.get(neighbor_id) else {
+            continue;
+        };
+        if node.kind == MemoryNodeKind::EntityCue || !query.accepts_kind(node.kind) {
+            continue;
+        }
+        if query.require_fresh && !node.is_active_at(as_of_unix_ms) {
+            continue;
+        }
+        let lexical = overlap_score(&query.question, &node.text);
+        let edge_score = edge_kind_weight(edge.kind) * edge.weight;
+        let score = (0.60 * edge_score + 0.40 * lexical).clamp(0.0, 1.0);
+        if score <= 0.02 {
+            continue;
+        }
+        candidates.insert(
+            node.id.clone(),
+            ReconstructionCandidate {
+                node_id: node.id.clone(),
+                kind: node.kind,
+                text: node.text.clone(),
+                score,
+                token_estimate: node.token_estimate,
+            },
+        );
+    }
+    candidates.into_values().collect()
 }
 
 fn visible_edges(
@@ -490,9 +783,110 @@ impl BTreeMapKeyedSpans {
 
 #[cfg(test)]
 mod tests {
-    use crate::{engine::MemoryEngine, model::MemoryScope, store::LedgerEvent};
+    use crate::{
+        engine::MemoryEngine,
+        model::{
+            MemoryNodeKind, MemoryScope, ReconstructionMode, ReconstructionOptions,
+            ReconstructionReason,
+        },
+        reconstruct::DeterministicReconstructor,
+        store::LedgerEvent,
+    };
 
     use super::*;
+
+    #[test]
+    fn auto_escalation_treats_exact_score_ties_as_ambiguous() {
+        let query = MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+            .with_reconstruction(ReconstructionOptions {
+                mode: ReconstructionMode::Auto,
+                ..ReconstructionOptions::default()
+            });
+
+        let reason = escalation_reason(
+            &query,
+            &[
+                Evidence::new(
+                    "left",
+                    MemoryNodeKind::Fact,
+                    "Incident alpha blocked.",
+                    0.42,
+                ),
+                Evidence::new(
+                    "right",
+                    MemoryNodeKind::Fact,
+                    "Incident alpha recovered.",
+                    0.42,
+                ),
+            ],
+        );
+
+        assert_eq!(reason, Some(ReconstructionReason::AmbiguousEvidence));
+    }
+
+    #[test]
+    fn accepted_frontier_nodes_are_expanded_before_remaining_seeds() {
+        let mut frontier = VecDeque::from(["seed-a".to_string(), "seed-b".to_string()]);
+        let mut expanded = BTreeSet::new();
+
+        assert_eq!(
+            pop_next_frontier(&mut frontier, &expanded),
+            Some("seed-a".to_string())
+        );
+        expanded.insert("seed-a".to_string());
+        frontier.push_front("accepted-hop".to_string());
+
+        assert_eq!(
+            pop_next_frontier(&mut frontier, &expanded),
+            Some("accepted-hop".to_string())
+        );
+    }
+
+    #[test]
+    fn reconstruction_candidates_are_budgeted_before_policy_decision() {
+        let (selected, pruned) = budget_reconstruction_candidates(
+            vec![
+                ReconstructionCandidate {
+                    node_id: "large".to_string(),
+                    kind: MemoryNodeKind::Fact,
+                    text: "large".to_string(),
+                    score: 0.95,
+                    token_estimate: 8,
+                },
+                ReconstructionCandidate {
+                    node_id: "medium".to_string(),
+                    kind: MemoryNodeKind::Fact,
+                    text: "medium".to_string(),
+                    score: 0.90,
+                    token_estimate: 5,
+                },
+                ReconstructionCandidate {
+                    node_id: "small".to_string(),
+                    kind: MemoryNodeKind::Fact,
+                    text: "small".to_string(),
+                    score: 0.70,
+                    token_estimate: 2,
+                },
+            ],
+            10,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["large", "small"]
+        );
+        assert_eq!(pruned, vec!["medium".to_string()]);
+        assert!(
+            selected
+                .iter()
+                .map(|candidate| candidate.token_estimate)
+                .sum::<u32>()
+                <= 10
+        );
+    }
 
     #[test]
     fn query_returns_cited_evidence() -> MemoryResult<()> {
@@ -512,6 +906,7 @@ mod tests {
                 MemoryScope::new("tenant", "project"),
             ),
             ActivationWeights::default(),
+            &DeterministicReconstructor,
         )?;
 
         assert!(!answer.evidence.is_empty());

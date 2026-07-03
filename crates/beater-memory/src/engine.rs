@@ -6,6 +6,7 @@ use crate::{
         ActivationWeights, BeliefRevisionOp, DistilledMemory, MemoryAnswer, MemoryEdgeKind,
         MemoryNodeKind, MemoryQuery,
     },
+    reconstruct::{ActiveReconstructor, DeterministicReconstructor},
     store::{LedgerEvent, MemoryNode, ProjectionResetReport, SqliteMemoryStore, StoreScope},
     text::{now_unix_ms, overlap_score, top_terms},
 };
@@ -35,13 +36,14 @@ pub struct ProjectionRebuildReport {
 }
 
 /// Memory engine facade: ledger import, projection, and answer-shaped reads.
-pub struct MemoryEngine<D = HeuristicDistiller> {
+pub struct MemoryEngine<D = HeuristicDistiller, R = DeterministicReconstructor> {
     store: SqliteMemoryStore,
     distiller: D,
+    reconstructor: R,
     activation_weights: ActivationWeights,
 }
 
-impl MemoryEngine<HeuristicDistiller> {
+impl MemoryEngine<HeuristicDistiller, DeterministicReconstructor> {
     pub fn open(path: impl AsRef<std::path::Path>) -> MemoryResult<Self> {
         Ok(Self::new(
             SqliteMemoryStore::open(path)?,
@@ -60,9 +62,21 @@ impl MemoryEngine<HeuristicDistiller> {
 impl<D: Distiller> MemoryEngine<D> {
     #[must_use]
     pub fn new(store: SqliteMemoryStore, distiller: D) -> Self {
+        Self::new_with_reconstructor(store, distiller, DeterministicReconstructor)
+    }
+}
+
+impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
+    #[must_use]
+    pub fn new_with_reconstructor(
+        store: SqliteMemoryStore,
+        distiller: D,
+        reconstructor: R,
+    ) -> Self {
         Self {
             store,
             distiller,
+            reconstructor,
             activation_weights: ActivationWeights::default(),
         }
     }
@@ -189,7 +203,12 @@ impl<D: Distiller> MemoryEngine<D> {
 
     pub fn query(&self, query: &MemoryQuery) -> MemoryResult<MemoryAnswer> {
         query.validate()?;
-        answer_query(&self.store, query, self.activation_weights)
+        answer_query(
+            &self.store,
+            query,
+            self.activation_weights,
+            &self.reconstructor,
+        )
     }
 
     fn apply_distilled(
@@ -514,9 +533,37 @@ enum ApplyOutcome {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{MemoryMode, MemoryScope, MemoryTier};
+    use crate::{
+        model::{
+            MemoryMode, MemoryScope, MemoryTier, ReconstructionMode, ReconstructionOptions,
+            ReconstructionReason,
+        },
+        reconstruct::{ReconstructionDecision, ReconstructionStep},
+    };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct BadReconstructor;
+
+    impl ActiveReconstructor for BadReconstructor {
+        fn decide(&self, _step: &ReconstructionStep) -> ReconstructionDecision {
+            ReconstructionDecision::Accept {
+                node_id: "missing-node".to_string(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct BadPruneReconstructor;
+
+    impl ActiveReconstructor for BadPruneReconstructor {
+        fn decide(&self, _step: &ReconstructionStep) -> ReconstructionDecision {
+            ReconstructionDecision::Prune {
+                node_id: "missing-node".to_string(),
+            }
+        }
+    }
 
     #[test]
     fn engine_projects_and_answers_e2e() -> MemoryResult<()> {
@@ -544,6 +591,161 @@ mod tests {
         assert!(answer.answer.contains("DATABASE_URL"));
         assert!(!answer.evidence.is_empty());
         assert!(!answer.cited_spans.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn forced_reconstruction_expands_linked_evidence() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?.with_activation_weights(ActivationWeights {
+            ppr: 0.0,
+            base_level: 0.0,
+            edge_type: 0.0,
+            freshness: 0.0,
+        });
+        let (_source, target) = linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic])
+                .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+
+        let reconstruction = answer
+            .reconstruction
+            .as_ref()
+            .expect("forced query should run reconstruction");
+        assert_eq!(answer.tier_used, MemoryTier::ActiveReconstruction);
+        assert_eq!(reconstruction.reason, ReconstructionReason::Forced);
+        assert!(reconstruction.accepted_node_ids.contains(&target.id));
+        assert!(answer.evidence.iter().any(|item| item.node_id == target.id));
+        Ok(())
+    }
+
+    #[test]
+    fn auto_reconstruction_escalates_compositional_queries() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "why was incident alpha fixed",
+                MemoryScope::new("tenant", "project"),
+            )
+            .with_modes(vec![MemoryMode::Semantic])
+            .with_reconstruction(ReconstructionOptions {
+                mode: ReconstructionMode::Auto,
+                ..ReconstructionOptions::default()
+            }),
+        )?;
+
+        assert_eq!(answer.tier_used, MemoryTier::ActiveReconstruction);
+        assert_eq!(
+            answer.reconstruction.as_ref().map(|report| report.reason),
+            Some(ReconstructionReason::CompositionalQuery)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruction_respects_as_of_visibility() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        let (_source, future_target) = linked_reconstruction_fixture(&engine, 1_000, 3_000, 3_000)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "incident alpha",
+                MemoryScope::new("tenant", "project").as_of_unix_ms(1_500),
+            )
+            .with_modes(vec![MemoryMode::Semantic])
+            .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+
+        assert_eq!(answer.tier_used, MemoryTier::ActiveReconstruction);
+        assert!(
+            !answer
+                .evidence
+                .iter()
+                .any(|item| item.node_id == future_target.id)
+        );
+        assert!(
+            !answer
+                .reconstruction
+                .as_ref()
+                .expect("forced query should run reconstruction")
+                .accepted_node_ids
+                .contains(&future_target.id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_reconstructor_decisions_are_ignored() -> MemoryResult<()> {
+        let engine = MemoryEngine::new_with_reconstructor(
+            SqliteMemoryStore::in_memory()?,
+            HeuristicDistiller::default(),
+            BadReconstructor,
+        )
+        .with_activation_weights(ActivationWeights {
+            ppr: 0.0,
+            base_level: 0.0,
+            edge_type: 0.0,
+            freshness: 0.0,
+        });
+        let (_source, target) = linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic])
+                .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+
+        let reconstruction = answer
+            .reconstruction
+            .as_ref()
+            .expect("forced query should run reconstruction");
+        assert_eq!(answer.tier_used, MemoryTier::ActiveReconstruction);
+        assert!(!answer.evidence.iter().any(|item| item.node_id == target.id));
+        assert!(!reconstruction.accepted_node_ids.contains(&target.id));
+        assert!(
+            !reconstruction
+                .pruned_node_ids
+                .iter()
+                .any(|node_id| node_id == "missing-node")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_prune_decisions_are_ignored() -> MemoryResult<()> {
+        let engine = MemoryEngine::new_with_reconstructor(
+            SqliteMemoryStore::in_memory()?,
+            HeuristicDistiller::default(),
+            BadPruneReconstructor,
+        )
+        .with_activation_weights(ActivationWeights {
+            ppr: 0.0,
+            base_level: 0.0,
+            edge_type: 0.0,
+            freshness: 0.0,
+        });
+        linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic])
+                .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+
+        let reconstruction = answer
+            .reconstruction
+            .as_ref()
+            .expect("forced query should run reconstruction");
+        assert!(
+            !reconstruction
+                .pruned_node_ids
+                .iter()
+                .any(|node_id| node_id == "missing-node")
+        );
         Ok(())
     }
 
@@ -1360,6 +1562,53 @@ mod tests {
         let rebuilt_nodes = engine.store().all_nodes("tenant", "project", None)?;
         assert_eq!(node_valid_to(&rebuilt_nodes, weak_late_node), Some(None));
         Ok(())
+    }
+
+    fn linked_reconstruction_fixture<D, R>(
+        engine: &MemoryEngine<D, R>,
+        source_observed_at_unix_ms: i64,
+        target_observed_at_unix_ms: i64,
+        edge_observed_at_unix_ms: i64,
+    ) -> MemoryResult<(MemoryNode, MemoryNode)>
+    where
+        D: Distiller,
+        R: ActiveReconstructor,
+    {
+        let source_text = "Incident alpha blocked deploys.";
+        let target_text = "Credential beta rotation restored deploys.";
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            source_text,
+            source_observed_at_unix_ms,
+        ))?;
+        engine.project_pending(100)?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            target_text,
+            target_observed_at_unix_ms,
+        ))?;
+        engine.project_pending(100)?;
+
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let source = nodes
+            .iter()
+            .find(|node| node.text == source_text && node.kind == MemoryNodeKind::Fact)
+            .cloned()
+            .expect("source memory should exist");
+        let target = nodes
+            .iter()
+            .find(|node| node.text == target_text && node.kind == MemoryNodeKind::Fact)
+            .cloned()
+            .expect("target memory should exist");
+        engine.store().insert_edge(
+            StoreScope::new("tenant", "project", None),
+            &source.id,
+            &target.id,
+            MemoryEdgeKind::Fixes,
+            1.0,
+            edge_observed_at_unix_ms,
+        )?;
+        Ok((source, target))
     }
 
     fn event_at(kind: MemoryNodeKind, text: &str, observed_at_unix_ms: i64) -> LedgerEvent {

@@ -38,6 +38,8 @@ The current implementation includes:
   cue index entries
 - as-of temporal query windows that exclude future or invalidated facts while
   still surfacing stale assumptions from contradiction edges
+- optional Tier 2 active reconstruction for hard or forced read-time graph
+  exploration, with bounded steps, token budget, and a diagnostic report
 - ledger validation that rejects malformed events before they enter the
   append-only log
 - query validation that rejects malformed scopes, empty questions, and unusable
@@ -73,6 +75,11 @@ cargo run -p beater-memory -- remember \
 cargo run -p beater-memory -- query \
   --tenant local --project demo \
   "How do I fix checkout database failures?"
+
+cargo run -p beater-memory -- query \
+  --tenant local --project demo \
+  --reconstruction-mode auto \
+  "why did checkout database failures recover?"
 
 cargo run -p beater-memory -- health --json
 ```
@@ -189,7 +196,7 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
 
 curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"question":"checkout database failure","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null}}' \
+  -d '{"question":"checkout database failure","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null},"reconstruction_mode":"auto","max_reconstruction_steps":4,"max_reconstruction_tokens":2000}' \
   http://127.0.0.1:8765/v1/query
 ```
 
@@ -209,8 +216,13 @@ The public API exports:
 - `LiveResponse`, `ReadyResponse`, and `ServiceMetricsSnapshot`
 - `LedgerEvent`
 - `Distiller` and `HeuristicDistiller`
+- `ActiveReconstructor`, `DeterministicReconstructor`,
+  `ReconstructionCandidate`, `ReconstructionDecision`, and
+  `ReconstructionStep`
 - `MemoryQuery` and `MemoryAnswer`
-- `MemoryTier`, `MemoryNodeKind`, `MemoryEdgeKind`, `BeliefRevisionOp`
+- `MemoryTier`, `MemoryNodeKind`, `MemoryEdgeKind`, `BeliefRevisionOp`,
+  `ReconstructionMode`, `ReconstructionOptions`, `ReconstructionReason`, and
+  `ReconstructionReport`
 - import helpers for `beater.js` journals and canonical JSONL
 - evidence token budgeting helpers
 
