@@ -26,8 +26,9 @@ pub use engine::{MemoryEngine, ProjectReport, ProjectionRebuildReport};
 pub use error::{MemoryError, MemoryResult};
 pub use eval::{
     EVAL_CONTRACT_VERSION, EvalAbility, EvalAbilitySummary, EvalCase, EvalCaseReport, EvalEvent,
-    EvalExpectationReport, EvalOptions, EvalReport, EvalReportSource, EvalScoreKind, EvalSuite,
-    EvalSuiteSource, EvalTierSummary, run_eval_suite, run_eval_suite_with_source,
+    EvalExpectationReport, EvalOptions, EvalReport, EvalReportSource, EvalRuntimeOptions,
+    EvalScoreKind, EvalSuite, EvalSuiteSource, EvalTierSummary, run_eval_suite,
+    run_eval_suite_with_source, run_eval_suite_with_source_and_runtime,
 };
 pub use imports::{
     BeaterJsImportReport, BeaterJsJournal, CanonicalJsonlImportReport, import_canonical_jsonl,

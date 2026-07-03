@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     MemoryEngine, ProjectReport,
+    distill::DistillerConfig,
     error::{MemoryError, MemoryResult},
     model::{
         MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier, ReconstructionMode,
         ReconstructionOptions, ReconstructionReason, RoutingReason, estimate_tokens,
     },
+    reconstruct::ReconstructorConfig,
     store::{LedgerEvent, StoreStats},
     text::stable_id,
 };
@@ -150,6 +152,13 @@ pub struct EvalOptions {
     pub max_reconstruction_tokens: Option<u32>,
 }
 
+/// Runtime provider selection for an eval run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalRuntimeOptions {
+    pub distiller: DistillerConfig,
+    pub reconstructor: ReconstructorConfig,
+}
+
 /// Aggregate result of one deterministic suite run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -183,6 +192,18 @@ pub struct EvalReport {
     pub answer_tokens_total: u32,
     pub evidence_tokens_total: u32,
     pub reconstruction_tokens_total: u32,
+    #[serde(default)]
+    pub reconstruction_provider_calls: usize,
+    #[serde(default)]
+    pub reconstruction_provider_errors: usize,
+    #[serde(default)]
+    pub reconstruction_provider_schema_errors: usize,
+    #[serde(default)]
+    pub reconstruction_provider_input_tokens: u32,
+    #[serde(default)]
+    pub reconstruction_provider_output_tokens: u32,
+    #[serde(default)]
+    pub reconstruction_provider_elapsed_ms: u64,
     pub project: crate::ProjectReport,
     pub stats: StoreStats,
     pub ability_scores: Vec<EvalAbilitySummary>,
@@ -265,6 +286,18 @@ pub struct EvalCaseReport {
     pub reconstruction_provider_errors: usize,
     #[serde(default)]
     pub reconstruction_provider_schema_errors: usize,
+    #[serde(default)]
+    pub reconstruction_provider_input_tokens: u32,
+    #[serde(default)]
+    pub reconstruction_provider_output_tokens: u32,
+    #[serde(default)]
+    pub reconstruction_provider_elapsed_ms: u64,
+    #[serde(default)]
+    pub reconstruction_expanded_node_ids: Vec<String>,
+    #[serde(default)]
+    pub reconstruction_accepted_node_ids: Vec<String>,
+    #[serde(default)]
+    pub reconstruction_pruned_node_ids: Vec<String>,
     pub latency_ms: u64,
     pub token_estimate: u32,
     pub answer_tokens: u32,
@@ -354,6 +387,18 @@ impl<'de> Deserialize<'de> for EvalCaseReport {
             reconstruction_provider_errors: usize,
             #[serde(default)]
             reconstruction_provider_schema_errors: usize,
+            #[serde(default)]
+            reconstruction_provider_input_tokens: u32,
+            #[serde(default)]
+            reconstruction_provider_output_tokens: u32,
+            #[serde(default)]
+            reconstruction_provider_elapsed_ms: u64,
+            #[serde(default)]
+            reconstruction_expanded_node_ids: Vec<String>,
+            #[serde(default)]
+            reconstruction_accepted_node_ids: Vec<String>,
+            #[serde(default)]
+            reconstruction_pruned_node_ids: Vec<String>,
             latency_ms: u64,
             token_estimate: u32,
             answer_tokens: u32,
@@ -415,6 +460,12 @@ impl<'de> Deserialize<'de> for EvalCaseReport {
             reconstruction_provider_calls: raw.reconstruction_provider_calls,
             reconstruction_provider_errors: raw.reconstruction_provider_errors,
             reconstruction_provider_schema_errors: raw.reconstruction_provider_schema_errors,
+            reconstruction_provider_input_tokens: raw.reconstruction_provider_input_tokens,
+            reconstruction_provider_output_tokens: raw.reconstruction_provider_output_tokens,
+            reconstruction_provider_elapsed_ms: raw.reconstruction_provider_elapsed_ms,
+            reconstruction_expanded_node_ids: raw.reconstruction_expanded_node_ids,
+            reconstruction_accepted_node_ids: raw.reconstruction_accepted_node_ids,
+            reconstruction_pruned_node_ids: raw.reconstruction_pruned_node_ids,
             latency_ms: raw.latency_ms,
             token_estimate: raw.token_estimate,
             answer_tokens: raw.answer_tokens,
@@ -460,9 +511,28 @@ pub fn run_eval_suite_with_source(
     options: &EvalOptions,
     suite_path: Option<String>,
 ) -> MemoryResult<EvalReport> {
+    run_eval_suite_with_source_and_runtime(
+        suite,
+        options,
+        suite_path,
+        &EvalRuntimeOptions::default(),
+    )
+}
+
+/// Run a suite with explicit runtime provider selection and source metadata.
+pub fn run_eval_suite_with_source_and_runtime(
+    suite: &EvalSuite,
+    options: &EvalOptions,
+    suite_path: Option<String>,
+    runtime: &EvalRuntimeOptions,
+) -> MemoryResult<EvalReport> {
     validate_options(options)?;
+    validate_runtime_options(runtime)?;
     validate_suite(suite)?;
-    let engine = MemoryEngine::in_memory()?;
+    let engine = MemoryEngine::in_memory_with_runtime_config(
+        runtime.distiller.clone(),
+        runtime.reconstructor.clone(),
+    )?;
     let mut project = ProjectReport::default();
     let mut case_reports = Vec::with_capacity(suite.cases.len());
     for (case_index, case) in suite.cases.iter().enumerate() {
@@ -540,6 +610,36 @@ pub fn run_eval_suite_with_source(
             .as_ref()
             .map(|report| report.provider_schema_errors)
             .unwrap_or(0);
+        let reconstruction_provider_input_tokens = answer
+            .reconstruction
+            .as_ref()
+            .map(|report| report.provider_input_tokens)
+            .unwrap_or(0);
+        let reconstruction_provider_output_tokens = answer
+            .reconstruction
+            .as_ref()
+            .map(|report| report.provider_output_tokens)
+            .unwrap_or(0);
+        let reconstruction_provider_elapsed_ms = answer
+            .reconstruction
+            .as_ref()
+            .map(|report| report.provider_elapsed_ms)
+            .unwrap_or(0);
+        let reconstruction_expanded_node_ids = answer
+            .reconstruction
+            .as_ref()
+            .map(|report| report.expanded_node_ids.clone())
+            .unwrap_or_default();
+        let reconstruction_accepted_node_ids = answer
+            .reconstruction
+            .as_ref()
+            .map(|report| report.accepted_node_ids.clone())
+            .unwrap_or_default();
+        let reconstruction_pruned_node_ids = answer
+            .reconstruction
+            .as_ref()
+            .map(|report| report.pruned_node_ids.clone())
+            .unwrap_or_default();
         case_reports.push(EvalCaseReport {
             id: case.id.clone(),
             ability: case.ability,
@@ -571,6 +671,12 @@ pub fn run_eval_suite_with_source(
             reconstruction_provider_calls,
             reconstruction_provider_errors,
             reconstruction_provider_schema_errors,
+            reconstruction_provider_input_tokens,
+            reconstruction_provider_output_tokens,
+            reconstruction_provider_elapsed_ms,
+            reconstruction_expanded_node_ids,
+            reconstruction_accepted_node_ids,
+            reconstruction_pruned_node_ids,
             latency_ms,
             token_estimate: answer.token_estimate,
             answer_tokens,
@@ -640,6 +746,30 @@ pub fn run_eval_suite_with_source(
         .iter()
         .map(|case| case.reconstruction_tokens)
         .sum::<u32>();
+    let reconstruction_provider_calls = case_reports
+        .iter()
+        .map(|case| case.reconstruction_provider_calls)
+        .sum::<usize>();
+    let reconstruction_provider_errors = case_reports
+        .iter()
+        .map(|case| case.reconstruction_provider_errors)
+        .sum::<usize>();
+    let reconstruction_provider_schema_errors = case_reports
+        .iter()
+        .map(|case| case.reconstruction_provider_schema_errors)
+        .sum::<usize>();
+    let reconstruction_provider_input_tokens = case_reports
+        .iter()
+        .map(|case| case.reconstruction_provider_input_tokens)
+        .sum::<u32>();
+    let reconstruction_provider_output_tokens = case_reports
+        .iter()
+        .map(|case| case.reconstruction_provider_output_tokens)
+        .sum::<u32>();
+    let reconstruction_provider_elapsed_ms = case_reports
+        .iter()
+        .map(|case| case.reconstruction_provider_elapsed_ms)
+        .sum::<u64>();
     let checks_total = case_reports
         .iter()
         .map(|case| case.checks_total)
@@ -681,6 +811,12 @@ pub fn run_eval_suite_with_source(
         answer_tokens_total,
         evidence_tokens_total,
         reconstruction_tokens_total,
+        reconstruction_provider_calls,
+        reconstruction_provider_errors,
+        reconstruction_provider_schema_errors,
+        reconstruction_provider_input_tokens,
+        reconstruction_provider_output_tokens,
+        reconstruction_provider_elapsed_ms,
         project,
         stats,
         ability_scores: ability_summaries(&case_reports),
@@ -731,6 +867,11 @@ fn validate_options(options: &EvalOptions) -> MemoryResult<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_runtime_options(options: &EvalRuntimeOptions) -> MemoryResult<()> {
+    options.distiller.validate()?;
+    options.reconstructor.validate()
 }
 
 fn validate_suite(suite: &EvalSuite) -> MemoryResult<()> {

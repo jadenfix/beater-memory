@@ -3,11 +3,11 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use beater_memory::{
     BeaterJsJournal, CommandDistillationProviderConfig, CommandReconstructionProviderConfig,
-    DistillerConfig, EvalOptions, EvalSuite, LedgerEvent, MaintenanceOptions, MemoryEngine,
-    MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig, ProjectReport,
-    ReconstructionMode, ReconstructionOptions, ReconstructorConfig, RuntimeDistiller,
-    RuntimeReconstructor, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite_with_source,
-    serve,
+    DistillerConfig, EvalOptions, EvalRuntimeOptions, EvalSuite, LedgerEvent, MaintenanceOptions,
+    MemoryEngine, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig,
+    ProjectReport, ReconstructionMode, ReconstructionOptions, ReconstructorConfig,
+    RuntimeDistiller, RuntimeReconstructor, SqliteMemoryStore, import_canonical_jsonl,
+    run_eval_suite_with_source_and_runtime, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -20,7 +20,7 @@ struct Cli {
     /// Path to the beater-memory SQLite database.
     #[arg(long, global = true, default_value = ".beater-memory/memory.db")]
     db: PathBuf,
-    /// Distiller used by projection commands.
+    /// Distiller used by projection, eval, and serve commands.
     #[arg(long, global = true, value_enum, default_value_t = DistillerArg::Heuristic)]
     distiller: DistillerArg,
     /// Command to run for `--distiller provider-command`.
@@ -35,7 +35,7 @@ struct Cli {
     /// Maximum provider repair attempts after malformed output.
     #[arg(long, global = true, default_value_t = 1)]
     distiller_max_repairs: usize,
-    /// Active reconstructor used by query and serve commands.
+    /// Active reconstructor used by query, eval, and serve commands.
     #[arg(long, global = true, value_enum, default_value_t = ReconstructorArg::Deterministic)]
     reconstructor: ReconstructorArg,
     /// Command to run for `--reconstructor provider-command`.
@@ -210,7 +210,7 @@ enum Command {
     },
     /// Print database counts.
     Stats,
-    /// Run a deterministic in-memory evaluation suite.
+    /// Run an in-memory evaluation suite.
     Eval {
         #[arg(long)]
         suite: PathBuf,
@@ -378,12 +378,16 @@ fn command_uses_projection_distiller(command: &Command) -> bool {
             | Command::Project { .. }
             | Command::Manage { .. }
             | Command::RebuildProjection { .. }
+            | Command::Eval { .. }
             | Command::Serve { .. }
     )
 }
 
 fn command_uses_reconstructor(command: &Command) -> bool {
-    matches!(command, Command::Query { .. } | Command::Serve { .. })
+    matches!(
+        command,
+        Command::Query { .. } | Command::Eval { .. } | Command::Serve { .. }
+    )
 }
 
 fn reconstructor_flags_present(cli: &Cli) -> bool {
@@ -409,7 +413,7 @@ fn runtime_reconstructor_config(config: &Option<ReconstructorConfig>) -> &Recons
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if !command_uses_reconstructor(&cli.command) && reconstructor_flags_present(&cli) {
-        anyhow::bail!("--reconstructor-* flags are only supported by query and serve");
+        anyhow::bail!("--reconstructor-* flags are only supported by query, eval, and serve");
     }
     let distiller_config = if command_uses_projection_distiller(&cli.command) {
         Some(distiller_config_from_cli(&cli)?)
@@ -761,7 +765,7 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::File::open(&suite).with_context(|| format!("open {}", suite.display()))?;
             let suite_definition: EvalSuite = serde_json::from_reader(suite_file)
                 .with_context(|| format!("parse {}", suite.display()))?;
-            let report = run_eval_suite_with_source(
+            let report = run_eval_suite_with_source_and_runtime(
                 &suite_definition,
                 &EvalOptions {
                     max_tokens,
@@ -770,6 +774,10 @@ async fn main() -> anyhow::Result<()> {
                     max_reconstruction_tokens,
                 },
                 Some(suite.display().to_string()),
+                &EvalRuntimeOptions {
+                    distiller: projection_distiller_config(&distiller_config).clone(),
+                    reconstructor: runtime_reconstructor_config(&reconstructor_config).clone(),
+                },
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             if report.failed > 0 {

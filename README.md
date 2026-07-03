@@ -79,7 +79,8 @@ The current implementation includes:
 - deterministic evaluation harness for LongMemEval-style ability cases,
   expectation-based judging, context-saturation gap placeholders, and
   read/write economics reports; cases are isolated by default unless the suite
-  opts into a shared haystack
+  opts into a shared haystack, and eval runs can opt into the same provider
+  distillation and active reconstruction adapters as CLI/HTTP runtime paths
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
 
@@ -174,6 +175,17 @@ Run a deterministic memory evaluation suite:
 
 ```bash
 cargo run -p beater-memory -- eval --suite ./memory-eval.json
+```
+
+Provider-backed evals use the same global adapter flags as manage/query:
+
+```bash
+cargo run -p beater-memory -- \
+  --distiller provider-command \
+  --distiller-command ./distill-provider \
+  --reconstructor provider-command \
+  --reconstructor-command ./reconstruct-provider \
+  eval --suite ./memory-eval.json --reconstruction-mode force
 ```
 
 `eval` emits machine-readable JSON on stdout by default. Passing suites keep
@@ -445,10 +457,10 @@ Key public API exports include:
   `ReconstructionMode`, `ReconstructionOptions`, `ReconstructionReason`, and
   `ReconstructionReport`
 - `EVAL_CONTRACT_VERSION`, `EvalSuite`, `EvalSuiteSource`, `EvalCase`,
-  `EvalEvent`, `EvalOptions`, `EvalReport`, `EvalReportSource`,
+  `EvalEvent`, `EvalOptions`, `EvalRuntimeOptions`, `EvalReport`, `EvalReportSource`,
   `EvalExpectationReport`, `EvalAbility`, `EvalScoreKind`,
   `EvalAbilitySummary`, `EvalTierSummary`, `run_eval_suite`, and
-  `run_eval_suite_with_source`
+  `run_eval_suite_with_source`, and `run_eval_suite_with_source_and_runtime`
 - import helpers for `beater.js` journals and canonical JSONL
 - evidence token budgeting helpers
 
