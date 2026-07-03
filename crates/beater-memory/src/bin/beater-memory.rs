@@ -2,9 +2,9 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use beater_memory::{
-    BeaterJsJournal, LedgerEvent, MaintenanceOptions, MemoryEngine, MemoryMode, MemoryNodeKind,
-    MemoryQuery, MemoryScope, MemoryServerConfig, ReconstructionMode, ReconstructionOptions,
-    SqliteMemoryStore, import_canonical_jsonl, serve,
+    BeaterJsJournal, EvalOptions, EvalSuite, LedgerEvent, MaintenanceOptions, MemoryEngine,
+    MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig, ReconstructionMode,
+    ReconstructionOptions, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -163,6 +163,19 @@ enum Command {
     },
     /// Print database counts.
     Stats,
+    /// Run a deterministic in-memory evaluation suite.
+    Eval {
+        #[arg(long)]
+        suite: PathBuf,
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        #[arg(long, value_enum)]
+        reconstruction_mode: Option<ReconstructionModeArg>,
+        #[arg(long)]
+        max_reconstruction_steps: Option<u8>,
+        #[arg(long)]
+        max_reconstruction_tokens: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -534,6 +547,36 @@ async fn main() -> anyhow::Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&engine.store().stats()?)?
             );
+        }
+        Command::Eval {
+            suite,
+            max_tokens,
+            reconstruction_mode,
+            max_reconstruction_steps,
+            max_reconstruction_tokens,
+        } => {
+            let suite_file =
+                std::fs::File::open(&suite).with_context(|| format!("open {}", suite.display()))?;
+            let suite_definition: EvalSuite = serde_json::from_reader(suite_file)
+                .with_context(|| format!("parse {}", suite.display()))?;
+            let report = run_eval_suite(
+                &suite_definition,
+                &EvalOptions {
+                    max_tokens,
+                    reconstruction_mode: reconstruction_mode.map(Into::into),
+                    max_reconstruction_steps,
+                    max_reconstruction_tokens,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report.failed > 0 {
+                anyhow::bail!(
+                    "eval suite {} failed {}/{} case(s)",
+                    report.suite,
+                    report.failed,
+                    report.cases
+                );
+            }
         }
     }
     Ok(())

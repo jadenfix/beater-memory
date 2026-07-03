@@ -7,6 +7,7 @@
 mod distill;
 mod engine;
 mod error;
+mod eval;
 mod graph;
 mod imports;
 mod model;
@@ -22,6 +23,10 @@ pub use distill::{
 };
 pub use engine::{MemoryEngine, ProjectReport, ProjectionRebuildReport};
 pub use error::{MemoryError, MemoryResult};
+pub use eval::{
+    EvalAbility, EvalAbilitySummary, EvalCase, EvalCaseReport, EvalEvent, EvalOptions, EvalReport,
+    EvalSuite, EvalTierSummary, run_eval_suite,
+};
 pub use imports::{
     BeaterJsImportReport, BeaterJsJournal, CanonicalJsonlImportReport, import_canonical_jsonl,
 };

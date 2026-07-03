@@ -67,6 +67,10 @@ The current implementation includes:
 - service metrics, persisted audit events, fixed-window request limiting, and
   bounded DB work concurrency
 - `x-request-id` propagation for HTTP responses and durable audit rows
+- deterministic evaluation harness for LongMemEval-style ability cases,
+  expectation-based judging, context-saturation gap placeholders, and
+  read/write economics reports; cases are isolated by default unless the suite
+  opts into a shared haystack
 - answer-shaped `MemoryAnswer` with citations, stale assumptions,
   contradictions, suggested follow-up queries, and token estimates
 
@@ -133,6 +137,12 @@ Import canonical span JSONL, useful for `beater-agents` exports:
 ```bash
 cargo run -p beater-memory -- import-jsonl \
   --path ./spans.jsonl --tenant local --project observed-agent
+```
+
+Run a deterministic memory evaluation suite:
+
+```bash
+cargo run -p beater-memory -- eval --suite ./memory-eval.json
 ```
 
 The default DB path is `.beater-memory/memory.db`; override with `--db`.
@@ -234,6 +244,9 @@ The public API exports:
 - `MemoryTier`, `MemoryMode`, `MemoryNodeKind`, `MemoryEdgeKind`,
   `BeliefRevisionOp`, `RoutingReason`, `RoutingReport`, `ReconstructionMode`,
   `ReconstructionOptions`, `ReconstructionReason`, and `ReconstructionReport`
+- `EvalSuite`, `EvalCase`, `EvalEvent`, `EvalOptions`, `EvalReport`,
+  `EvalAbility`, `EvalAbilitySummary`, `EvalTierSummary`, and
+  `run_eval_suite`
 - import helpers for `beater.js` journals and canonical JSONL
 - evidence token budgeting helpers
 
@@ -257,6 +270,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Retrieval returns an answer-shaped evidence bundle, not raw chunks.
 - Token cost, read latency, write amplification, and context pollution are
   first-class metrics.
+- Evaluation reports use deterministic content expectation checks or future
+  calibrated judges; they do not use F1/BLEU as the correctness signal.
+  Retrieval-tier expectations gate routing behavior without inflating accuracy,
+  context-saturation gap is the clamped full-context shortfall, and selected
+  evidence tokens are reported as the answer-context token load.
 - Contradictions are graph edges and stale assumptions, not silently overwritten
   summaries.
 

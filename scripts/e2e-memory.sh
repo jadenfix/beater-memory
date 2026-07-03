@@ -235,6 +235,136 @@ json_assert "$TMP_DIR/query-temporal-before.json" 'assert not any("scoped API to
 json_assert "$TMP_DIR/query-temporal-after.json" 'assert data["evidence"] and any("scoped API token" in item["text"] for item in data["evidence"])'
 json_assert "$TMP_DIR/query-temporal-after.json" 'assert not any("for deploys" in item["text"] for item in data["evidence"]) and data["contradictions"] and data["stale_assumptions"]'
 
+cat > "$TMP_DIR/eval-suite.json" <<'JSON'
+{
+  "name": "lme-v2-shaped-smoke",
+  "tenant_id": "local",
+  "project_id": "eval",
+  "cases": [
+    {
+      "id": "static-state",
+      "ability": "static_state_recall",
+      "question": "what is the production API base URL?",
+      "modes": ["state"],
+      "baseline_full_context_score": 1.0,
+      "events": [
+        {
+          "kind": "state",
+          "text": "The production API base URL is https://api.example.test.",
+          "observed_at_unix_ms": 1000
+        }
+      ],
+      "expected_evidence_contains": ["https://api.example.test"],
+      "expected_tier": "activation"
+    },
+    {
+      "id": "workflow",
+      "ability": "workflow_knowledge",
+      "question": "what is the deploy workflow?",
+      "modes": ["procedural"],
+      "reconstruction": {"mode": "force", "max_steps": 2, "max_tokens": 500},
+      "baseline_full_context_score": 1.0,
+      "events": [
+        {
+          "kind": "procedure",
+          "text": "Deploy workflow: run migrations, restart workers, then check health.",
+          "observed_at_unix_ms": 2000
+        }
+      ],
+      "expected_evidence_contains": ["restart workers"],
+      "expected_tier": "active_reconstruction"
+    },
+    {
+      "id": "gotcha",
+      "ability": "environment_gotcha",
+      "question": "why does checkout return 500?",
+      "modes": ["gotcha"],
+      "baseline_full_context_score": 1.0,
+      "events": [
+        {
+          "kind": "gotcha",
+          "text": "Checkout gotcha: missing DATABASE_URL returns HTTP 500.",
+          "observed_at_unix_ms": 3000
+        }
+      ],
+      "expected_evidence_contains": ["DATABASE_URL"],
+      "expected_tier": "activation"
+    },
+    {
+      "id": "dynamic-state",
+      "ability": "dynamic_state_tracking",
+      "question": "is the checkout feature flag enabled?",
+      "modes": ["state"],
+      "baseline_full_context_score": 1.0,
+      "events": [
+        {
+          "kind": "state",
+          "text": "Checkout feature flag is enabled now.",
+          "observed_at_unix_ms": 4000
+        }
+      ],
+      "expected_evidence_contains": ["enabled"],
+      "expected_tier": "activation"
+    },
+    {
+      "id": "premise",
+      "ability": "premise_awareness",
+      "question": "should I use the legacy API token?",
+      "modes": ["semantic"],
+      "baseline_full_context_score": 1.0,
+      "events": [
+        {
+          "kind": "fact",
+          "text": "Use the legacy API token.",
+          "observed_at_unix_ms": 5000
+        },
+        {
+          "kind": "fact",
+          "text": "Do not use the legacy API token; it is deprecated. Use the scoped API token.",
+          "observed_at_unix_ms": 6000
+        }
+      ],
+      "expected_evidence_contains": ["scoped API token"],
+      "expected_stale_contains": ["legacy API token"],
+      "expected_contradiction_contains": ["scoped API token"]
+    }
+  ]
+}
+JSON
+"$BIN" eval --suite "$TMP_DIR/eval-suite.json" > "$TMP_DIR/eval-report.json"
+json_assert "$TMP_DIR/eval-report.json" 'assert data["suite"] == "lme-v2-shaped-smoke" and data["cases"] == 5 and data["passed"] == 5 and data["failed"] == 0'
+json_assert "$TMP_DIR/eval-report.json" 'assert data["score"] == 1.0 and data["context_saturation_gap"] == 0.0'
+json_assert "$TMP_DIR/eval-report.json" 'assert data["source_tokens_per_stored_memory"] > 0 and data["projected_tokens_per_stored_memory"] > 0 and data["tokens_into_context_total"] > 0'
+json_assert "$TMP_DIR/eval-report.json" 'assert any(row["ability"] == "premise_awareness" and row["score"] == 1.0 for row in data["ability_scores"])'
+json_assert "$TMP_DIR/eval-report.json" 'assert any(row["tier"] == "active_reconstruction" and row["requests"] >= 1 for row in data["tier_metrics"])'
+"$BIN" eval --suite "$TMP_DIR/eval-suite.json" --max-reconstruction-steps 1 > "$TMP_DIR/eval-report-step-override.json"
+json_assert "$TMP_DIR/eval-report-step-override.json" 'assert data["passed"] == 5 and any(case["id"] == "workflow" and case["tier_used"] == "active_reconstruction" for case in data["case_reports"])'
+
+cat > "$TMP_DIR/eval-failing-suite.json" <<'JSON'
+{
+  "name": "failing-smoke",
+  "cases": [
+    {
+      "id": "missing",
+      "question": "what database is configured?",
+      "events": [
+        {"kind": "fact", "text": "Checkout uses DATABASE_URL."}
+      ],
+      "expected_evidence_contains": ["REDIS_URL"]
+    }
+  ]
+}
+JSON
+set +e
+"$BIN" eval --suite "$TMP_DIR/eval-failing-suite.json" > "$TMP_DIR/eval-failing-report.json" 2> "$TMP_DIR/eval-failing.err"
+eval_status=$?
+set -e
+if [ "$eval_status" -eq 0 ]; then
+  echo "expected failing eval suite to exit nonzero" >&2
+  exit 1
+fi
+json_assert "$TMP_DIR/eval-failing-report.json" 'assert data["failed"] == 1 and data["case_reports"][0]["failure_reasons"]'
+
 start_server
 json_assert "$TMP_DIR/readyz.json" 'assert data["status"] == "ok" and data["database"] == "ok"'
 
