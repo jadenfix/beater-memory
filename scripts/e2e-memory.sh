@@ -140,6 +140,13 @@ kind = event.get("name", "fact")
 if kind not in {"episode", "fact", "procedure", "state", "gotcha", "anti_memory", "topic"}:
     kind = "fact"
 text = "Provider distilled: " + event["text"]
+relation_edges = []
+if "nebula73" in event["text"]:
+    text = "Provider distilled: Credential nebula73 restored service."
+    for neighbor in request.get("neighbors", []):
+        if neighbor.get("kind") not in {"episode", "entity_cue"} and "quasar42" in neighbor.get("text", ""):
+            relation_edges.append({"kind": "fixes", "target_node_id": neighbor["id"]})
+            break
 print(json.dumps({
     "memories": [
         {
@@ -147,6 +154,7 @@ print(json.dumps({
             "node_kind": kind,
             "text": text,
             "target_node_id": None,
+            "relation_edges": relation_edges,
             "cited_spans": [span],
         }
     ]
@@ -258,6 +266,66 @@ json_assert "$TMP_DIR/provider-cli-rebuild.json" 'assert data["completed"] is Tr
   "Provider command CLI marker" \
   > "$TMP_DIR/provider-cli-query-after-rebuild.json"
 json_assert "$TMP_DIR/provider-cli-query-after-rebuild.json" 'assert data["evidence"] and any("Provider distilled:" in item["text"] for item in data["evidence"])'
+write_provider
+
+"$BIN" --db "$PROVIDER_DB" remember \
+  --tenant local \
+  --project provider \
+  --kind fact \
+  --no-project \
+  "Anchor quasar42 outage marker." \
+  > "$TMP_DIR/provider-relation-anchor-remember.json"
+json_assert "$TMP_DIR/provider-relation-anchor-remember.json" 'assert data["events_projected"] == 0'
+"$BIN" --db "$PROVIDER_DB" \
+  --distiller provider-command \
+  --distiller-command "$PROVIDER" \
+  --distiller-arg --ignored-provider-flag \
+  manage --limit 10 \
+  > "$TMP_DIR/provider-relation-anchor-manage.json"
+json_assert "$TMP_DIR/provider-relation-anchor-manage.json" 'assert data["events_projected"] == 1 and data["distillation_provider_calls"] == 1'
+"$BIN" --db "$PROVIDER_DB" remember \
+  --tenant local \
+  --project provider \
+  --kind fact \
+  --no-project \
+  "Credential nebula73 restored quasar42 service." \
+  > "$TMP_DIR/provider-relation-fix-remember.json"
+json_assert "$TMP_DIR/provider-relation-fix-remember.json" 'assert data["events_projected"] == 0'
+"$BIN" --db "$PROVIDER_DB" \
+  --distiller provider-command \
+  --distiller-command "$PROVIDER" \
+  --distiller-arg --ignored-provider-flag \
+  manage --limit 10 \
+  > "$TMP_DIR/provider-relation-fix-manage.json"
+json_assert "$TMP_DIR/provider-relation-fix-manage.json" 'assert data["events_projected"] == 1 and data["edges_added"] >= 1'
+"$BIN" --db "$PROVIDER_DB" query \
+  --tenant local \
+  --project provider \
+  --modes semantic \
+  --reconstruction-mode force \
+  --max-reconstruction-steps 2 \
+  --json \
+  "quasar42" \
+  > "$TMP_DIR/provider-relation-query.json"
+json_assert "$TMP_DIR/provider-relation-query.json" 'assert data["tier_used"] == "active_reconstruction" and any("Credential nebula73 restored service" in item["text"] for item in data["evidence"])'
+write_failing_provider
+"$BIN" --db "$PROVIDER_DB" \
+  --distiller provider-command \
+  --distiller-command "$PROVIDER" \
+  --distiller-arg --ignored-provider-flag \
+  rebuild-projection --yes-clear-projections \
+  > "$TMP_DIR/provider-relation-rebuild.json"
+json_assert "$TMP_DIR/provider-relation-rebuild.json" 'assert data["completed"] is True and data["project"]["events_projected"] == 3 and data["project"]["edges_added"] >= 1 and data["project"]["distillation_provider_calls"] == 0 and data["project"]["distillation_replayed_batches"] == 3'
+"$BIN" --db "$PROVIDER_DB" query \
+  --tenant local \
+  --project provider \
+  --modes semantic \
+  --reconstruction-mode force \
+  --max-reconstruction-steps 2 \
+  --json \
+  "quasar42" \
+  > "$TMP_DIR/provider-relation-query-after-rebuild.json"
+json_assert "$TMP_DIR/provider-relation-query-after-rebuild.json" 'assert data["tier_used"] == "active_reconstruction" and any("Credential nebula73 restored service" in item["text"] for item in data["evidence"])'
 write_provider
 
 "$BIN" --db "$DB" remember \

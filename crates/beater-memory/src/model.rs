@@ -264,6 +264,20 @@ impl MemoryEdgeKind {
             Self::ObservedIn => "observed_in",
         }
     }
+
+    #[must_use]
+    pub fn is_provider_relation(self) -> bool {
+        matches!(
+            self,
+            Self::CausedBy
+                | Self::Fixes
+                | Self::Before
+                | Self::After
+                | Self::PartOf
+                | Self::Blocks
+                | Self::Enables
+        )
+    }
 }
 
 impl fmt::Display for MemoryEdgeKind {
@@ -663,7 +677,17 @@ pub struct DistilledMemory {
     pub node_kind: MemoryNodeKind,
     pub text: String,
     pub target_node_id: Option<String>,
+    #[serde(default)]
+    pub relation_edges: Vec<DistilledEdge>,
     pub cited_spans: Vec<CitedSpan>,
+}
+
+/// A typed graph edge emitted by distillation from this memory to an existing neighbor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DistilledEdge {
+    pub kind: MemoryEdgeKind,
+    pub target_node_id: String,
 }
 
 impl DistilledMemory {
@@ -674,6 +698,7 @@ impl DistilledMemory {
             node_kind,
             text: text.into(),
             target_node_id: None,
+            relation_edges: Vec::new(),
             cited_spans: vec![cited_span],
         }
     }
@@ -687,6 +712,9 @@ impl DistilledMemory {
         }
         if let Some(target_node_id) = self.target_node_id.as_deref() {
             validate_required_identifier("target_node_id", target_node_id)?;
+        }
+        for edge in &self.relation_edges {
+            edge.validate()?;
         }
         match self.op {
             BeliefRevisionOp::Add => {
@@ -703,6 +731,11 @@ impl DistilledMemory {
                         "invalidate memory must include text or target_node_id",
                     ));
                 }
+                if !has_text && !self.relation_edges.is_empty() {
+                    return Err(MemoryError::invalid(
+                        "invalidate memory must include replacement text when relation_edges are present",
+                    ));
+                }
             }
             BeliefRevisionOp::Noop => {
                 if self.target_node_id.is_some() {
@@ -710,7 +743,32 @@ impl DistilledMemory {
                         "noop memory must not include target_node_id",
                     ));
                 }
+                if !self.relation_edges.is_empty() {
+                    return Err(MemoryError::invalid(
+                        "noop memory must not include relation_edges",
+                    ));
+                }
             }
+        }
+        Ok(())
+    }
+}
+
+impl DistilledEdge {
+    pub fn validate(&self) -> MemoryResult<()> {
+        validate_required_identifier("relation_edges.target_node_id", &self.target_node_id)?;
+        if matches!(
+            self.kind,
+            MemoryEdgeKind::Contradicts | MemoryEdgeKind::Supersedes
+        ) {
+            return Err(MemoryError::invalid(
+                "relation_edges must not use revision edge kinds",
+            ));
+        }
+        if !self.kind.is_provider_relation() {
+            return Err(MemoryError::invalid(
+                "relation_edges must use provider relation edge kinds",
+            ));
         }
         Ok(())
     }
@@ -958,6 +1016,7 @@ mod tests {
             node_kind: MemoryNodeKind::Episode,
             text: String::new(),
             target_node_id: Some("node_1".to_string()),
+            relation_edges: Vec::new(),
             cited_spans: vec![valid_span()],
         }
         .validate()
@@ -969,6 +1028,7 @@ mod tests {
             node_kind: MemoryNodeKind::Fact,
             text: String::new(),
             target_node_id: None,
+            relation_edges: Vec::new(),
             cited_spans: vec![valid_span()],
         }
         .validate()
@@ -980,11 +1040,20 @@ mod tests {
             node_kind: MemoryNodeKind::Fact,
             text: "Checkout uses DATABASE_URL.".to_string(),
             target_node_id: None,
+            relation_edges: Vec::new(),
             cited_spans: Vec::new(),
         }
         .validate()
         .unwrap_err();
         assert!(err.to_string().contains("cited_spans"));
+
+        let err = DistilledEdge {
+            kind: MemoryEdgeKind::Mentions,
+            target_node_id: "node_checkout".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("provider relation"));
     }
 
     #[test]

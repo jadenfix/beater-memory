@@ -626,16 +626,13 @@ fn ordinary_edge_visible_at(
     if edge.created_at_unix_ms > as_of_unix_ms {
         return Ok(false);
     }
-    if known_at_unix_ms.is_none() {
+    let Some(known_at_unix_ms) = known_at_unix_ms else {
         return Ok(true);
-    }
-    // Ordinary edges currently have observed time but no source event id. For
-    // known-time reads, hiding them is conservative until edge provenance is
-    // added to the projection schema.
-    if !matches!(
-        edge.kind,
-        MemoryEdgeKind::Contradicts | MemoryEdgeKind::Supersedes
-    ) {
+    };
+    let Some(source_event_id) = edge.source_event_id else {
+        return Ok(false);
+    };
+    if !store.event_known_at(source_event_id, known_at_unix_ms)? {
         return Ok(false);
     }
     let Some(from_node) = nodes.get(&edge.from_node_id) else {
@@ -645,8 +642,8 @@ fn ordinary_edge_visible_at(
         return Ok(false);
     };
     Ok(
-        store.node_is_visible_at(from_node, Some(as_of_unix_ms), known_at_unix_ms)?
-            && store.node_is_visible_at(to_node, Some(as_of_unix_ms), known_at_unix_ms)?,
+        store.node_is_visible_at(from_node, Some(as_of_unix_ms), Some(known_at_unix_ms))?
+            && store.node_is_visible_at(to_node, Some(as_of_unix_ms), Some(known_at_unix_ms))?,
     )
 }
 

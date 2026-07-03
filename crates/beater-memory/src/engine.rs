@@ -285,22 +285,26 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         let mut projected_nodes = Vec::new();
         for memory in projection.memories {
             match self.apply_distilled(projection.event, memory, projection.neighbors)? {
-                ApplyOutcome::Added(node) => {
+                ApplyOutcome::Added { node, edges_added } => {
                     event_report.memories_added += 1;
+                    event_report.edges_added += edges_added;
                     event_report.record_projected_node(&node);
                     projected_nodes.push(node);
                 }
-                ApplyOutcome::Updated(node) => {
+                ApplyOutcome::Updated { node, edges_added } => {
                     event_report.memories_updated += 1;
+                    event_report.edges_added += edges_added;
                     event_report.record_projected_node(&node);
                     projected_nodes.push(node);
                 }
                 ApplyOutcome::Invalidated {
                     replacement,
                     invalidated_count,
+                    edges_added,
                 } => {
                     event_report.memories_invalidated += invalidated_count;
                     event_report.stored_memories_touched += invalidated_count;
+                    event_report.edges_added += edges_added;
                     if let Some(node) = replacement {
                         event_report.record_projected_node(&node);
                         projected_nodes.push(node);
@@ -520,10 +524,11 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                     &memory.cited_spans,
                 )?;
                 self.ensure_entity_cues(event, &node)?;
+                let edges_added = self.insert_relation_edges(event, &node, &memory, neighbors)?;
                 if created {
-                    Ok(ApplyOutcome::Added(node))
+                    Ok(ApplyOutcome::Added { node, edges_added })
                 } else {
-                    Ok(ApplyOutcome::Updated(node))
+                    Ok(ApplyOutcome::Updated { node, edges_added })
                 }
             }
             BeliefRevisionOp::Update => {
@@ -546,19 +551,22 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 if created {
                     self.ensure_entity_cues(event, &node)?;
                 }
-                self.store.insert_edge(
+                let supersedes_inserted = self.store.insert_edge_with_source_event(
                     scope,
-                    &node.id,
-                    &target.id,
+                    (&node.id, &target.id),
                     MemoryEdgeKind::Supersedes,
                     1.0,
                     event.observed_at_unix_ms,
+                    event.id,
                 )?;
-                Ok(ApplyOutcome::Updated(node))
+                let edges_added = usize::from(supersedes_inserted)
+                    + self.insert_relation_edges(event, &node, &memory, neighbors)?;
+                Ok(ApplyOutcome::Updated { node, edges_added })
             }
             BeliefRevisionOp::Invalidate => {
                 let replacement = self.replacement_for_invalidation(event, &memory)?;
                 let mut invalidated_count = 0;
+                let mut edges_added = 0;
                 let targets = self.invalidation_targets(&memory, neighbors, replacement.as_ref());
                 for target in targets {
                     let invalidated = self.store.invalidate_node(
@@ -570,35 +578,43 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                         invalidated_count += 1;
                     }
                     if invalidated && let Some(newer) = replacement.as_ref() {
-                        self.store.insert_edge(
+                        if self.store.insert_edge_with_source_event(
                             StoreScope::new(
                                 &event.tenant_id,
                                 &event.project_id,
                                 event.environment_id.as_deref(),
                             ),
-                            &newer.id,
-                            &target.id,
+                            (&newer.id, &target.id),
                             MemoryEdgeKind::Supersedes,
                             1.0,
                             event.observed_at_unix_ms,
-                        )?;
-                        self.store.insert_edge(
+                            event.id,
+                        )? {
+                            edges_added += 1;
+                        }
+                        if self.store.insert_edge_with_source_event(
                             StoreScope::new(
                                 &event.tenant_id,
                                 &event.project_id,
                                 event.environment_id.as_deref(),
                             ),
-                            &newer.id,
-                            &target.id,
+                            (&newer.id, &target.id),
                             MemoryEdgeKind::Contradicts,
                             0.8,
                             event.observed_at_unix_ms,
-                        )?;
+                            event.id,
+                        )? {
+                            edges_added += 1;
+                        }
                     }
+                }
+                if let Some(newer) = replacement.as_ref() {
+                    edges_added += self.insert_relation_edges(event, newer, &memory, neighbors)?;
                 }
                 Ok(ApplyOutcome::Invalidated {
                     replacement,
                     invalidated_count,
+                    edges_added,
                 })
             }
         }
@@ -729,7 +745,62 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 )));
             }
         }
+        for edge in &memory.relation_edges {
+            let target = neighbors.iter().find(|node| node.id == edge.target_node_id);
+            let Some(target) = target else {
+                return Err(MemoryError::invalid(format!(
+                    "invalid {context} for event trace_id={} span_id={} seq={}: relation edge target_node_id {:?} is not in scoped neighbors",
+                    event.trace_id, event.span_id, event.seq, edge.target_node_id
+                )));
+            };
+            if matches!(
+                target.kind,
+                MemoryNodeKind::Episode | MemoryNodeKind::EntityCue
+            ) {
+                return Err(MemoryError::invalid(format!(
+                    "invalid {context} for event trace_id={} span_id={} seq={}: relation edge target_node_id {:?} must reference an answerable typed memory node",
+                    event.trace_id, event.span_id, event.seq, edge.target_node_id
+                )));
+            }
+        }
         Ok(())
+    }
+
+    fn insert_relation_edges(
+        &self,
+        event: &LedgerEvent,
+        from_node: &MemoryNode,
+        memory: &DistilledMemory,
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<usize> {
+        let mut edges_added = 0;
+        let scope = StoreScope::new(
+            &event.tenant_id,
+            &event.project_id,
+            event.environment_id.as_deref(),
+        );
+        for edge in &memory.relation_edges {
+            let Some(target) = neighbors.iter().find(|node| node.id == edge.target_node_id) else {
+                continue;
+            };
+            if matches!(
+                target.kind,
+                MemoryNodeKind::Episode | MemoryNodeKind::EntityCue
+            ) {
+                continue;
+            }
+            if self.store.insert_edge_with_source_event(
+                scope,
+                (&from_node.id, &target.id),
+                edge.kind,
+                1.0,
+                event.observed_at_unix_ms,
+                event.id,
+            )? {
+                edges_added += 1;
+            }
+        }
+        Ok(edges_added)
     }
 
     fn revision_target(
@@ -889,12 +960,19 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                         if !targets.iter().any(|target| target.id == node.id) {
                             continue;
                         }
-                        let invalidated = self.store.with_immediate_transaction(|_| {
-                            self.apply_late_invalidation(&projected_event, memory, node)
-                        })?;
+                        let (invalidated, edges_added) =
+                            self.store.with_immediate_transaction(|_| {
+                                self.apply_late_invalidation(
+                                    &projected_event,
+                                    memory,
+                                    node,
+                                    &neighbors,
+                                )
+                            })?;
                         if invalidated {
                             report.memories_invalidated += 1;
                             report.stored_memories_touched += 1;
+                            report.edges_added += edges_added;
                             return Ok(report);
                         }
                     }
@@ -905,20 +983,61 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                         if target.id != node.id {
                             continue;
                         }
-                        let updated = self.store.with_immediate_transaction(|_| {
-                            self.apply_late_update(&projected_event, memory, node)
-                        })?;
+                        let (updated, edges_added) =
+                            self.store.with_immediate_transaction(|_| {
+                                self.apply_late_update(&projected_event, memory, node, &neighbors)
+                            })?;
                         if updated {
                             report.memories_updated += 1;
                             report.stored_memories_touched += 1;
+                            report.edges_added += edges_added;
                             return Ok(report);
                         }
                     }
-                    BeliefRevisionOp::Add | BeliefRevisionOp::Noop => {}
+                    BeliefRevisionOp::Add => {
+                        if !memory
+                            .relation_edges
+                            .iter()
+                            .any(|edge| edge.target_node_id == node.id)
+                        {
+                            continue;
+                        }
+                        let edges_added = self.store.with_immediate_transaction(|_| {
+                            self.insert_late_add_relation_edges(
+                                &projected_event,
+                                &memory,
+                                &neighbors,
+                            )
+                        })?;
+                        report.edges_added += edges_added;
+                    }
+                    BeliefRevisionOp::Noop => {}
                 }
             }
         }
         Ok(report)
+    }
+
+    fn insert_late_add_relation_edges(
+        &self,
+        event: &LedgerEvent,
+        memory: &DistilledMemory,
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<usize> {
+        let source = self.store.node_version_by_text(
+            StoreScope::new(
+                &event.tenant_id,
+                &event.project_id,
+                event.environment_id.as_deref(),
+            ),
+            memory.node_kind,
+            &memory.text,
+            event.observed_at_unix_ms,
+        )?;
+        let Some(source) = source else {
+            return Ok(0);
+        };
+        self.insert_relation_edges(event, &source, memory, neighbors)
     }
 
     fn apply_late_invalidation(
@@ -926,38 +1045,45 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         event: &LedgerEvent,
         memory: DistilledMemory,
         target: &MemoryNode,
-    ) -> MemoryResult<bool> {
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<(bool, usize)> {
+        let mut edges_added = 0;
         let replacement = self.replacement_for_invalidation(event, &memory)?;
         let invalidated =
             self.store
                 .invalidate_node(&target.id, event.observed_at_unix_ms, event.id)?;
         if invalidated && let Some(newer) = replacement.as_ref() {
-            self.store.insert_edge(
+            if self.store.insert_edge_with_source_event(
                 StoreScope::new(
                     &event.tenant_id,
                     &event.project_id,
                     event.environment_id.as_deref(),
                 ),
-                &newer.id,
-                &target.id,
+                (&newer.id, &target.id),
                 MemoryEdgeKind::Supersedes,
                 1.0,
                 event.observed_at_unix_ms,
-            )?;
-            self.store.insert_edge(
+                event.id,
+            )? {
+                edges_added += 1;
+            }
+            if self.store.insert_edge_with_source_event(
                 StoreScope::new(
                     &event.tenant_id,
                     &event.project_id,
                     event.environment_id.as_deref(),
                 ),
-                &newer.id,
-                &target.id,
+                (&newer.id, &target.id),
                 MemoryEdgeKind::Contradicts,
                 0.8,
                 event.observed_at_unix_ms,
-            )?;
+                event.id,
+            )? {
+                edges_added += 1;
+            }
+            edges_added += self.insert_relation_edges(event, newer, &memory, neighbors)?;
         }
-        Ok(invalidated)
+        Ok((invalidated, edges_added))
     }
 
     fn apply_late_update(
@@ -965,7 +1091,8 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         event: &LedgerEvent,
         memory: DistilledMemory,
         target: &MemoryNode,
-    ) -> MemoryResult<bool> {
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<(bool, usize)> {
         let scope = StoreScope::new(
             &event.tenant_id,
             &event.project_id,
@@ -1020,16 +1147,21 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                     event.id,
                 )?;
             }
-            self.store.insert_edge(
+            let mut edges_added = 0;
+            if self.store.insert_edge_with_source_event(
                 scope,
-                &successor.id,
-                &target.id,
+                (&successor.id, &target.id),
                 MemoryEdgeKind::Supersedes,
                 1.0,
                 event.observed_at_unix_ms,
-            )?;
+                event.id,
+            )? {
+                edges_added += 1;
+            }
+            edges_added += self.insert_relation_edges(event, &successor, &memory, neighbors)?;
+            return Ok((true, edges_added));
         }
-        Ok(updated)
+        Ok((updated, 0))
     }
 
     fn link_projected_nodes(
@@ -1041,32 +1173,32 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         for pair in projected_nodes.windows(2) {
             let from = &pair[0];
             let to = &pair[1];
-            if self.store.insert_edge(
+            if self.store.insert_edge_with_source_event(
                 StoreScope::new(
                     &event.tenant_id,
                     &event.project_id,
                     event.environment_id.as_deref(),
                 ),
-                &to.id,
-                &from.id,
+                (&to.id, &from.id),
                 MemoryEdgeKind::DerivedFrom,
                 0.8,
                 event.observed_at_unix_ms,
+                event.id,
             )? {
                 edges += 1;
             }
             if from.kind == MemoryNodeKind::Episode
-                && self.store.insert_edge(
+                && self.store.insert_edge_with_source_event(
                     StoreScope::new(
                         &event.tenant_id,
                         &event.project_id,
                         event.environment_id.as_deref(),
                     ),
-                    &to.id,
-                    &from.id,
+                    (&to.id, &from.id),
                     MemoryEdgeKind::ObservedIn,
                     0.9,
                     event.observed_at_unix_ms,
+                    event.id,
                 )?
             {
                 edges += 1;
@@ -1089,17 +1221,17 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 event.observed_at_unix_ms,
                 std::slice::from_ref(&cited_span),
             )?;
-            self.store.insert_edge(
+            self.store.insert_edge_with_source_event(
                 StoreScope::new(
                     &event.tenant_id,
                     &event.project_id,
                     event.environment_id.as_deref(),
                 ),
-                &node.id,
-                &cue_node.id,
+                (&node.id, &cue_node.id),
                 MemoryEdgeKind::Mentions,
                 0.55,
                 event.observed_at_unix_ms,
+                event.id,
             )?;
         }
         Ok(())
@@ -1155,11 +1287,18 @@ impl ProjectReport {
 }
 
 enum ApplyOutcome {
-    Added(MemoryNode),
-    Updated(MemoryNode),
+    Added {
+        node: MemoryNode,
+        edges_added: usize,
+    },
+    Updated {
+        node: MemoryNode,
+        edges_added: usize,
+    },
     Invalidated {
         replacement: Option<MemoryNode>,
         invalidated_count: usize,
+        edges_added: usize,
     },
     Noop,
 }
@@ -1172,8 +1311,8 @@ mod tests {
             DistillationReplayKey, ProviderDistiller,
         },
         model::{
-            MemoryMode, MemoryScope, MemoryTier, ReconstructionMode, ReconstructionOptions,
-            ReconstructionReason, RoutingReason,
+            DistilledEdge, MemoryMode, MemoryScope, MemoryTier, ReconstructionMode,
+            ReconstructionOptions, ReconstructionReason, RoutingReason,
         },
         reconstruct::{
             ProviderReconstructor, ReconstructionDecision, ReconstructionDecisionOutcome,
@@ -1400,13 +1539,13 @@ mod tests {
                     && node.text == "Checkout workers require credential beta."
             })
             .expect("fact exists");
-        engine.store().insert_edge(
+        engine.store().insert_edge_with_source_event(
             StoreScope::new("tenant", "project", None),
-            &procedure.id,
-            &fact.id,
+            (&procedure.id, &fact.id),
             MemoryEdgeKind::Fixes,
             1.0,
             1_001,
+            None,
         )?;
 
         let answer = engine.query(
@@ -1429,6 +1568,214 @@ mod tests {
         );
         assert!(reconstruction.accepted_node_ids.contains(&fact.id));
         assert!(answer.evidence.iter().any(|item| item.node_id == fact.id));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_distillation_projects_typed_relation_edges() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct RelationDistiller;
+
+        impl Distiller for RelationDistiller {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                let cited_span = event.cited_span();
+                if event.text.contains("Deploy workflow steps") {
+                    return Ok(DistillOutcome::accepted(vec![DistilledMemory::add(
+                        MemoryNodeKind::Procedure,
+                        event.text.clone(),
+                        cited_span,
+                    )]));
+                }
+                let procedure = neighbors
+                    .iter()
+                    .find(|node| node.kind == MemoryNodeKind::Procedure)
+                    .expect("procedure neighbor should be available");
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op: BeliefRevisionOp::Add,
+                    node_kind: MemoryNodeKind::Fact,
+                    text: "Credential beta rotation restored the incident.".to_string(),
+                    target_node_id: None,
+                    relation_edges: vec![DistilledEdge {
+                        kind: MemoryEdgeKind::Fixes,
+                        target_node_id: procedure.id.clone(),
+                    }],
+                    cited_spans: vec![cited_span],
+                }]))
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, RelationDistiller);
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Procedure,
+            "Deploy workflow steps: restart checkout workers.",
+            1_000,
+        ))?;
+        engine.project_pending(100)?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Credential beta rotation restored deploy workflow.",
+            2_000,
+        ))?;
+        let report = engine.project_pending(100)?;
+
+        let edges = engine.store().edges_for_scope("tenant", "project", None)?;
+        let relation = edges
+            .iter()
+            .find(|edge| edge.kind == MemoryEdgeKind::Fixes)
+            .expect("typed relation edge should be projected");
+
+        assert!(relation.source_event_id.is_some());
+        assert!(report.edges_added >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn late_replay_backfills_future_add_relation_edges() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct LateRelationDistiller;
+
+        impl Distiller for LateRelationDistiller {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                let cited_span = event.cited_span();
+                if event.text.contains("future fix") {
+                    let relation_edges = neighbors
+                        .iter()
+                        .filter(|node| node.text.contains("late anchor"))
+                        .map(|node| DistilledEdge {
+                            kind: MemoryEdgeKind::Fixes,
+                            target_node_id: node.id.clone(),
+                        })
+                        .collect();
+                    return Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                        op: BeliefRevisionOp::Add,
+                        node_kind: MemoryNodeKind::Fact,
+                        text: "Future fix references late anchor.".to_string(),
+                        target_node_id: None,
+                        relation_edges,
+                        cited_spans: vec![cited_span],
+                    }]));
+                }
+                Ok(DistillOutcome::accepted(vec![DistilledMemory::add(
+                    MemoryNodeKind::Fact,
+                    event.text.clone(),
+                    cited_span,
+                )]))
+            }
+
+            fn supports_late_replay(&self) -> bool {
+                true
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, LateRelationDistiller);
+        engine.ingest_event(&event_at(MemoryNodeKind::Fact, "future fix event", 2_000))?;
+        let first = engine.project_pending(100)?;
+        engine.ingest_event(&event_at(MemoryNodeKind::Fact, "late anchor event", 1_000))?;
+        let late = engine.project_pending(100)?;
+
+        let edges = engine.store().edges_for_scope("tenant", "project", None)?;
+        let relation = edges
+            .iter()
+            .find(|edge| edge.kind == MemoryEdgeKind::Fixes)
+            .expect("late replay should backfill relation edge");
+
+        assert_eq!(first.edges_added, 0);
+        assert!(late.edges_added >= 1);
+        assert!(relation.source_event_id.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn known_at_reads_traverse_sourced_ordinary_edges() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Incident alpha blocked deploys.",
+            1_000,
+        ))?;
+        engine.project_pending(100)?;
+        engine.ingest_event(&event_at_ingested(
+            MemoryNodeKind::Fact,
+            "Credential beta rotation restored service.",
+            1_100,
+            1_100,
+        ))?;
+        engine.project_pending(100)?;
+        let edge_event = event_at_ingested(
+            MemoryNodeKind::Fact,
+            "Credential beta rotation was linked to incident alpha.",
+            2_000,
+            3_000,
+        );
+        engine.store().append_event(&edge_event)?;
+
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let source = nodes
+            .iter()
+            .find(|node| {
+                node.kind == MemoryNodeKind::Fact && node.text == "Incident alpha blocked deploys."
+            })
+            .expect("source fact exists");
+        let target = nodes
+            .iter()
+            .find(|node| {
+                node.kind == MemoryNodeKind::Fact
+                    && node.text == "Credential beta rotation restored service."
+            })
+            .expect("target fact exists");
+        let edge_event_id: i64 = engine.store().connection().query_row(
+            "SELECT id FROM ledger_events WHERE trace_id = ?1",
+            ["trace-2000"],
+            |row| row.get(0),
+        )?;
+        engine.store().insert_edge_with_source_event(
+            StoreScope::new("tenant", "project", None),
+            (&source.id, &target.id),
+            MemoryEdgeKind::Fixes,
+            1.0,
+            2_000,
+            Some(edge_event_id),
+        )?;
+
+        let before_known = engine.query(
+            &MemoryQuery::new(
+                "incident alpha chain",
+                MemoryScope::new("tenant", "project")
+                    .as_of_unix_ms(2_500)
+                    .known_at_unix_ms(2_500),
+            )
+            .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+        let after_known = engine.query(
+            &MemoryQuery::new(
+                "incident alpha chain",
+                MemoryScope::new("tenant", "project")
+                    .as_of_unix_ms(2_500)
+                    .known_at_unix_ms(3_500),
+            )
+            .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+
+        assert!(
+            !before_known
+                .evidence
+                .iter()
+                .any(|item| item.node_id == target.id)
+        );
+        assert!(
+            after_known
+                .evidence
+                .iter()
+                .any(|item| item.node_id == target.id)
+        );
         Ok(())
     }
 
@@ -2140,6 +2487,7 @@ mod tests {
                     node_kind: MemoryNodeKind::AntiMemory,
                     text: "Do not use the stale checkout token.".to_string(),
                     target_node_id: None,
+                    relation_edges: Vec::new(),
                     cited_spans: vec![event.cited_span()],
                 }]))
             }
@@ -2426,6 +2774,7 @@ mod tests {
             node_kind: MemoryNodeKind::Fact,
             text: "Do not use checkout token.".to_string(),
             target_node_id: None,
+            relation_edges: Vec::new(),
             cited_spans: vec![current_event.cited_span()],
         };
         store.put_distillation_batch(
@@ -2789,6 +3138,7 @@ mod tests {
                     node_kind: MemoryNodeKind::Fact,
                     text: event.text.clone(),
                     target_node_id,
+                    relation_edges: Vec::new(),
                     cited_spans: vec![event.cited_span()],
                 }]))
             }
@@ -2910,6 +3260,7 @@ mod tests {
                     node_kind: MemoryNodeKind::Fact,
                     text: event.text.clone(),
                     target_node_id,
+                    relation_edges: Vec::new(),
                     cited_spans: vec![event.cited_span()],
                 }]))
             }
@@ -2985,6 +3336,7 @@ mod tests {
                     node_kind: MemoryNodeKind::Fact,
                     text: event.text.clone(),
                     target_node_id,
+                    relation_edges: Vec::new(),
                     cited_spans: vec![event.cited_span()],
                 }]))
             }
@@ -3127,6 +3479,7 @@ mod tests {
                     node_kind: MemoryNodeKind::Fact,
                     text: event.text.clone(),
                     target_node_id,
+                    relation_edges: Vec::new(),
                     cited_spans: vec![event.cited_span()],
                 }]))
             }
@@ -3256,6 +3609,7 @@ mod tests {
                     node_kind: MemoryNodeKind::Fact,
                     text,
                     target_node_id,
+                    relation_edges: Vec::new(),
                     cited_spans: vec![event.cited_span()],
                 }]))
             }
@@ -3308,6 +3662,7 @@ mod tests {
                     node_kind: MemoryNodeKind::Fact,
                     text: "Do not use checkout token alpha; use checkout token beta.".to_string(),
                     target_node_id: None,
+                    relation_edges: Vec::new(),
                     cited_spans: vec![event.cited_span()],
                 }]))
             }
@@ -4000,23 +4355,32 @@ mod tests {
             .find(|node| node.text == target_text && node.kind == MemoryNodeKind::Fact)
             .cloned()
             .expect("target memory should exist");
-        engine.store().insert_edge(
+        engine.store().insert_edge_with_source_event(
             StoreScope::new("tenant", "project", None),
-            &source.id,
-            &target.id,
+            (&source.id, &target.id),
             MemoryEdgeKind::Fixes,
             1.0,
             edge_observed_at_unix_ms,
+            None,
         )?;
         Ok((source, target))
     }
 
     fn event_at(kind: MemoryNodeKind, text: &str, observed_at_unix_ms: i64) -> LedgerEvent {
+        event_at_ingested(kind, text, observed_at_unix_ms, observed_at_unix_ms)
+    }
+
+    fn event_at_ingested(
+        kind: MemoryNodeKind,
+        text: &str,
+        observed_at_unix_ms: i64,
+        ingested_at_unix_ms: i64,
+    ) -> LedgerEvent {
         let mut event = LedgerEvent::direct_memory_write("tenant", "project", kind, text);
         event.trace_id = format!("trace-{observed_at_unix_ms}");
         event.span_id = format!("span-{observed_at_unix_ms}");
         event.observed_at_unix_ms = observed_at_unix_ms;
-        event.ingested_at_unix_ms = observed_at_unix_ms;
+        event.ingested_at_unix_ms = ingested_at_unix_ms;
         event
     }
 

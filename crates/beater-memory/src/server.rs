@@ -2060,7 +2060,10 @@ mod tests {
 
         let err = test_config()
             .with_distiller_config(DistillerConfig::Command(
-                crate::CommandDistillationProviderConfig::new("provider").with_timeout_ms(30_000),
+                crate::CommandDistillationProviderConfig::new(
+                    std::env::current_exe().unwrap_or_else(|err| panic!("{err}")),
+                )
+                .with_timeout_ms(30_000),
             ))
             .with_db_task_timeout_ms(30_000)
             .validate()
