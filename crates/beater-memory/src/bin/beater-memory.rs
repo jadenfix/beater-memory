@@ -3,7 +3,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use beater_memory::{
     BeaterJsJournal, LedgerEvent, MaintenanceOptions, MemoryEngine, MemoryMode, MemoryNodeKind,
-    MemoryQuery, MemoryScope, MemoryServerConfig, SqliteMemoryStore, import_canonical_jsonl, serve,
+    MemoryQuery, MemoryScope, MemoryServerConfig, ReconstructionMode, ReconstructionOptions,
+    SqliteMemoryStore, import_canonical_jsonl, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -148,6 +149,12 @@ enum Command {
         fresh: bool,
         #[arg(long)]
         as_of_unix_ms: Option<i64>,
+        #[arg(long, value_enum, default_value_t = ReconstructionModeArg::Off)]
+        reconstruction_mode: ReconstructionModeArg,
+        #[arg(long, default_value_t = 4)]
+        max_reconstruction_steps: u8,
+        #[arg(long, default_value_t = 2_000)]
+        max_reconstruction_tokens: u32,
         #[arg(long, value_delimiter = ',')]
         modes: Vec<ModeArg>,
         #[arg(long)]
@@ -200,6 +207,23 @@ impl From<ModeArg> for MemoryMode {
             ModeArg::Procedural => Self::Procedural,
             ModeArg::Gotcha => Self::Gotcha,
             ModeArg::State => Self::State,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReconstructionModeArg {
+    Off,
+    Auto,
+    Force,
+}
+
+impl From<ReconstructionModeArg> for ReconstructionMode {
+    fn from(value: ReconstructionModeArg) -> Self {
+        match value {
+            ReconstructionModeArg::Off => Self::Off,
+            ReconstructionModeArg::Auto => Self::Auto,
+            ReconstructionModeArg::Force => Self::Force,
         }
     }
 }
@@ -448,6 +472,9 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             fresh,
             as_of_unix_ms,
+            reconstruction_mode,
+            max_reconstruction_steps,
+            max_reconstruction_tokens,
             modes,
             json,
             question,
@@ -461,7 +488,13 @@ async fn main() -> anyhow::Result<()> {
             if let Some(as_of_unix_ms) = as_of_unix_ms {
                 scope = scope.as_of_unix_ms(as_of_unix_ms);
             }
-            let mut query = MemoryQuery::new(question, scope).with_max_tokens(max_tokens);
+            let mut query = MemoryQuery::new(question, scope)
+                .with_max_tokens(max_tokens)
+                .with_reconstruction(ReconstructionOptions {
+                    mode: reconstruction_mode.into(),
+                    max_steps: max_reconstruction_steps,
+                    max_tokens: max_reconstruction_tokens,
+                });
             if fresh {
                 query = query.requiring_fresh();
             }

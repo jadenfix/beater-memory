@@ -24,7 +24,10 @@ use tokio::time::{Duration, timeout};
 use crate::{
     MemoryEngine, ProjectReport,
     error::{MemoryError, MemoryResult},
-    model::{MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope},
+    model::{
+        MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, ReconstructionMode,
+        ReconstructionOptions,
+    },
     store::{
         AuditEvent, AuditRecord, LedgerEvent, MaintenanceOptions, MaintenanceReport, StoreHealth,
         StoreStats,
@@ -206,6 +209,9 @@ pub struct QueryHttpRequest {
     pub max_tokens: Option<u32>,
     pub require_fresh: Option<bool>,
     pub modes: Option<Vec<MemoryMode>>,
+    pub reconstruction_mode: Option<ReconstructionMode>,
+    pub max_reconstruction_steps: Option<u8>,
+    pub max_reconstruction_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -819,6 +825,10 @@ async fn query(
 ) -> Result<Json<MemoryAnswer>, ApiError> {
     let ctx = begin_request(&state, &headers, "query", "/v1/query").await?;
     let max_tokens = request.max_tokens.unwrap_or(1_200);
+    let reconstruction_mode = request.reconstruction_mode.unwrap_or_default();
+    let max_reconstruction_tokens = request
+        .max_reconstruction_tokens
+        .unwrap_or_else(|| 2_000.min(state.config.max_query_tokens));
     if max_tokens > state.config.max_query_tokens {
         return fail_request(
             &state,
@@ -830,9 +840,26 @@ async fn query(
         )
         .await;
     }
+    if max_reconstruction_tokens > state.config.max_query_tokens {
+        return fail_request(
+            &state,
+            &ctx,
+            ApiError::bad_request(format!(
+                "max_reconstruction_tokens {max_reconstruction_tokens} exceeds configured max {}",
+                state.config.max_query_tokens
+            )),
+        )
+        .await;
+    }
     let tenant_id = request.scope.tenant_id.clone();
     let project_id = request.scope.project_id.clone();
-    let mut query = MemoryQuery::new(request.question, request.scope).with_max_tokens(max_tokens);
+    let mut query = MemoryQuery::new(request.question, request.scope)
+        .with_max_tokens(max_tokens)
+        .with_reconstruction(ReconstructionOptions {
+            mode: reconstruction_mode,
+            max_steps: request.max_reconstruction_steps.unwrap_or(4),
+            max_tokens: max_reconstruction_tokens,
+        });
     if request.require_fresh.unwrap_or(false) {
         query = query.requiring_fresh();
     }
@@ -842,18 +869,24 @@ async fn query(
     if let Err(err) = query.validate() {
         return fail_request(&state, &ctx, ApiError::from(err)).await;
     }
-    let result = with_engine(state.clone(), move |engine| engine.query(&query)).await;
-    finish_request(
-        state,
-        ctx,
-        result,
-        serde_json::json!({
-            "tenant_id": tenant_id,
-            "project_id": project_id,
-            "max_tokens": max_tokens
-        }),
-    )
-    .await
+    let reconstruction_mode = query.reconstruction.mode.as_str();
+    let max_reconstruction_steps = query.reconstruction.max_steps;
+    let max_reconstruction_tokens = query.reconstruction.max_tokens;
+    let result = run_db_task(state.clone(), move |engine| engine.query(&query)).await;
+    let audit_reconstruction = result
+        .as_ref()
+        .ok()
+        .and_then(|answer| answer.reconstruction.as_ref());
+    let success_detail = serde_json::json!({
+        "tenant_id": tenant_id,
+        "project_id": project_id,
+        "max_tokens": max_tokens,
+        "reconstruction_mode": reconstruction_mode,
+        "max_reconstruction_steps": max_reconstruction_steps,
+        "max_reconstruction_tokens": max_reconstruction_tokens,
+        "reconstruction": audit_reconstruction
+    });
+    finish_request(state, ctx, result.map(Json), success_detail).await
 }
 
 async fn maintenance(
@@ -1791,6 +1824,83 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn query_reconstruction_limit_defaults_under_server_cap() {
+        let app = memory_router(
+            test_config()
+                .with_bearer_token("secret")
+                .with_limits(4096, 10, 1_000),
+        );
+        let query = serde_json::json!({
+            "question": "anything",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "max_tokens": 900
+        });
+
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query = serde_json::json!({
+            "question": "anything",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "max_tokens": 900,
+            "max_reconstruction_tokens": 1_001
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn query_audit_records_reconstruction_detail() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let query = serde_json::json!({
+            "question": "anything",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "max_tokens": 900,
+            "reconstruction_mode": "force",
+            "max_reconstruction_steps": 2,
+            "max_reconstruction_tokens": 500
+        });
+
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get_request("/v1/audit?limit=10"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let audit: AuditHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        let query_event = audit
+            .events
+            .iter()
+            .find(|event| event.action == "query")
+            .expect("query audit event should exist");
+
+        assert_eq!(query_event.detail["reconstruction_mode"], "force");
+        assert_eq!(query_event.detail["max_reconstruction_steps"], 2);
+        assert_eq!(query_event.detail["max_reconstruction_tokens"], 500);
+        assert_eq!(query_event.detail["reconstruction"]["reason"], "forced");
     }
 
     #[tokio::test]

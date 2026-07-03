@@ -46,6 +46,96 @@ pub enum MemoryTier {
     ActiveReconstruction,
 }
 
+/// Read-time active reconstruction policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionMode {
+    #[default]
+    Off,
+    Auto,
+    Force,
+}
+
+impl ReconstructionMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Force => "force",
+        }
+    }
+}
+
+/// Why a query did or did not escalate into active reconstruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionReason {
+    Forced,
+    EmptyEvidence,
+    LowConfidence,
+    AmbiguousEvidence,
+    CompositionalQuery,
+}
+
+/// Query-time bounds for active reconstruction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconstructionOptions {
+    #[serde(default)]
+    pub mode: ReconstructionMode,
+    #[serde(default = "default_reconstruction_max_steps")]
+    pub max_steps: u8,
+    #[serde(default = "default_reconstruction_max_tokens")]
+    pub max_tokens: u32,
+}
+
+const fn default_reconstruction_max_steps() -> u8 {
+    4
+}
+
+const fn default_reconstruction_max_tokens() -> u32 {
+    2_000
+}
+
+impl Default for ReconstructionOptions {
+    fn default() -> Self {
+        Self {
+            mode: ReconstructionMode::Off,
+            max_steps: default_reconstruction_max_steps(),
+            max_tokens: default_reconstruction_max_tokens(),
+        }
+    }
+}
+
+impl ReconstructionOptions {
+    #[must_use]
+    pub fn off() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn force() -> Self {
+        Self {
+            mode: ReconstructionMode::Force,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> MemoryResult<()> {
+        if self.max_steps == 0 {
+            return Err(MemoryError::invalid(
+                "max_reconstruction_steps must be greater than 0",
+            ));
+        }
+        if self.max_tokens == 0 {
+            return Err(MemoryError::invalid(
+                "max_reconstruction_tokens must be greater than 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Typed memory node families in the projection graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -269,6 +359,8 @@ pub struct MemoryQuery {
     pub max_tokens: u32,
     pub require_fresh: bool,
     pub modes: Vec<MemoryMode>,
+    #[serde(default, skip_serializing_if = "is_default_reconstruction_options")]
+    pub reconstruction: ReconstructionOptions,
 }
 
 impl MemoryQuery {
@@ -280,6 +372,7 @@ impl MemoryQuery {
             max_tokens: 1_200,
             require_fresh: false,
             modes: MemoryNodeKind::default_modes(),
+            reconstruction: ReconstructionOptions::default(),
         }
     }
 
@@ -302,6 +395,12 @@ impl MemoryQuery {
     }
 
     #[must_use]
+    pub fn with_reconstruction(mut self, reconstruction: ReconstructionOptions) -> Self {
+        self.reconstruction = reconstruction;
+        self
+    }
+
+    #[must_use]
     pub fn accepts_kind(&self, kind: MemoryNodeKind) -> bool {
         self.modes.iter().any(|mode| mode.accepts(kind))
     }
@@ -315,6 +414,7 @@ impl MemoryQuery {
         if self.modes.is_empty() {
             return Err(MemoryError::invalid("modes must not be empty"));
         }
+        self.reconstruction.validate()?;
         Ok(())
     }
 }
@@ -337,6 +437,10 @@ fn validate_required_text(field: &str, value: &str) -> MemoryResult<()> {
     } else {
         Ok(())
     }
+}
+
+fn is_default_reconstruction_options(options: &ReconstructionOptions) -> bool {
+    options == &ReconstructionOptions::default()
 }
 
 /// Span provenance for a returned memory.
@@ -418,6 +522,18 @@ pub struct StaleAssumption {
     pub invalidated_at_unix_ms: Option<i64>,
 }
 
+/// Diagnostic report for a bounded active reconstruction pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconstructionReport {
+    pub mode: ReconstructionMode,
+    pub reason: ReconstructionReason,
+    pub steps_used: u8,
+    pub tokens_spent: u32,
+    pub expanded_node_ids: Vec<String>,
+    pub accepted_node_ids: Vec<String>,
+    pub pruned_node_ids: Vec<String>,
+}
+
 /// Answer returned by the memory engine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryAnswer {
@@ -429,6 +545,8 @@ pub struct MemoryAnswer {
     pub suggested_next_queries: Vec<String>,
     pub token_estimate: u32,
     pub tier_used: MemoryTier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruction: Option<ReconstructionReport>,
 }
 
 impl MemoryAnswer {
@@ -443,6 +561,7 @@ impl MemoryAnswer {
             suggested_next_queries: Vec::new(),
             token_estimate: 0,
             tier_used,
+            reconstruction: None,
         }
     }
 }
@@ -579,7 +698,64 @@ mod tests {
         assert!(query.modes.contains(&MemoryMode::Semantic));
         assert!(query.modes.contains(&MemoryMode::Gotcha));
         assert!(!query.require_fresh);
+        assert_eq!(query.reconstruction, ReconstructionOptions::default());
         query.validate().unwrap_or_else(|err| panic!("{err}"));
+    }
+
+    #[test]
+    fn query_deserialization_defaults_reconstruction_options() {
+        let query: MemoryQuery = serde_json::from_value(serde_json::json!({
+            "question": "what changed?",
+            "scope": {
+                "tenant_id": "tenant",
+                "project_id": "project",
+                "environment_id": null,
+                "as_of_unix_ms": null
+            },
+            "max_tokens": 1200,
+            "require_fresh": false,
+            "modes": ["semantic"]
+        }))
+        .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(query.reconstruction, ReconstructionOptions::default());
+
+        let query: MemoryQuery = serde_json::from_value(serde_json::json!({
+            "question": "what changed?",
+            "scope": {
+                "tenant_id": "tenant",
+                "project_id": "project",
+                "environment_id": null,
+                "as_of_unix_ms": null
+            },
+            "max_tokens": 1200,
+            "require_fresh": false,
+            "modes": ["semantic"],
+            "reconstruction": { "mode": "auto" }
+        }))
+        .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(query.reconstruction.mode, ReconstructionMode::Auto);
+        assert_eq!(query.reconstruction.max_steps, 4);
+        assert_eq!(query.reconstruction.max_tokens, 2_000);
+    }
+
+    #[test]
+    fn query_serialization_omits_default_reconstruction_options() {
+        let query = MemoryQuery::new("what changed?", MemoryScope::new("tenant", "project"));
+
+        let value = serde_json::to_value(query).unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(value.get("reconstruction").is_none());
+    }
+
+    #[test]
+    fn answer_serialization_omits_empty_reconstruction_report() {
+        let answer = MemoryAnswer::empty(MemoryTier::Activation);
+
+        let value = serde_json::to_value(answer).unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(value.get("reconstruction").is_none());
     }
 
     #[test]

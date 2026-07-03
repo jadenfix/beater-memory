@@ -55,7 +55,11 @@ edges are projections that can be rebuilt.
    - `as_of_unix_ms` is a validity boundary: future memories and facts
      invalidated by that time are excluded from evidence, while contradiction
      edges still surface stale assumptions when the newer fact is visible
-   - Tier 2: reserved API slot for budgeted active reconstruction
+   - Tier 2: optional active reconstruction that escalates forced queries and
+     hard auto queries into bounded graph expansion through an
+     `ActiveReconstructor` policy. The default policy is deterministic and
+     provider-neutral; future model-backed providers must return validated
+     accept/prune/stop decisions under the same step and token budgets.
    - Return type: `MemoryAnswer`, not raw chunks.
 
 5. **Service API**
@@ -159,6 +163,9 @@ cargo run -p beater-memory -- remember --tenant local --project demo --kind gotc
   "Checkout fails when DATABASE_URL is missing. Fix by setting DATABASE_URL."
 cargo run -p beater-memory -- query --tenant local --project demo \
   "How do I fix checkout database failures?"
+cargo run -p beater-memory -- query --tenant local --project demo \
+  --reconstruction-mode auto \
+  "why did checkout database failures recover?"
 cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance
 cargo run -p beater-memory -- maintenance --repair-orphans
