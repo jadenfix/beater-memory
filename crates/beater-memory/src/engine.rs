@@ -1,5 +1,8 @@
 use crate::{
-    distill::{DistillMetrics, DistillOutcome, Distiller, HeuristicDistiller},
+    distill::{
+        DistillMetrics, DistillOutcome, Distiller, DistillerConfig, HeuristicDistiller,
+        RuntimeDistiller,
+    },
     error::{MemoryError, MemoryResult},
     graph::answer_query,
     model::{
@@ -82,6 +85,25 @@ impl MemoryEngine<HeuristicDistiller, DeterministicReconstructor> {
         Ok(Self::new(
             SqliteMemoryStore::in_memory()?,
             HeuristicDistiller::default(),
+        ))
+    }
+}
+
+impl MemoryEngine<RuntimeDistiller, DeterministicReconstructor> {
+    pub fn open_with_distiller_config(
+        path: impl AsRef<std::path::Path>,
+        distiller: DistillerConfig,
+    ) -> MemoryResult<Self> {
+        Ok(Self::new(
+            SqliteMemoryStore::open(path)?,
+            distiller.build()?,
+        ))
+    }
+
+    pub fn in_memory_with_distiller_config(distiller: DistillerConfig) -> MemoryResult<Self> {
+        Ok(Self::new(
+            SqliteMemoryStore::in_memory()?,
+            distiller.build()?,
         ))
     }
 }
@@ -232,6 +254,11 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         }
         if max_events.is_some_and(|max_events| max_events == 0) {
             return Err(MemoryError::invalid("max_events must be greater than 0"));
+        }
+        if !self.distiller.supports_projection_rebuild() {
+            return Err(MemoryError::invalid(
+                "projection rebuild requires a replay-safe distiller",
+            ));
         }
         let reset = self.store.reset_projection()?;
         let mut project = ProjectReport::default();
@@ -435,9 +462,9 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             ))
         })?;
         let cited_span = event.cited_span();
-        if !memory.cited_spans.iter().any(|span| span == &cited_span) {
+        if memory.cited_spans.iter().any(|span| span != &cited_span) {
             return Err(MemoryError::invalid(format!(
-                "invalid {context} for event trace_id={} span_id={} seq={}: cited_spans must include the projected event",
+                "invalid {context} for event trace_id={} span_id={} seq={}: cited_spans must only reference the projected event",
                 event.trace_id, event.span_id, event.seq
             )));
         }
@@ -1720,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_distiller_skips_late_replay_to_preserve_rebuild_convergence() -> MemoryResult<()> {
+    fn provider_distiller_skips_late_replay_and_rejects_rebuild() -> MemoryResult<()> {
         let engine = MemoryEngine::new(
             SqliteMemoryStore::in_memory()?,
             ProviderDistiller::new(EchoAddProvider),
@@ -1754,7 +1781,8 @@ mod tests {
             &MemoryQuery::new("late checkout token", MemoryScope::new("tenant", "project"))
                 .with_modes(vec![MemoryMode::Semantic]),
         )?;
-        engine.rebuild_projection(100, None)?;
+        let err = engine.rebuild_projection(100, None).unwrap_err();
+        assert!(err.to_string().contains("replay-safe distiller"));
         let rebuilt = engine.query(
             &MemoryQuery::new("late checkout token", MemoryScope::new("tenant", "project"))
                 .with_modes(vec![MemoryMode::Semantic]),
@@ -1765,8 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_projection_reports_incomplete_when_provider_rejects_pending_event()
-    -> MemoryResult<()> {
+    fn rebuild_projection_rejects_provider_distiller_before_reset() -> MemoryResult<()> {
         let engine = MemoryEngine::new(
             SqliteMemoryStore::in_memory()?,
             ProviderDistiller::new(FakeProvider {
@@ -1780,14 +1807,16 @@ mod tests {
             MemoryNodeKind::Fact,
             "Checkout uses DATABASE_URL.",
         ))?;
+        let before = engine.store().stats()?;
 
-        let report = engine.rebuild_projection(10, None)?;
+        let err = engine.rebuild_projection(10, None).unwrap_err();
+        let after = engine.store().stats()?;
 
-        assert!(!report.completed);
-        assert_eq!(report.project.events_seen, 1);
-        assert_eq!(report.project.events_projected, 0);
-        assert_eq!(report.project.events_skipped, 1);
-        assert_eq!(engine.store().stats()?.pending_events, 1);
+        assert!(err.to_string().contains("replay-safe distiller"));
+        assert_eq!(after.ledger_events, before.ledger_events);
+        assert_eq!(after.pending_events, before.pending_events);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.edges, before.edges);
         Ok(())
     }
 
@@ -1969,6 +1998,10 @@ mod tests {
                     target_node_id,
                     cited_spans: vec![event.cited_span()],
                 }]))
+            }
+
+            fn supports_projection_rebuild(&self) -> bool {
+                true
             }
         }
 
@@ -2166,6 +2199,10 @@ mod tests {
             fn supports_late_replay(&self) -> bool {
                 true
             }
+
+            fn supports_projection_rebuild(&self) -> bool {
+                true
+            }
         }
 
         let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, UpdateCheckoutApi);
@@ -2299,6 +2336,10 @@ mod tests {
                     target_node_id,
                     cited_spans: vec![event.cited_span()],
                 }]))
+            }
+
+            fn supports_projection_rebuild(&self) -> bool {
+                true
             }
         }
 

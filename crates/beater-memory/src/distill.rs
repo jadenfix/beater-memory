@@ -5,7 +5,17 @@ use crate::{
     text::{concise, overlap_score},
 };
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::{
+    io::Write,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+const DEFAULT_COMMAND_PROVIDER_TIMEOUT_MS: u64 = 25_000;
 
 /// Offline/sleep-time distillation boundary.
 ///
@@ -19,6 +29,10 @@ pub trait Distiller {
     ) -> MemoryResult<DistillOutcome>;
 
     fn supports_late_replay(&self) -> bool {
+        false
+    }
+
+    fn supports_projection_rebuild(&self) -> bool {
         false
     }
 }
@@ -90,6 +104,275 @@ pub struct DistillationRepairPrompt<'a> {
     pub neighbors: &'a [MemoryNode],
     pub raw_output: &'a str,
     pub error: &'a str,
+}
+
+/// Runtime distiller selection used by CLI/server entrypoints.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DistillerConfig {
+    #[default]
+    Heuristic,
+    Command(CommandDistillationProviderConfig),
+}
+
+impl DistillerConfig {
+    #[must_use]
+    pub fn command(command: impl Into<PathBuf>) -> Self {
+        Self::Command(CommandDistillationProviderConfig::new(command))
+    }
+
+    pub fn validate(&self) -> MemoryResult<()> {
+        match self {
+            Self::Heuristic => Ok(()),
+            Self::Command(config) => config.validate(),
+        }
+    }
+
+    pub fn build(&self) -> MemoryResult<RuntimeDistiller> {
+        self.validate()?;
+        Ok(match self {
+            Self::Heuristic => RuntimeDistiller::Heuristic(HeuristicDistiller::default()),
+            Self::Command(config) => RuntimeDistiller::Command(
+                ProviderDistiller::new(CommandDistillationProvider::new(config.clone()))
+                    .with_max_repairs(config.max_repairs),
+            ),
+        })
+    }
+}
+
+/// Command provider configuration.
+///
+/// The command receives a JSON request on stdin and must write provider JSON on
+/// stdout. The same command is used for repair requests with `request:
+/// "repair"` and the original malformed output/error included.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandDistillationProviderConfig {
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_command_provider_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_command_provider_max_repairs")]
+    pub max_repairs: usize,
+}
+
+impl CommandDistillationProviderConfig {
+    #[must_use]
+    pub fn new(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+            timeout_ms: DEFAULT_COMMAND_PROVIDER_TIMEOUT_MS,
+            max_repairs: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_repairs(mut self, max_repairs: usize) -> Self {
+        self.max_repairs = max_repairs;
+        self
+    }
+
+    pub fn validate(&self) -> MemoryResult<()> {
+        if self.command.as_os_str().is_empty() {
+            return Err(MemoryError::invalid(
+                "distillation command must not be empty",
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(MemoryError::invalid(
+                "distillation command timeout_ms must be greater than 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_command_provider_timeout_ms() -> u64 {
+    DEFAULT_COMMAND_PROVIDER_TIMEOUT_MS
+}
+
+fn default_command_provider_max_repairs() -> usize {
+    1
+}
+
+/// Runtime distiller used when user-facing entrypoints select a distiller.
+#[derive(Clone, Debug)]
+pub enum RuntimeDistiller {
+    Heuristic(HeuristicDistiller),
+    Command(ProviderDistiller<CommandDistillationProvider>),
+}
+
+impl Distiller for RuntimeDistiller {
+    fn distill(
+        &self,
+        event: &LedgerEvent,
+        neighbors: &[MemoryNode],
+    ) -> MemoryResult<DistillOutcome> {
+        match self {
+            Self::Heuristic(distiller) => distiller.distill(event, neighbors),
+            Self::Command(distiller) => distiller.distill(event, neighbors),
+        }
+    }
+
+    fn supports_late_replay(&self) -> bool {
+        match self {
+            Self::Heuristic(distiller) => distiller.supports_late_replay(),
+            Self::Command(distiller) => distiller.supports_late_replay(),
+        }
+    }
+
+    fn supports_projection_rebuild(&self) -> bool {
+        match self {
+            Self::Heuristic(distiller) => distiller.supports_projection_rebuild(),
+            Self::Command(distiller) => distiller.supports_projection_rebuild(),
+        }
+    }
+}
+
+/// Provider adapter that delegates distillation JSON generation to a command.
+#[derive(Clone, Debug)]
+pub struct CommandDistillationProvider {
+    config: CommandDistillationProviderConfig,
+}
+
+impl CommandDistillationProvider {
+    #[must_use]
+    pub fn new(config: CommandDistillationProviderConfig) -> Self {
+        Self { config }
+    }
+
+    fn run(&self, request: CommandDistillationRequest<'_>) -> MemoryResult<String> {
+        self.config.validate()?;
+        let input = serde_json::to_vec(&request)?;
+        let mut command = Command::new(&self.config.command);
+        command
+            .args(&self.config.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|err| {
+            MemoryError::invalid(format!(
+                "failed to start distillation command {:?}: {err}",
+                self.config.command
+            ))
+        })?;
+        let Some(mut stdin) = child.stdin.take() else {
+            terminate_child(&mut child);
+            let _ = child.wait();
+            return Err(MemoryError::invalid(
+                "distillation command stdin was unavailable",
+            ));
+        };
+
+        let deadline = Instant::now() + Duration::from_millis(self.config.timeout_ms);
+        let writer = thread::spawn(move || -> MemoryResult<()> {
+            stdin.write_all(&input)?;
+            drop(stdin);
+            Ok(())
+        });
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let output = child.wait_with_output()?;
+                    let write_result = writer.join().map_err(|_| {
+                        MemoryError::invalid("distillation command stdin writer panicked")
+                    })?;
+                    if !status.success() {
+                        return Err(MemoryError::invalid(format!(
+                            "distillation command exited with status {status}: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        )));
+                    }
+                    write_result?;
+                    return String::from_utf8(output.stdout).map_err(|err| {
+                        MemoryError::invalid(format!("provider output is not UTF-8: {err}"))
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    terminate_child(&mut child);
+                    let _ = child.wait();
+                    let _ = writer.join();
+                    return Err(err.into());
+                }
+            }
+            if Instant::now() >= deadline {
+                terminate_child(&mut child);
+                let _ = child.wait();
+                let _ = writer.join();
+                return Err(MemoryError::invalid(format!(
+                    "distillation command exceeded timeout_ms {}",
+                    self.config.timeout_ms
+                )));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+impl DistillationProvider for CommandDistillationProvider {
+    fn distill(&self, prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+        self.run(CommandDistillationRequest {
+            request: "distill",
+            event: prompt.event,
+            neighbors: prompt.neighbors,
+            raw_output: None,
+            error: None,
+        })
+    }
+
+    fn repair(&self, prompt: DistillationRepairPrompt<'_>) -> MemoryResult<String> {
+        self.run(CommandDistillationRequest {
+            request: "repair",
+            event: prompt.event,
+            neighbors: prompt.neighbors,
+            raw_output: Some(prompt.raw_output),
+            error: Some(prompt.error),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct CommandDistillationRequest<'a> {
+    request: &'static str,
+    event: &'a LedgerEvent,
+    neighbors: &'a [MemoryNode],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_output: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
 }
 
 /// Provider-backed distiller with schema validation and bounded repair.
@@ -181,6 +464,10 @@ impl Distiller for HeuristicDistiller {
     fn supports_late_replay(&self) -> bool {
         true
     }
+
+    fn supports_projection_rebuild(&self) -> bool {
+        true
+    }
 }
 
 impl<P: DistillationProvider> Distiller for ProviderDistiller<P> {
@@ -255,6 +542,10 @@ impl<P: DistillationProvider> Distiller for ProviderDistiller<P> {
                 }
             }
         }
+    }
+
+    fn supports_projection_rebuild(&self) -> bool {
+        false
     }
 }
 
@@ -535,6 +826,49 @@ mod tests {
                 .clone()
                 .ok_or_else(|| MemoryError::invalid("repair unavailable"))
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_provider_timeout_covers_blocked_stdin() {
+        let text = "x".repeat(2 * 1024 * 1024);
+        let event = event(MemoryNodeKind::Fact, &text);
+        let provider = CommandDistillationProvider::new(
+            CommandDistillationProviderConfig::new("sh")
+                .with_args(["-c", "sleep 2"])
+                .with_timeout_ms(50),
+        );
+        let started = Instant::now();
+
+        let err = provider
+            .distill(DistillationPrompt {
+                event: &event,
+                neighbors: &[],
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timeout_ms"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_provider_rejects_non_utf8_output() {
+        let event = event(MemoryNodeKind::Fact, "Checkout uses DATABASE_URL.");
+        let provider = CommandDistillationProvider::new(
+            CommandDistillationProviderConfig::new("sh")
+                .with_args(["-c", "cat >/dev/null; printf '\\377'"])
+                .with_timeout_ms(1_000),
+        );
+
+        let err = provider
+            .distill(DistillationPrompt {
+                event: &event,
+                neighbors: &[],
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("UTF-8"));
     }
 
     fn provider_json(event: &LedgerEvent, text: &str) -> String {

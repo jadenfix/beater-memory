@@ -18,8 +18,9 @@ mod store;
 mod text;
 
 pub use distill::{
-    DistillMetrics, DistillOutcome, DistillationPrompt, DistillationProvider,
-    DistillationRepairPrompt, Distiller, HeuristicDistiller, ProviderDistiller,
+    CommandDistillationProvider, CommandDistillationProviderConfig, DistillMetrics, DistillOutcome,
+    DistillationPrompt, DistillationProvider, DistillationRepairPrompt, Distiller, DistillerConfig,
+    HeuristicDistiller, ProviderDistiller, RuntimeDistiller,
 };
 pub use engine::{MemoryEngine, ProjectReport, ProjectionRebuildReport};
 pub use error::{MemoryError, MemoryResult};

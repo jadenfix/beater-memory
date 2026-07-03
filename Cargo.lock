@@ -139,6 +139,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

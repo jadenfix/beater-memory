@@ -9,17 +9,24 @@ cargo build -p beater-memory
 TMP_DIR="$(mktemp -d)"
 SERVER_PID=""
 
-cleanup() {
+stop_server() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  SERVER_PID=""
+}
+
+cleanup() {
+  stop_server
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
 BIN="$ROOT/target/debug/beater-memory"
 DB="$TMP_DIR/memory.db"
+PROVIDER_DB="$TMP_DIR/provider-memory.db"
+PROVIDER_HTTP_DB="$TMP_DIR/provider-http-memory.db"
 TOKEN="e2e-secret"
 PORT=""
 BASE_URL=""
@@ -55,12 +62,19 @@ PY
 }
 
 start_server() {
+  local server_db="${1:-$DB}"
+  shift || true
   local attempt
   for attempt in $(seq 1 10); do
     PORT="$(allocate_port)"
     BASE_URL="http://127.0.0.1:$PORT"
     : > "$TMP_DIR/server.log"
-    BEATER_MEMORY_TOKEN="$TOKEN" "$BIN" --db "$DB" serve --bind "127.0.0.1:$PORT" \
+    local -a command=("$BIN" "--db" "$server_db")
+    if (($# > 0)); then
+      command+=("$@")
+    fi
+    command+=("serve" "--bind" "127.0.0.1:$PORT")
+    BEATER_MEMORY_TOKEN="$TOKEN" "${command[@]}" \
       > "$TMP_DIR/server.log" 2>&1 &
     SERVER_PID="$!"
 
@@ -105,6 +119,39 @@ api_post() {
     "$BASE_URL$path"
 }
 
+PROVIDER="$TMP_DIR/provider-distiller.py"
+cat > "$PROVIDER" <<'PY'
+#!/usr/bin/env python3
+import json
+import sys
+
+request = json.load(sys.stdin)
+event = request["event"]
+span = {
+    "tenant_id": event["tenant_id"],
+    "project_id": event["project_id"],
+    "trace_id": event["trace_id"],
+    "span_id": event["span_id"],
+    "seq": event["seq"],
+}
+kind = event.get("name", "fact")
+if kind not in {"episode", "fact", "procedure", "state", "gotcha", "anti_memory", "topic"}:
+    kind = "fact"
+text = "Provider distilled: " + event["text"]
+print(json.dumps({
+    "memories": [
+        {
+            "op": "add",
+            "node_kind": kind,
+            "text": text,
+            "target_node_id": None,
+            "cited_spans": [span],
+        }
+    ]
+}))
+PY
+chmod +x "$PROVIDER"
+
 "$BIN" --db "$DB" init > "$TMP_DIR/init.json"
 json_assert "$TMP_DIR/init.json" 'assert data["ledger_events"] == 0'
 
@@ -122,6 +169,45 @@ json_assert "$TMP_DIR/stats-write-only.json" 'assert data["ledger_events"] == 1 
 json_assert "$TMP_DIR/manage-write-only.json" 'assert data["events_projected"] == 1 and data["memories_added"] >= 1'
 "$BIN" --db "$DB" stats > "$TMP_DIR/stats-managed.json"
 json_assert "$TMP_DIR/stats-managed.json" 'assert data["pending_events"] == 0 and data["nodes"] > 0'
+"$BIN" --db "$DB" --distiller provider-command stats > "$TMP_DIR/stats-lazy-distiller.json"
+json_assert "$TMP_DIR/stats-lazy-distiller.json" 'assert data["pending_events"] == 0 and data["nodes"] > 0'
+
+"$BIN" --db "$PROVIDER_DB" remember \
+  --tenant local \
+  --project provider \
+  --kind fact \
+  --no-project \
+  "Provider command CLI marker gamma." \
+  > "$TMP_DIR/provider-cli-remember.json"
+json_assert "$TMP_DIR/provider-cli-remember.json" 'assert data["events_projected"] == 0 and data["distillation_provider_calls"] == 0'
+"$BIN" --db "$PROVIDER_DB" \
+  --distiller provider-command \
+  --distiller-command "$PROVIDER" \
+  --distiller-arg --ignored-provider-flag \
+  manage --limit 10 \
+  > "$TMP_DIR/provider-cli-manage.json"
+json_assert "$TMP_DIR/provider-cli-manage.json" 'assert data["events_projected"] == 1 and data["memories_added"] == 1'
+json_assert "$TMP_DIR/provider-cli-manage.json" 'assert data["distillation_provider_calls"] == 1 and data["distillation_provider_errors"] == 0 and data["distillation_rejections"] == 0'
+"$BIN" --db "$PROVIDER_DB" query \
+  --tenant local \
+  --project provider \
+  --json \
+  "Provider command CLI marker" \
+  > "$TMP_DIR/provider-cli-query.json"
+json_assert "$TMP_DIR/provider-cli-query.json" 'assert data["evidence"] and any("Provider distilled:" in item["text"] for item in data["evidence"])'
+set +e
+"$BIN" --db "$PROVIDER_DB" \
+  --distiller provider-command \
+  --distiller-command "$PROVIDER" \
+  rebuild-projection --yes-clear-projections \
+  > "$TMP_DIR/provider-cli-rebuild.json" 2> "$TMP_DIR/provider-cli-rebuild.err"
+provider_rebuild_status=$?
+set -e
+if [ "$provider_rebuild_status" -eq 0 ]; then
+  echo "expected provider-backed rebuild to be rejected" >&2
+  exit 1
+fi
+grep -q "replay-safe distiller" "$TMP_DIR/provider-cli-rebuild.err"
 
 "$BIN" --db "$DB" remember \
   --tenant local \
@@ -530,9 +616,53 @@ def value(metric: str, labels: str) -> float:
         raise SystemExit(f"missing {metric}{{{labels}}}")
     return float(match.group(1))
 
+def plain_value(metric: str) -> float:
+    match = re.search(rf'^{re.escape(metric)} ([0-9.]+)$', text, re.M)
+    if not match:
+        raise SystemExit(f"missing {metric}")
+    return float(match.group(1))
+
 assert value("beater_memory_query_tier_requests_total", 'tier="activation"') > 0
 assert value("beater_memory_query_tier_requests_total", 'tier="active_reconstruction"') > 0
 assert value("beater_memory_query_tier_tokens_total", 'tier="activation",token_kind="answer"') > 0
+assert plain_value("beater_memory_distillation_provider_calls_total") == 0
+PY
+
+stop_server
+"$BIN" --db "$PROVIDER_HTTP_DB" init > "$TMP_DIR/provider-http-init.json"
+start_server "$PROVIDER_HTTP_DB" --distiller provider-command --distiller-command "$PROVIDER"
+json_assert "$TMP_DIR/readyz.json" 'assert data["status"] == "ok" and data["database"] == "ok"'
+
+api_post "/v1/remember" '{"tenant_id":"local","project_id":"provider-http","kind":"fact","text":"Provider command HTTP marker delta.","project":false}' \
+  > "$TMP_DIR/provider-http-remember.json"
+json_assert "$TMP_DIR/provider-http-remember.json" 'assert data["ingested"] is True and data["project"] is None'
+
+api_post "/v1/manage" '{"limit":10}' > "$TMP_DIR/provider-http-manage.json"
+json_assert "$TMP_DIR/provider-http-manage.json" 'assert data["events_projected"] == 1 and data["memories_added"] == 1'
+json_assert "$TMP_DIR/provider-http-manage.json" 'assert data["distillation_provider_calls"] == 1 and data["distillation_provider_errors"] == 0 and data["distillation_rejections"] == 0'
+
+api_post "/v1/query" '{"question":"Provider command HTTP marker","scope":{"tenant_id":"local","project_id":"provider-http","environment_id":null,"as_of_unix_ms":null},"modes":["semantic"]}' \
+  > "$TMP_DIR/provider-http-query.json"
+json_assert "$TMP_DIR/provider-http-query.json" 'assert data["evidence"] and any("Provider distilled:" in item["text"] for item in data["evidence"])'
+
+api_get "/v1/metrics" > "$TMP_DIR/provider-http-metrics.json"
+json_assert "$TMP_DIR/provider-http-metrics.json" 'assert data["manage_requests"] == 1 and data["distillation_provider_calls"] == 1 and data["distillation_rejections"] == 0'
+
+api_get "/v1/audit?limit=20" > "$TMP_DIR/provider-http-audit.json"
+json_assert "$TMP_DIR/provider-http-audit.json" 'assert any(event["action"] == "manage" and event["outcome"] == "success" and event["detail"]["project"]["distillation_provider_calls"] == 1 for event in data["events"])'
+
+api_get "/v1/metrics/prometheus" > "$TMP_DIR/provider-http-prometheus.txt"
+python3 - "$TMP_DIR/provider-http-prometheus.txt" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    text = handle.read()
+
+match = re.search(r'^beater_memory_distillation_provider_calls_total ([0-9.]+)$', text, re.M)
+if not match:
+    raise SystemExit("missing provider calls metric")
+assert float(match.group(1)) == 1
 PY
 
 echo "beater-memory e2e passed"

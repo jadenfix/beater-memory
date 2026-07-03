@@ -23,15 +23,15 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 
 use crate::{
-    MemoryEngine, ProjectReport,
+    DistillerConfig, MemoryEngine, ProjectReport, RuntimeDistiller,
     error::{MemoryError, MemoryResult},
     model::{
         MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier,
         ReconstructionMode, ReconstructionOptions, estimate_tokens,
     },
     store::{
-        AuditEvent, AuditRecord, LedgerEvent, MaintenanceOptions, MaintenanceReport, StoreHealth,
-        StoreStats,
+        AuditEvent, AuditRecord, LedgerEvent, MaintenanceOptions, MaintenanceReport,
+        SqliteMemoryStore, StoreHealth, StoreStats,
     },
     text::{now_unix_ms, stable_id},
 };
@@ -54,6 +54,7 @@ static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub struct MemoryServerConfig {
     pub db_path: PathBuf,
     pub bind_addr: SocketAddr,
+    pub distiller: DistillerConfig,
     pub bearer_token: Option<String>,
     pub max_body_bytes: usize,
     pub max_project_limit: usize,
@@ -70,6 +71,7 @@ impl MemoryServerConfig {
         Self {
             db_path: db_path.into(),
             bind_addr,
+            distiller: DistillerConfig::default(),
             bearer_token: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_project_limit: DEFAULT_MAX_PROJECT_LIMIT,
@@ -84,6 +86,12 @@ impl MemoryServerConfig {
     #[must_use]
     pub fn with_bearer_token(mut self, bearer_token: impl Into<String>) -> Self {
         self.bearer_token = Some(bearer_token.into().trim().to_string());
+        self
+    }
+
+    #[must_use]
+    pub fn with_distiller_config(mut self, distiller: DistillerConfig) -> Self {
+        self.distiller = distiller;
         self
     }
 
@@ -136,6 +144,15 @@ impl MemoryServerConfig {
             .is_some_and(|token| token.trim().is_empty())
         {
             return Err(MemoryError::invalid("bearer token must not be empty"));
+        }
+        self.distiller.validate()?;
+        if let DistillerConfig::Command(distiller) = &self.distiller
+            && self.db_task_timeout_ms > 0
+            && distiller.timeout_ms >= self.db_task_timeout_ms
+        {
+            return Err(MemoryError::invalid(
+                "distillation command timeout_ms must be less than db_task_timeout_ms",
+            ));
         }
         if self.max_body_bytes == 0 {
             return Err(MemoryError::invalid(
@@ -258,6 +275,26 @@ pub struct ServiceMetricsSnapshot {
     pub metrics_requests: u64,
     pub audit_requests: u64,
     #[serde(default)]
+    pub distillation_outputs: u64,
+    #[serde(default)]
+    pub distillation_provider_calls: u64,
+    #[serde(default)]
+    pub distillation_provider_errors: u64,
+    #[serde(default)]
+    pub distillation_schema_errors: u64,
+    #[serde(default)]
+    pub distillation_repair_attempts: u64,
+    #[serde(default)]
+    pub distillation_repair_successes: u64,
+    #[serde(default)]
+    pub distillation_rejections: u64,
+    #[serde(default)]
+    pub distillation_input_tokens: u64,
+    #[serde(default)]
+    pub distillation_output_tokens: u64,
+    #[serde(default)]
+    pub distillation_elapsed_ms: u64,
+    #[serde(default)]
     pub query_cue_seed: QueryTierMetrics,
     #[serde(default)]
     pub query_activation: QueryTierMetrics,
@@ -299,6 +336,16 @@ impl ServiceMetricsSnapshot {
             maintenance_requests: 0,
             metrics_requests: 0,
             audit_requests: 0,
+            distillation_outputs: 0,
+            distillation_provider_calls: 0,
+            distillation_provider_errors: 0,
+            distillation_schema_errors: 0,
+            distillation_repair_attempts: 0,
+            distillation_repair_successes: 0,
+            distillation_rejections: 0,
+            distillation_input_tokens: 0,
+            distillation_output_tokens: 0,
+            distillation_elapsed_ms: 0,
             query_cue_seed: QueryTierMetrics::default(),
             query_activation: QueryTierMetrics::default(),
             query_active_reconstruction: QueryTierMetrics::default(),
@@ -321,6 +368,19 @@ impl ServiceMetricsSnapshot {
             "audit" => self.audit_requests += 1,
             _ => {}
         }
+    }
+
+    fn record_project_report(&mut self, report: &ProjectReport) {
+        self.distillation_outputs += report.distillation_outputs as u64;
+        self.distillation_provider_calls += report.distillation_provider_calls as u64;
+        self.distillation_provider_errors += report.distillation_provider_errors as u64;
+        self.distillation_schema_errors += report.distillation_schema_errors as u64;
+        self.distillation_repair_attempts += report.distillation_repair_attempts as u64;
+        self.distillation_repair_successes += report.distillation_repair_successes as u64;
+        self.distillation_rejections += report.distillation_rejections as u64;
+        self.distillation_input_tokens += u64::from(report.distillation_input_tokens);
+        self.distillation_output_tokens += u64::from(report.distillation_output_tokens);
+        self.distillation_elapsed_ms += report.distillation_elapsed_ms;
     }
 
     fn record_query_answer(&mut self, answer: &MemoryAnswer, latency_ms: u64) {
@@ -804,7 +864,7 @@ async fn remember(
         .idempotency_key
         .as_deref()
         .map(|key| stable_id("idempotency_key", &[key.trim()]));
-    let result = with_engine(state.clone(), move |engine| {
+    let result = run_db_task(state.clone(), move |engine| {
         let mut event = LedgerEvent::direct_memory_write(
             &request.tenant_id,
             &request.project_id,
@@ -824,14 +884,25 @@ async fn remember(
         Ok(RememberHttpResponse { ingested, project })
     })
     .await;
+    if let Ok(response) = result.as_ref()
+        && let Some(report) = response.project.as_ref()
+    {
+        record_project_report(&state, report);
+    }
+    let project_detail = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response.project.as_ref())
+        .map(project_report_detail);
     finish_request(
         state,
         ctx,
-        result,
+        result.map(Json),
         serde_json::json!({
             "tenant_id": tenant_id,
             "project_id": project_id,
-            "idempotency_key_hash": idempotency_key_hash
+            "idempotency_key_hash": idempotency_key_hash,
+            "project": project_detail
         }),
     )
     .await
@@ -881,8 +952,18 @@ async fn manage_request(
         )
         .await;
     }
-    let result = with_engine(state.clone(), move |engine| engine.manage_pending(limit)).await;
-    finish_request(state, ctx, result, serde_json::json!({ "limit": limit })).await
+    let result = run_db_task(state.clone(), move |engine| engine.manage_pending(limit)).await;
+    if let Ok(report) = result.as_ref() {
+        record_project_report(&state, report);
+    }
+    let detail = match result.as_ref() {
+        Ok(report) => serde_json::json!({
+            "limit": limit,
+            "project": project_report_detail(report)
+        }),
+        Err(_) => serde_json::json!({ "limit": limit }),
+    };
+    finish_request(state, ctx, result.map(Json), detail).await
 }
 
 async fn query(
@@ -1006,7 +1087,7 @@ async fn maintenance(
 
 async fn with_engine<T>(
     state: MemoryServerState,
-    f: impl FnOnce(MemoryEngine) -> MemoryResult<T> + Send + 'static,
+    f: impl FnOnce(MemoryEngine<RuntimeDistiller>) -> MemoryResult<T> + Send + 'static,
 ) -> Result<Json<T>, ApiError>
 where
     T: Serialize + Send + 'static,
@@ -1016,12 +1097,13 @@ where
 
 async fn run_db_task<T>(
     state: MemoryServerState,
-    f: impl FnOnce(MemoryEngine) -> MemoryResult<T> + Send + 'static,
+    f: impl FnOnce(MemoryEngine<RuntimeDistiller>) -> MemoryResult<T> + Send + 'static,
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
 {
     let db_path = state.config.db_path.clone();
+    let distiller = state.config.distiller.clone();
     let permit = match state.db_permits.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -1031,7 +1113,7 @@ where
     };
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let engine = MemoryEngine::open(db_path)?;
+        let engine = MemoryEngine::open_with_distiller_config(db_path, distiller)?;
         f(engine)
     });
     let result = match timeout(
@@ -1197,8 +1279,8 @@ async fn append_audit_event(state: &MemoryServerState, record: AuditRecord) {
     };
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let engine = MemoryEngine::open(db_path)?;
-        engine.store().append_audit(&record)?;
+        let store = SqliteMemoryStore::open(db_path)?;
+        store.append_audit(&record)?;
         Ok::<_, MemoryError>(())
     })
     .await;
@@ -1228,6 +1310,32 @@ fn metrics_snapshot(state: &MemoryServerState) -> ServiceMetricsSnapshot {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .clone()
+}
+
+fn project_report_detail(report: &ProjectReport) -> serde_json::Value {
+    serde_json::json!({
+        "events_seen": report.events_seen,
+        "events_projected": report.events_projected,
+        "events_skipped": report.events_skipped,
+        "source_token_estimate": report.source_token_estimate,
+        "projected_memory_token_estimate": report.projected_memory_token_estimate,
+        "stored_memories_touched": report.stored_memories_touched,
+        "distillation_outputs": report.distillation_outputs,
+        "distillation_provider_calls": report.distillation_provider_calls,
+        "distillation_provider_errors": report.distillation_provider_errors,
+        "distillation_schema_errors": report.distillation_schema_errors,
+        "distillation_repair_attempts": report.distillation_repair_attempts,
+        "distillation_repair_successes": report.distillation_repair_successes,
+        "distillation_rejections": report.distillation_rejections,
+        "distillation_input_tokens": report.distillation_input_tokens,
+        "distillation_output_tokens": report.distillation_output_tokens,
+        "distillation_elapsed_ms": report.distillation_elapsed_ms,
+        "memories_added": report.memories_added,
+        "memories_updated": report.memories_updated,
+        "memories_invalidated": report.memories_invalidated,
+        "memories_nooped": report.memories_nooped,
+        "edges_added": report.edges_added
+    })
 }
 
 fn render_prometheus_metrics(snapshot: &ServiceMetricsSnapshot, now_unix_ms: i64) -> String {
@@ -1387,6 +1495,86 @@ fn render_prometheus_metrics(snapshot: &ServiceMetricsSnapshot, now_unix_ms: i64
         "timeout",
         snapshot.db_timeout_requests,
     );
+    output.push_str("# HELP beater_memory_distillation_outputs_total Total projected distillation outputs by outcome.\n");
+    output.push_str("# TYPE beater_memory_distillation_outputs_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_outputs_total",
+        "outcome",
+        "accepted",
+        snapshot.distillation_outputs,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_outputs_total",
+        "outcome",
+        "rejected",
+        snapshot.distillation_rejections,
+    );
+    output.push_str("# HELP beater_memory_distillation_provider_calls_total Total distillation provider calls.\n");
+    output.push_str("# TYPE beater_memory_distillation_provider_calls_total counter\n");
+    push_prometheus_unlabeled_counter(
+        &mut output,
+        "beater_memory_distillation_provider_calls_total",
+        snapshot.distillation_provider_calls,
+    );
+    output.push_str("# HELP beater_memory_distillation_provider_errors_total Total distillation provider errors.\n");
+    output.push_str("# TYPE beater_memory_distillation_provider_errors_total counter\n");
+    push_prometheus_unlabeled_counter(
+        &mut output,
+        "beater_memory_distillation_provider_errors_total",
+        snapshot.distillation_provider_errors,
+    );
+    output.push_str("# HELP beater_memory_distillation_schema_total Total distillation schema and repair outcomes.\n");
+    output.push_str("# TYPE beater_memory_distillation_schema_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_schema_total",
+        "outcome",
+        "schema_errors",
+        snapshot.distillation_schema_errors,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_schema_total",
+        "outcome",
+        "repair_attempts",
+        snapshot.distillation_repair_attempts,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_schema_total",
+        "outcome",
+        "repair_successes",
+        snapshot.distillation_repair_successes,
+    );
+    output.push_str("# HELP beater_memory_distillation_tokens_total Total distillation provider token estimates.\n");
+    output.push_str("# TYPE beater_memory_distillation_tokens_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_tokens_total",
+        "kind",
+        "input",
+        snapshot.distillation_input_tokens,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_tokens_total",
+        "kind",
+        "output",
+        snapshot.distillation_output_tokens,
+    );
+    output.push_str(
+        "# HELP beater_memory_distillation_elapsed_ms_total Total distillation elapsed milliseconds.\n",
+    );
+    output.push_str("# TYPE beater_memory_distillation_elapsed_ms_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_distillation_elapsed_ms_total",
+        "kind",
+        "all",
+        snapshot.distillation_elapsed_ms,
+    );
     output.push_str("# HELP beater_memory_query_tier_requests_total Successful query answers by retrieval tier.\n");
     output.push_str("# TYPE beater_memory_query_tier_requests_total counter\n");
     push_query_tier_prometheus_counter(
@@ -1486,6 +1674,10 @@ fn push_prometheus_counter(
     ));
 }
 
+fn push_prometheus_unlabeled_counter(output: &mut String, name: &str, value: u64) {
+    output.push_str(&format!("{name} {value}\n"));
+}
+
 fn escape_prometheus_label(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -1550,6 +1742,14 @@ fn record_db_timeout(state: &MemoryServerState) {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .db_timeout_requests += 1;
+}
+
+fn record_project_report(state: &MemoryServerState, report: &ProjectReport) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .record_project_report(report);
 }
 
 fn record_query_answer(state: &MemoryServerState, answer: &MemoryAnswer, latency_ms: u64) {
@@ -1715,6 +1915,15 @@ mod tests {
 
         let err = test_config().with_audit_limit(0).validate().unwrap_err();
         assert!(err.to_string().contains("max_audit_limit"));
+
+        let err = test_config()
+            .with_distiller_config(DistillerConfig::Command(
+                crate::CommandDistillationProviderConfig::new("provider").with_timeout_ms(30_000),
+            ))
+            .with_db_task_timeout_ms(30_000)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("db_task_timeout_ms"));
     }
 
     #[test]
