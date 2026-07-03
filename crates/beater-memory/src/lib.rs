@@ -25,8 +25,9 @@ pub use distill::{
 pub use engine::{MemoryEngine, ProjectReport, ProjectionRebuildReport};
 pub use error::{MemoryError, MemoryResult};
 pub use eval::{
-    EvalAbility, EvalAbilitySummary, EvalCase, EvalCaseReport, EvalEvent, EvalOptions, EvalReport,
-    EvalSuite, EvalTierSummary, run_eval_suite,
+    EVAL_CONTRACT_VERSION, EvalAbility, EvalAbilitySummary, EvalCase, EvalCaseReport, EvalEvent,
+    EvalExpectationReport, EvalOptions, EvalReport, EvalReportSource, EvalScoreKind, EvalSuite,
+    EvalSuiteSource, EvalTierSummary, run_eval_suite, run_eval_suite_with_source,
 };
 pub use imports::{
     BeaterJsImportReport, BeaterJsJournal, CanonicalJsonlImportReport, import_canonical_jsonl,

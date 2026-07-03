@@ -170,6 +170,10 @@ Run a deterministic memory evaluation suite:
 cargo run -p beater-memory -- eval --suite ./memory-eval.json
 ```
 
+`eval` emits machine-readable JSON on stdout by default. Passing suites keep
+stderr empty; failing suites still print the JSON report to stdout and then emit
+a human error on stderr with a nonzero exit code.
+
 The default DB path is `.beater-memory/memory.db`; override with `--db`.
 
 For retryable direct writes, pass an idempotency key. Reusing the same key in
@@ -301,6 +305,28 @@ HTTP metrics, Prometheus metrics, and audit detail include reconstruction
 provider calls, provider errors, schema errors, input/output token estimates,
 and elapsed milliseconds.
 
+### Evaluation suites
+
+Eval fixtures use `contract_version: 1`; omitted versions default to v1 for
+older local fixtures, while unsupported future versions are rejected. A fixture
+can also include `source` metadata with `name`, `uri`, and `revision`; CLI
+reports echo that metadata plus the suite file path.
+
+By default each case runs in an isolated per-case project. Set
+`"shared_haystack": true` only for chronological shared-haystack benchmarks:
+the runner ingests, projects, and queries each case in order, so later cases can
+see earlier observations but earlier cases cannot see future observations.
+
+Report `score` is `effective_expectation_pass_rate`: content expectations are
+matched against the answer, evidence, stale assumptions, and contradictions,
+then hard gates such as `expected_tier` force the case score to `0.0` when they
+fail. `content_score` preserves the raw content-only match rate for debugging.
+Top-level `passed`/`failed` count full case pass/fail, `checks_*` count content
+expectations, and `context_saturation_gap` is the clamped shortfall versus the
+average full-context baseline over cases that supply one. Each case report
+includes effective scope, modes, routing/reconstruction telemetry, expectation
+match rows, compact answer/evidence excerpts, and write/read economics.
+
 ## Operations
 
 Manage/projection is atomic per ledger event. The engine uses an immediate
@@ -397,9 +423,11 @@ Key public API exports include:
 - `MemoryTier`, `MemoryMode`, `MemoryNodeKind`, `MemoryEdgeKind`,
   `BeliefRevisionOp`, `RoutingReason`, `RoutingReport`, `ReconstructionMode`,
   `ReconstructionOptions`, `ReconstructionReason`, and `ReconstructionReport`
-- `EvalSuite`, `EvalCase`, `EvalEvent`, `EvalOptions`, `EvalReport`,
-  `EvalAbility`, `EvalAbilitySummary`, `EvalTierSummary`, and
-  `run_eval_suite`
+- `EVAL_CONTRACT_VERSION`, `EvalSuite`, `EvalSuiteSource`, `EvalCase`,
+  `EvalEvent`, `EvalOptions`, `EvalReport`, `EvalReportSource`,
+  `EvalExpectationReport`, `EvalAbility`, `EvalScoreKind`,
+  `EvalAbilitySummary`, `EvalTierSummary`, `run_eval_suite`, and
+  `run_eval_suite_with_source`
 - import helpers for `beater.js` journals and canonical JSONL
 - evidence token budgeting helpers
 
@@ -426,11 +454,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Retrieval returns an answer-shaped evidence bundle, not raw chunks.
 - Token cost, read latency, write amplification, and context pollution are
   first-class metrics.
-- Evaluation reports use deterministic content expectation checks or future
-  calibrated judges; they do not use F1/BLEU as the correctness signal.
-  Retrieval-tier expectations gate routing behavior without inflating accuracy,
-  context-saturation gap is the clamped full-context shortfall, and selected
-  evidence tokens are reported as the answer-context token load.
+- Evaluation reports use versioned deterministic content expectation checks or
+  future calibrated judges; they do not use F1/BLEU as the correctness signal.
+  Retrieval-tier expectations are hard gates that zero the effective case score
+  when they fail, context-saturation gap is the clamped full-context shortfall,
+  and selected evidence tokens are reported as the answer-context token load.
 - Contradictions are graph edges and stale assumptions, not silently overwritten
   summaries.
 
