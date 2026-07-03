@@ -115,6 +115,21 @@ edges are projections that can be rebuilt.
      Unix; `serve_with_shutdown` exposes the same server loop with an injected
      shutdown future for embedding and tests.
 
+6. **Evaluation Harness**
+   - CLI command: `beater-memory eval --suite <path>`
+   - Suites are deterministic JSON fixtures with LongMemEval-V2-style ability
+     labels, ledger observations, query settings, explicit content expectation
+     checks over answers, evidence, stale assumptions, and contradictions, plus
+     an optional retrieval-tier gate. Cases are isolated into per-case project
+     scopes by default; suites that model shared-haystack benchmarks opt in
+     with `shared_haystack: true`.
+   - The runner builds an isolated in-memory store, projects the suite, queries
+     every case, and reports accuracy by ability, context-saturation shortfall
+     when a full-context baseline score is supplied, write tokens per stored
+     memory, projected/source token ratio, latency by tier, and tokens placed
+     into answer context as selected evidence. It intentionally avoids F1/BLEU
+     as a correctness signal.
+
 ## Why No Embeddings In The MVP
 
 The first-principles read path needs typed structure, temporal validity, and
@@ -202,6 +217,7 @@ cargo run -p beater-memory -- maintenance --repair-orphans
 cargo run -p beater-memory -- maintenance --retain-audit-events 10000
 cargo run -p beater-memory -- rebuild-projection --yes-clear-projections
 cargo run -p beater-memory -- backup --path ./backups/memory.db
+cargo run -p beater-memory -- eval --suite ./memory-eval.json
 BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
 curl http://127.0.0.1:8765/readyz
 ```
