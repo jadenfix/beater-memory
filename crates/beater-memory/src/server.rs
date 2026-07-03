@@ -23,7 +23,8 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 
 use crate::{
-    DistillerConfig, MemoryEngine, ProjectReport, RuntimeDistiller,
+    DistillerConfig, MemoryEngine, ProjectReport, ReconstructorConfig, RuntimeDistiller,
+    RuntimeReconstructor,
     error::{MemoryError, MemoryResult},
     model::{
         MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier,
@@ -43,6 +44,7 @@ const DEFAULT_MAX_AUDIT_LIMIT: usize = 500;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: u32 = 600;
 const DEFAULT_MAX_CONCURRENT_DB_TASKS: usize = 32;
 const DEFAULT_DB_TASK_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_RECONSTRUCTION_STEPS: u8 = 4;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -55,6 +57,7 @@ pub struct MemoryServerConfig {
     pub db_path: PathBuf,
     pub bind_addr: SocketAddr,
     pub distiller: DistillerConfig,
+    pub reconstructor: ReconstructorConfig,
     pub bearer_token: Option<String>,
     pub max_body_bytes: usize,
     pub max_project_limit: usize,
@@ -72,6 +75,7 @@ impl MemoryServerConfig {
             db_path: db_path.into(),
             bind_addr,
             distiller: DistillerConfig::default(),
+            reconstructor: ReconstructorConfig::default(),
             bearer_token: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_project_limit: DEFAULT_MAX_PROJECT_LIMIT,
@@ -92,6 +96,12 @@ impl MemoryServerConfig {
     #[must_use]
     pub fn with_distiller_config(mut self, distiller: DistillerConfig) -> Self {
         self.distiller = distiller;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reconstructor_config(mut self, reconstructor: ReconstructorConfig) -> Self {
+        self.reconstructor = reconstructor;
         self
     }
 
@@ -146,12 +156,21 @@ impl MemoryServerConfig {
             return Err(MemoryError::invalid("bearer token must not be empty"));
         }
         self.distiller.validate()?;
+        self.reconstructor.validate()?;
         if let DistillerConfig::Command(distiller) = &self.distiller
             && self.db_task_timeout_ms > 0
             && distiller.timeout_ms >= self.db_task_timeout_ms
         {
             return Err(MemoryError::invalid(
                 "distillation command timeout_ms must be less than db_task_timeout_ms",
+            ));
+        }
+        if let ReconstructorConfig::Command(reconstructor) = &self.reconstructor
+            && self.db_task_timeout_ms > 0
+            && reconstructor.timeout_ms >= self.db_task_timeout_ms
+        {
+            return Err(MemoryError::invalid(
+                "reconstruction command timeout_ms must be less than db_task_timeout_ms",
             ));
         }
         if self.max_body_bytes == 0 {
@@ -297,6 +316,18 @@ pub struct ServiceMetricsSnapshot {
     #[serde(default)]
     pub distillation_elapsed_ms: u64,
     #[serde(default)]
+    pub reconstruction_provider_calls: u64,
+    #[serde(default)]
+    pub reconstruction_provider_errors: u64,
+    #[serde(default)]
+    pub reconstruction_provider_schema_errors: u64,
+    #[serde(default)]
+    pub reconstruction_provider_input_tokens: u64,
+    #[serde(default)]
+    pub reconstruction_provider_output_tokens: u64,
+    #[serde(default)]
+    pub reconstruction_provider_elapsed_ms: u64,
+    #[serde(default)]
     pub query_cue_seed: QueryTierMetrics,
     #[serde(default)]
     pub query_activation: QueryTierMetrics,
@@ -349,6 +380,12 @@ impl ServiceMetricsSnapshot {
             distillation_input_tokens: 0,
             distillation_output_tokens: 0,
             distillation_elapsed_ms: 0,
+            reconstruction_provider_calls: 0,
+            reconstruction_provider_errors: 0,
+            reconstruction_provider_schema_errors: 0,
+            reconstruction_provider_input_tokens: 0,
+            reconstruction_provider_output_tokens: 0,
+            reconstruction_provider_elapsed_ms: 0,
             query_cue_seed: QueryTierMetrics::default(),
             query_activation: QueryTierMetrics::default(),
             query_active_reconstruction: QueryTierMetrics::default(),
@@ -407,6 +444,14 @@ impl ServiceMetricsSnapshot {
             .as_ref()
             .map(|report| u64::from(report.tokens_spent))
             .unwrap_or(0);
+        if let Some(report) = answer.reconstruction.as_ref() {
+            self.reconstruction_provider_calls += report.provider_calls as u64;
+            self.reconstruction_provider_errors += report.provider_errors as u64;
+            self.reconstruction_provider_schema_errors += report.provider_schema_errors as u64;
+            self.reconstruction_provider_input_tokens += u64::from(report.provider_input_tokens);
+            self.reconstruction_provider_output_tokens += u64::from(report.provider_output_tokens);
+            self.reconstruction_provider_elapsed_ms += report.provider_elapsed_ms;
+        }
     }
 }
 
@@ -978,6 +1023,9 @@ async fn query(
     let ctx = begin_request(&state, &headers, "query", "/v1/query").await?;
     let max_tokens = request.max_tokens.unwrap_or(1_200);
     let reconstruction_mode = request.reconstruction_mode.unwrap_or_default();
+    let max_reconstruction_steps = request
+        .max_reconstruction_steps
+        .unwrap_or(DEFAULT_MAX_RECONSTRUCTION_STEPS);
     let max_reconstruction_tokens = request
         .max_reconstruction_tokens
         .unwrap_or_else(|| 2_000.min(state.config.max_query_tokens));
@@ -1003,13 +1051,20 @@ async fn query(
         )
         .await;
     }
+    if let Err(err) = validate_reconstruction_provider_budget(
+        &state.config,
+        reconstruction_mode,
+        max_reconstruction_steps,
+    ) {
+        return fail_request(&state, &ctx, ApiError::from(err)).await;
+    }
     let tenant_id = request.scope.tenant_id.clone();
     let project_id = request.scope.project_id.clone();
     let mut query = MemoryQuery::new(request.question, request.scope)
         .with_max_tokens(max_tokens)
         .with_reconstruction(ReconstructionOptions {
             mode: reconstruction_mode,
-            max_steps: request.max_reconstruction_steps.unwrap_or(4),
+            max_steps: max_reconstruction_steps,
             max_tokens: max_reconstruction_tokens,
         });
     if request.require_fresh.unwrap_or(false) {
@@ -1055,6 +1110,30 @@ async fn query(
     finish_request(state, ctx, result.map(Json), success_detail).await
 }
 
+fn validate_reconstruction_provider_budget(
+    config: &MemoryServerConfig,
+    reconstruction_mode: ReconstructionMode,
+    max_reconstruction_steps: u8,
+) -> MemoryResult<()> {
+    if reconstruction_mode == ReconstructionMode::Off || config.db_task_timeout_ms == 0 {
+        return Ok(());
+    }
+    let ReconstructorConfig::Command(reconstructor) = &config.reconstructor else {
+        return Ok(());
+    };
+    let aggregate_timeout_ms = reconstructor
+        .timeout_ms
+        .checked_mul(u64::from(max_reconstruction_steps))
+        .ok_or_else(|| MemoryError::invalid("reconstruction command timeout budget overflowed"))?;
+    if aggregate_timeout_ms >= config.db_task_timeout_ms {
+        return Err(MemoryError::invalid(format!(
+            "reconstruction command timeout_ms multiplied by max_reconstruction_steps must be less than db_task_timeout_ms ({aggregate_timeout_ms} >= {})",
+            config.db_task_timeout_ms
+        )));
+    }
+    Ok(())
+}
+
 async fn maintenance(
     State(state): State<MemoryServerState>,
     headers: HeaderMap,
@@ -1091,7 +1170,9 @@ async fn maintenance(
 
 async fn with_engine<T>(
     state: MemoryServerState,
-    f: impl FnOnce(MemoryEngine<RuntimeDistiller>) -> MemoryResult<T> + Send + 'static,
+    f: impl FnOnce(MemoryEngine<RuntimeDistiller, RuntimeReconstructor>) -> MemoryResult<T>
+    + Send
+    + 'static,
 ) -> Result<Json<T>, ApiError>
 where
     T: Serialize + Send + 'static,
@@ -1101,13 +1182,16 @@ where
 
 async fn run_db_task<T>(
     state: MemoryServerState,
-    f: impl FnOnce(MemoryEngine<RuntimeDistiller>) -> MemoryResult<T> + Send + 'static,
+    f: impl FnOnce(MemoryEngine<RuntimeDistiller, RuntimeReconstructor>) -> MemoryResult<T>
+    + Send
+    + 'static,
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
 {
     let db_path = state.config.db_path.clone();
     let distiller = state.config.distiller.clone();
+    let reconstructor = state.config.reconstructor.clone();
     let permit = match state.db_permits.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -1117,7 +1201,7 @@ where
     };
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let engine = MemoryEngine::open_with_distiller_config(db_path, distiller)?;
+        let engine = MemoryEngine::open_with_runtime_config(db_path, distiller, reconstructor)?;
         f(engine)
     });
     let result = match timeout(
@@ -1654,6 +1738,50 @@ fn render_prometheus_metrics(snapshot: &ServiceMetricsSnapshot, now_unix_ms: i64
             metrics.reconstruction_tokens,
         );
     }
+    output.push_str("# HELP beater_memory_reconstruction_provider_calls_total Total active reconstruction provider calls.\n");
+    output.push_str("# TYPE beater_memory_reconstruction_provider_calls_total counter\n");
+    push_prometheus_unlabeled_counter(
+        &mut output,
+        "beater_memory_reconstruction_provider_calls_total",
+        snapshot.reconstruction_provider_calls,
+    );
+    output.push_str("# HELP beater_memory_reconstruction_provider_errors_total Total active reconstruction provider errors.\n");
+    output.push_str("# TYPE beater_memory_reconstruction_provider_errors_total counter\n");
+    push_prometheus_unlabeled_counter(
+        &mut output,
+        "beater_memory_reconstruction_provider_errors_total",
+        snapshot.reconstruction_provider_errors,
+    );
+    output.push_str("# HELP beater_memory_reconstruction_provider_schema_errors_total Total active reconstruction provider schema errors.\n");
+    output.push_str("# TYPE beater_memory_reconstruction_provider_schema_errors_total counter\n");
+    push_prometheus_unlabeled_counter(
+        &mut output,
+        "beater_memory_reconstruction_provider_schema_errors_total",
+        snapshot.reconstruction_provider_schema_errors,
+    );
+    output.push_str("# HELP beater_memory_reconstruction_provider_tokens_total Total active reconstruction provider token estimates.\n");
+    output.push_str("# TYPE beater_memory_reconstruction_provider_tokens_total counter\n");
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_reconstruction_provider_tokens_total",
+        "kind",
+        "input",
+        snapshot.reconstruction_provider_input_tokens,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_reconstruction_provider_tokens_total",
+        "kind",
+        "output",
+        snapshot.reconstruction_provider_output_tokens,
+    );
+    output.push_str("# HELP beater_memory_reconstruction_provider_elapsed_ms_total Total active reconstruction provider elapsed milliseconds.\n");
+    output.push_str("# TYPE beater_memory_reconstruction_provider_elapsed_ms_total counter\n");
+    push_prometheus_unlabeled_counter(
+        &mut output,
+        "beater_memory_reconstruction_provider_elapsed_ms_total",
+        snapshot.reconstruction_provider_elapsed_ms,
+    );
     output
 }
 
@@ -1933,6 +2061,18 @@ mod tests {
         let err = test_config()
             .with_distiller_config(DistillerConfig::Command(
                 crate::CommandDistillationProviderConfig::new("provider").with_timeout_ms(30_000),
+            ))
+            .with_db_task_timeout_ms(30_000)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("db_task_timeout_ms"));
+
+        let err = test_config()
+            .with_reconstructor_config(ReconstructorConfig::Command(
+                crate::CommandReconstructionProviderConfig::new(
+                    std::env::current_exe().unwrap_or_else(|err| panic!("{err}")),
+                )
+                .with_timeout_ms(30_000),
             ))
             .with_db_task_timeout_ms(30_000)
             .validate()
@@ -2393,6 +2533,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_rejects_reconstruction_provider_budget_over_db_timeout() {
+        let app = memory_router(
+            test_config()
+                .with_bearer_token("secret")
+                .with_reconstructor_config(ReconstructorConfig::Command(
+                    crate::CommandReconstructionProviderConfig::new(
+                        std::env::current_exe().unwrap_or_else(|err| panic!("{err}")),
+                    )
+                    .with_timeout_ms(20_000),
+                ))
+                .with_db_task_timeout_ms(30_000),
+        );
+        let query = serde_json::json!({
+            "question": "anything",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "reconstruction_mode": "force",
+            "max_reconstruction_steps": 2,
+            "max_reconstruction_tokens": 500
+        });
+
+        let response = app
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "bad_request");
+        assert!(error.error.message.contains("max_reconstruction_steps"));
+    }
+
+    #[tokio::test]
     async fn query_audit_records_reconstruction_detail() {
         let app = memory_router(test_config().with_bearer_token("secret"));
         let query = serde_json::json!({
@@ -2709,6 +2884,16 @@ mod tests {
         assert!(text.contains("beater_memory_http_route_requests_total{route=\"metrics\"} 1"));
         assert!(text.contains("beater_memory_db_requests_total{outcome=\"busy\"} 0"));
         assert!(text.contains("beater_memory_distillation_replay_batches_total 0"));
+        assert!(text.contains("beater_memory_reconstruction_provider_calls_total 0"));
+        assert!(text.contains("beater_memory_reconstruction_provider_errors_total 0"));
+        assert!(text.contains("beater_memory_reconstruction_provider_schema_errors_total 0"));
+        assert!(
+            text.contains("beater_memory_reconstruction_provider_tokens_total{kind=\"input\"} 0")
+        );
+        assert!(
+            text.contains("beater_memory_reconstruction_provider_tokens_total{kind=\"output\"} 0")
+        );
+        assert!(text.contains("beater_memory_reconstruction_provider_elapsed_ms_total 0"));
         assert!(text.contains("beater_memory_query_tier_requests_total{tier=\"activation\"} 1"));
         assert!(text.contains(
             "beater_memory_query_tier_tokens_total{tier=\"activation\",token_kind=\"answer\"}"

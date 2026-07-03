@@ -604,6 +604,18 @@ pub struct ReconstructionReport {
     pub reason: ReconstructionReason,
     pub steps_used: u8,
     pub tokens_spent: u32,
+    #[serde(default)]
+    pub provider_calls: usize,
+    #[serde(default)]
+    pub provider_errors: usize,
+    #[serde(default)]
+    pub provider_schema_errors: usize,
+    #[serde(default)]
+    pub provider_input_tokens: u32,
+    #[serde(default)]
+    pub provider_output_tokens: u32,
+    #[serde(default)]
+    pub provider_elapsed_ms: u64,
     pub expanded_node_ids: Vec<String>,
     pub accepted_node_ids: Vec<String>,
     pub pruned_node_ids: Vec<String>,

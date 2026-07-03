@@ -93,8 +93,10 @@ edges are projections that can be rebuilt.
    - Tier 2: optional active reconstruction that escalates forced queries and
      hard auto queries into bounded graph expansion through an
      `ActiveReconstructor` policy. The default policy is deterministic and
-     provider-neutral; future model-backed providers must return validated
-     accept/prune/stop decisions under the same step and token budgets.
+     provider-neutral. The command-backed provider policy uses the same step
+     and token budgets, validates accept/prune decisions against the current
+     candidate set, stops reconstruction on transport or schema failures, and
+     reports provider calls, errors, token estimates, and elapsed time.
    - Return type: `MemoryAnswer`, not raw chunks.
 
 5. **Service API**
@@ -111,14 +113,18 @@ edges are projections that can be rebuilt.
      timeout are configurable at startup. Public request limits must be
      positive; the rate limiter, DB concurrency limiter, and DB timeout keep
      their documented zero-value controls.
-     Provider-command distillation has its own per-call timeout, and server
-     startup rejects provider timeouts greater than or equal to the DB task
-     timeout so a single provider call cannot race the HTTP timeout boundary.
+     Provider-command distillation and reconstruction have their own per-call
+     timeouts, and server startup rejects provider timeouts greater than or
+     equal to the DB task timeout so a single provider call cannot race the HTTP
+     timeout boundary. Provider-backed reconstruction queries are also rejected
+     when command timeout multiplied by requested reconstruction steps would
+     exceed the DB task timeout.
    - Controls: a fixed-window per-actor limiter protects `/v1/*`; in-memory
      JSON and Prometheus service metrics expose request totals, DB saturation,
-     DB timeouts, distillation provider counters, and query counts/latency/token
-     totals by retrieval tier; durable audit rows record successes, failures,
-     denied auth, throttled attempts, and projection summaries.
+     DB timeouts, distillation and reconstruction provider counters, and query
+     counts/latency/token totals by retrieval tier; durable audit rows record
+     successes, failures, denied auth, throttled attempts, and projection
+     summaries.
    - Economics telemetry: projection reports include source-token estimates,
      projected memory-token estimates, and distillation provider counters;
      store stats expose total/active stored-memory tokens and active node counts
@@ -235,6 +241,10 @@ cargo run -p beater-memory -- query --tenant local --project demo \
   "How did checkout look at that time?"
 cargo run -p beater-memory -- query --tenant local --project demo \
   --reconstruction-mode auto \
+  "why did checkout database failures recover?"
+cargo run -p beater-memory -- --reconstructor provider-command \
+  --reconstructor-command ./reconstruct-provider \
+  query --tenant local --project demo --reconstruction-mode force \
   "why did checkout database failures recover?"
 cargo run -p beater-memory -- health --json
 cargo run -p beater-memory -- maintenance

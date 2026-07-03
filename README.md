@@ -27,6 +27,8 @@ The current implementation includes:
   inside projection write transactions
 - opt-in command-backed provider distillation for CLI and HTTP manage paths,
   with a per-call timeout and bounded repair attempts
+- opt-in command-backed active reconstruction for CLI and HTTP query paths,
+  with strict decision parsing, candidate validation, and provider metrics
 - memory economics telemetry for projection source/stored-token estimates,
   active stored-token totals, active node counts by kind, and query tier
   latency/token counters
@@ -107,6 +109,13 @@ cargo run -p beater-memory -- query \
 cargo run -p beater-memory -- query \
   --tenant local --project demo \
   --reconstruction-mode auto \
+  "why did checkout database failures recover?"
+
+cargo run -p beater-memory -- \
+  --reconstructor provider-command \
+  --reconstructor-command ./reconstruct-provider \
+  query --tenant local --project demo \
+  --reconstruction-mode force \
   "why did checkout database failures recover?"
 
 cargo run -p beater-memory -- health --json
@@ -244,6 +253,54 @@ arguments, and effective repair budget; it does not include provider file
 contents, environment variables, cwd-dependent behavior, timeout, or model
 settings unless those settings are encoded in the command arguments.
 
+### Provider-backed active reconstruction
+
+Queries use the deterministic active reconstructor by default. To run a local
+provider adapter during forced or auto Tier 2 reads, pass global reconstructor
+flags before `query` or `serve`:
+
+```bash
+cargo run -p beater-memory -- \
+  --reconstructor provider-command \
+  --reconstructor-command ./reconstruct-provider \
+  --reconstructor-timeout-ms 25000 \
+  query --tenant local --project demo \
+  --reconstruction-mode force \
+  "incident alpha"
+
+BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- \
+  --reconstructor provider-command \
+  --reconstructor-command ./reconstruct-provider \
+  --reconstructor-timeout-ms 5000 \
+  serve --bind 127.0.0.1:8765
+```
+
+`--reconstructor-arg` repeats like `--distiller-arg` and can pass values that
+start with `-`. The command timeout defaults to 25s and must be lower than the
+server DB task timeout when used with `serve`. CLI query and server startup
+reject missing, non-file, or non-executable command paths. HTTP query requests
+using provider reconstruction are rejected when
+`--reconstructor-timeout-ms * max_reconstruction_steps` is greater than or equal
+to `--db-task-timeout-ms`, so long-running providers should either use a lower
+per-call timeout, fewer reconstruction steps, or a larger DB task timeout.
+
+The command receives one `ReconstructionStep` JSON document on stdin with
+`question`, `step_index`, `expanded_node_id`, `remaining_tokens`, and
+`candidates`. It must write one decision JSON document on stdout:
+
+```json
+{"decision":"accept","node_id":"node-id-from-candidates"}
+```
+
+Valid decisions are `accept`, `prune`, and `stop`. `accept` and `prune` must
+name a candidate node ID from the same step; unknown fields, unknown decisions,
+and non-candidate node IDs are treated as schema failures. Provider transport or
+schema failures stop active reconstruction for that query and are reported in
+the `ReconstructionReport`; they do not fail the whole query. Query responses,
+HTTP metrics, Prometheus metrics, and audit detail include reconstruction
+provider calls, provider errors, schema errors, input/output token estimates,
+and elapsed milliseconds.
+
 ## Operations
 
 Manage/projection is atomic per ledger event. The engine uses an immediate
@@ -312,7 +369,7 @@ curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
 
 ## Crate API
 
-The public API exports:
+Key public API exports include:
 
 - `MemoryEngine`
 - `ProjectReport` and `ProjectionRebuildReport`
@@ -330,7 +387,11 @@ The public API exports:
   `DistillationProvider`, `DistillationPrompt`, `DistillationRepairPrompt`,
   `DistillationReplayKey`, `DistillOutcome`, and `DistillMetrics`
 - `ActiveReconstructor`, `DeterministicReconstructor`,
-  `ReconstructionCandidate`, `ReconstructionDecision`, and
+  `ProviderReconstructor`, `CommandReconstructionProvider`,
+  `CommandReconstructionProviderConfig`, `ReconstructionProvider`,
+  `ReconstructorConfig`, `RuntimeReconstructor`,
+  `ReconstructionCandidate`, `ReconstructionDecision`,
+  `ReconstructionDecisionOutcome`, `ReconstructionMetrics`, and
   `ReconstructionStep`
 - `MemoryQuery` and `MemoryAnswer`
 - `MemoryTier`, `MemoryMode`, `MemoryNodeKind`, `MemoryEdgeKind`,

@@ -120,6 +120,7 @@ api_post() {
 }
 
 PROVIDER="$TMP_DIR/provider-distiller.py"
+RECONSTRUCTOR="$TMP_DIR/provider-reconstructor.py"
 write_provider() {
   cat > "$PROVIDER" <<'PY'
 #!/usr/bin/env python3
@@ -154,6 +155,22 @@ PY
   chmod +x "$PROVIDER"
 }
 
+write_reconstructor() {
+  cat > "$RECONSTRUCTOR" <<'PY'
+#!/usr/bin/env python3
+import json
+import sys
+
+step = json.load(sys.stdin)
+candidates = step.get("candidates", [])
+if candidates:
+    print(json.dumps({"decision": "accept", "node_id": candidates[0]["node_id"]}))
+else:
+    print(json.dumps({"decision": "stop"}))
+PY
+  chmod +x "$RECONSTRUCTOR"
+}
+
 write_failing_provider() {
   cat > "$PROVIDER" <<'PY'
 #!/usr/bin/env python3
@@ -166,6 +183,7 @@ PY
 }
 
 write_provider
+write_reconstructor
 
 "$BIN" --db "$DB" init > "$TMP_DIR/init.json"
 json_assert "$TMP_DIR/init.json" 'assert data["ledger_events"] == 0'
@@ -301,6 +319,25 @@ json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["tier_used
 json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["routing"]["routed_modes"] == ["semantic", "episodic"]'
 json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["routing"]["reconstruction_modes"] == ["semantic", "episodic"]'
 json_assert "$TMP_DIR/query-reconstruction-expands.json" 'assert data["reconstruction"]["accepted_node_ids"] and data["reconstruction"]["tokens_spent"] <= 200 and data["reconstruction"]["steps_used"] <= 2'
+
+"$BIN" --db "$DB" \
+  --reconstructor provider-command \
+  --reconstructor-command "$RECONSTRUCTOR" \
+  --reconstructor-arg --accept-first \
+  query \
+  --tenant local \
+  --project demo \
+  --modes semantic,episodic \
+  --max-tokens 10 \
+  --reconstruction-mode force \
+  --max-reconstruction-steps 2 \
+  --max-reconstruction-tokens 200 \
+  --json \
+  "incident alpha" \
+  > "$TMP_DIR/query-provider-reconstruction.json"
+json_assert "$TMP_DIR/query-provider-reconstruction.json" 'assert data["tier_used"] == "active_reconstruction" and data["reconstruction"]["provider_calls"] > 0'
+json_assert "$TMP_DIR/query-provider-reconstruction.json" 'assert data["reconstruction"]["provider_errors"] == 0 and data["reconstruction"]["provider_schema_errors"] == 0'
+json_assert "$TMP_DIR/query-provider-reconstruction.json" 'assert data["reconstruction"]["provider_input_tokens"] > 0 and data["reconstruction"]["provider_output_tokens"] > 0'
 
 cat > "$TMP_DIR/spans.jsonl" <<'JSONL'
 {"tenant_id":"local","project_id":"demo","trace_id":"trace-jsonl","span_id":"span-write","seq":1,"name":"procedure","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":1782864000000,"payload":{"memory":"Deploy procedure: run cargo test before merging memory changes."}}
@@ -567,7 +604,7 @@ if [ "$eval_status" -eq 0 ]; then
 fi
 json_assert "$TMP_DIR/eval-failing-report.json" 'assert data["failed"] == 1 and data["case_reports"][0]["failure_reasons"]'
 
-start_server
+start_server "$DB" --reconstructor provider-command --reconstructor-command "$RECONSTRUCTOR" --reconstructor-timeout-ms 1000
 json_assert "$TMP_DIR/readyz.json" 'assert data["status"] == "ok" and data["database"] == "ok"'
 
 api_post "/v1/remember" '{"tenant_id":"local","project_id":"demo","kind":"gotcha","idempotency_key":"http-checkout-db","text":"HTTP checkout fails unless DATABASE_URL is configured before migrations."}' \
@@ -594,6 +631,7 @@ json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["tier
 json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["routing"]["routed_modes"] == ["semantic", "episodic"]'
 json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["routing"]["reconstruction_modes"] == ["semantic", "episodic"]'
 json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["reconstruction"]["accepted_node_ids"] and data["reconstruction"]["tokens_spent"] <= 200 and data["reconstruction"]["steps_used"] <= 2'
+json_assert "$TMP_DIR/http-query-reconstruction-expands.json" 'assert data["reconstruction"]["provider_calls"] > 0 and data["reconstruction"]["provider_errors"] == 0 and data["reconstruction"]["provider_schema_errors"] == 0'
 
 api_post "/v1/query" '{"question":"legacy API token","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":1500},"modes":["semantic"]}' \
   > "$TMP_DIR/http-query-temporal-before.json"
@@ -634,6 +672,11 @@ api_get "/v1/stats" > "$TMP_DIR/http-stats.json"
 json_assert "$TMP_DIR/http-stats.json" 'assert data["ledger_events"] >= 5 and data["nodes"] > 0 and data["audit_events"] > 0'
 json_assert "$TMP_DIR/http-stats.json" 'assert data["total_node_tokens"] > 0 and data["active_node_tokens"] > 0 and data["active_fact_nodes"] >= 1'
 
+api_get "/v1/metrics" > "$TMP_DIR/http-metrics.json"
+json_assert "$TMP_DIR/http-metrics.json" 'assert data["reconstruction_provider_calls"] > 0 and data["reconstruction_provider_errors"] == 0 and data["reconstruction_provider_schema_errors"] == 0'
+json_assert "$TMP_DIR/http-metrics.json" 'assert data["reconstruction_provider_input_tokens"] > 0 and data["reconstruction_provider_output_tokens"] > 0'
+json_assert "$TMP_DIR/http-metrics.json" 'assert data["reconstruction_provider_elapsed_ms"] >= 0'
+
 api_get "/v1/metrics/prometheus" > "$TMP_DIR/prometheus.txt"
 grep -q "beater_memory_http_requests_total" "$TMP_DIR/prometheus.txt"
 python3 - "$TMP_DIR/prometheus.txt" <<'PY'
@@ -660,6 +703,12 @@ assert value("beater_memory_query_tier_requests_total", 'tier="active_reconstruc
 assert value("beater_memory_query_tier_tokens_total", 'tier="activation",token_kind="answer"') > 0
 assert plain_value("beater_memory_distillation_provider_calls_total") == 0
 assert plain_value("beater_memory_distillation_replay_batches_total") == 0
+assert plain_value("beater_memory_reconstruction_provider_calls_total") > 0
+assert plain_value("beater_memory_reconstruction_provider_errors_total") == 0
+assert plain_value("beater_memory_reconstruction_provider_schema_errors_total") == 0
+assert value("beater_memory_reconstruction_provider_tokens_total", 'kind="input"') > 0
+assert value("beater_memory_reconstruction_provider_tokens_total", 'kind="output"') > 0
+assert plain_value("beater_memory_reconstruction_provider_elapsed_ms_total") >= 0
 PY
 
 stop_server

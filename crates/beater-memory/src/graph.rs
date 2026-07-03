@@ -344,13 +344,21 @@ fn reconstruct_active(
     }
     let mut expanded = BTreeSet::new();
     let mut expanded_node_ids = Vec::new();
+    let mut pruned_ids = BTreeSet::new();
     let mut accepted_node_ids = Vec::new();
     let mut pruned_node_ids = Vec::new();
     let mut tokens_spent = 0_u32;
     let mut steps_used = 0_u8;
+    let mut provider_calls = 0_usize;
+    let mut provider_errors = 0_usize;
+    let mut provider_schema_errors = 0_usize;
+    let mut provider_input_tokens = 0_u32;
+    let mut provider_output_tokens = 0_u32;
+    let mut provider_elapsed_ms = 0_u64;
 
     for step_index in 0..query.reconstruction.max_steps {
-        let Some(expanded_node_id) = pop_next_frontier(&mut frontier, &expanded) else {
+        let Some(expanded_node_id) = pop_next_frontier(&mut frontier, &expanded, &pruned_ids)
+        else {
             break;
         };
         expanded.insert(expanded_node_id.clone());
@@ -367,12 +375,15 @@ fn reconstruct_active(
             edges,
             selected_ids: &selected_ids,
             expanded_ids: &expanded,
+            pruned_ids: &pruned_ids,
             as_of_unix_ms,
             known_at_unix_ms,
         })?;
         let (candidates, budget_pruned_node_ids) =
             budget_reconstruction_candidates(candidates, remaining_tokens);
-        pruned_node_ids.extend(budget_pruned_node_ids);
+        for node_id in budget_pruned_node_ids {
+            record_pruned_node(node_id, &mut pruned_ids, &mut pruned_node_ids);
+        }
         if remaining_tokens == 0 {
             break;
         }
@@ -383,7 +394,14 @@ fn reconstruct_active(
             remaining_tokens,
             candidates,
         };
-        match reconstructor.decide(&step) {
+        let outcome = reconstructor.decide(&step)?;
+        provider_calls += outcome.metrics.provider_calls;
+        provider_errors += outcome.metrics.provider_errors;
+        provider_schema_errors += outcome.metrics.schema_errors;
+        provider_input_tokens += outcome.metrics.input_tokens;
+        provider_output_tokens += outcome.metrics.output_tokens;
+        provider_elapsed_ms += outcome.metrics.elapsed_ms;
+        match outcome.decision {
             ReconstructionDecision::Accept { node_id } => {
                 if let Some(candidate) = step
                     .candidates
@@ -414,7 +432,7 @@ fn reconstruct_active(
                     .iter()
                     .any(|candidate| candidate.node_id == node_id)
                 {
-                    pruned_node_ids.push(node_id);
+                    record_pruned_node(node_id, &mut pruned_ids, &mut pruned_node_ids);
                 }
             }
             ReconstructionDecision::Prune { node_id } => {
@@ -423,7 +441,7 @@ fn reconstruct_active(
                     .iter()
                     .any(|candidate| candidate.node_id == node_id)
                 {
-                    pruned_node_ids.push(node_id);
+                    record_pruned_node(node_id, &mut pruned_ids, &mut pruned_node_ids);
                 }
             }
             ReconstructionDecision::Stop => break,
@@ -438,6 +456,12 @@ fn reconstruct_active(
             reason,
             steps_used,
             tokens_spent,
+            provider_calls,
+            provider_errors,
+            provider_schema_errors,
+            provider_input_tokens,
+            provider_output_tokens,
+            provider_elapsed_ms,
             expanded_node_ids,
             accepted_node_ids,
             pruned_node_ids,
@@ -448,13 +472,24 @@ fn reconstruct_active(
 fn pop_next_frontier(
     frontier: &mut VecDeque<String>,
     expanded_ids: &BTreeSet<String>,
+    pruned_ids: &BTreeSet<String>,
 ) -> Option<String> {
     while let Some(node_id) = frontier.pop_front() {
-        if !expanded_ids.contains(&node_id) {
+        if !expanded_ids.contains(&node_id) && !pruned_ids.contains(&node_id) {
             return Some(node_id);
         }
     }
     None
+}
+
+fn record_pruned_node(
+    node_id: String,
+    pruned_ids: &mut BTreeSet<String>,
+    pruned_node_ids: &mut Vec<String>,
+) {
+    if pruned_ids.insert(node_id.clone()) {
+        pruned_node_ids.push(node_id);
+    }
 }
 
 fn budget_reconstruction_candidates(
@@ -487,6 +522,7 @@ struct CandidateRequest<'a> {
     edges: &'a [MemoryEdge],
     selected_ids: &'a BTreeSet<String>,
     expanded_ids: &'a BTreeSet<String>,
+    pruned_ids: &'a BTreeSet<String>,
     as_of_unix_ms: Option<i64>,
     known_at_unix_ms: Option<i64>,
 }
@@ -503,6 +539,7 @@ fn reconstruction_candidates(
         edges,
         selected_ids,
         expanded_ids,
+        pruned_ids,
         as_of_unix_ms,
         known_at_unix_ms,
     } = request;
@@ -518,7 +555,10 @@ fn reconstruction_candidates(
         let Some(neighbor_id) = neighbor_id else {
             continue;
         };
-        if selected_ids.contains(neighbor_id) || expanded_ids.contains(neighbor_id) {
+        if selected_ids.contains(neighbor_id)
+            || expanded_ids.contains(neighbor_id)
+            || pruned_ids.contains(neighbor_id)
+        {
             continue;
         }
         let Some(node) = nodes.get(neighbor_id) else {
@@ -1007,17 +1047,30 @@ mod tests {
     fn accepted_frontier_nodes_are_expanded_before_remaining_seeds() {
         let mut frontier = VecDeque::from(["seed-a".to_string(), "seed-b".to_string()]);
         let mut expanded = BTreeSet::new();
+        let pruned = BTreeSet::new();
 
         assert_eq!(
-            pop_next_frontier(&mut frontier, &expanded),
+            pop_next_frontier(&mut frontier, &expanded, &pruned),
             Some("seed-a".to_string())
         );
         expanded.insert("seed-a".to_string());
         frontier.push_front("accepted-hop".to_string());
 
         assert_eq!(
-            pop_next_frontier(&mut frontier, &expanded),
+            pop_next_frontier(&mut frontier, &expanded, &pruned),
             Some("accepted-hop".to_string())
+        );
+    }
+
+    #[test]
+    fn pruned_frontier_nodes_are_not_expanded() {
+        let mut frontier = VecDeque::from(["pruned".to_string(), "next".to_string()]);
+        let expanded = BTreeSet::new();
+        let pruned = BTreeSet::from(["pruned".to_string()]);
+
+        assert_eq!(
+            pop_next_frontier(&mut frontier, &expanded, &pruned),
+            Some("next".to_string())
         );
     }
 
