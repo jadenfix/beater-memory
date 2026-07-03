@@ -337,6 +337,8 @@ pub struct MemoryScope {
     pub project_id: String,
     pub environment_id: Option<String>,
     pub as_of_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub known_at_unix_ms: Option<i64>,
 }
 
 impl MemoryScope {
@@ -347,6 +349,7 @@ impl MemoryScope {
             project_id: project_id.into(),
             environment_id: None,
             as_of_unix_ms: None,
+            known_at_unix_ms: None,
         }
     }
 
@@ -362,6 +365,12 @@ impl MemoryScope {
         self
     }
 
+    #[must_use]
+    pub fn known_at_unix_ms(mut self, known_at_unix_ms: i64) -> Self {
+        self.known_at_unix_ms = Some(known_at_unix_ms);
+        self
+    }
+
     pub fn validate(&self) -> MemoryResult<()> {
         validate_required_identifier("tenant_id", &self.tenant_id)?;
         validate_required_identifier("project_id", &self.project_id)?;
@@ -370,6 +379,11 @@ impl MemoryScope {
         }
         if self.as_of_unix_ms.is_some_and(|as_of| as_of < 0) {
             return Err(MemoryError::invalid("as_of_unix_ms must be non-negative"));
+        }
+        if self.known_at_unix_ms.is_some_and(|known_at| known_at < 0) {
+            return Err(MemoryError::invalid(
+                "known_at_unix_ms must be non-negative",
+            ));
         }
         Ok(())
     }
@@ -778,7 +792,8 @@ mod tests {
                 "tenant_id": "tenant",
                 "project_id": "project",
                 "environment_id": null,
-                "as_of_unix_ms": null
+                "as_of_unix_ms": null,
+                "known_at_unix_ms": null
             },
             "max_tokens": 1200,
             "require_fresh": false,
@@ -795,7 +810,8 @@ mod tests {
                 "tenant_id": "tenant",
                 "project_id": "project",
                 "environment_id": null,
-                "as_of_unix_ms": null
+                "as_of_unix_ms": null,
+                "known_at_unix_ms": null
             },
             "max_tokens": 1200,
             "require_fresh": false,
@@ -851,6 +867,30 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("as_of_unix_ms"));
+
+        let err = MemoryScope::new("tenant", "project")
+            .known_at_unix_ms(-1)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("known_at_unix_ms"));
+    }
+
+    #[test]
+    fn scope_deserialization_defaults_known_at_for_old_json() {
+        let scope: MemoryScope = serde_json::from_value(serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "environment_id": null,
+            "as_of_unix_ms": 1500
+        }))
+        .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(scope.as_of_unix_ms, Some(1_500));
+        assert_eq!(scope.known_at_unix_ms, None);
+
+        let value = serde_json::to_value(scope.known_at_unix_ms(2_500))
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(value["known_at_unix_ms"], 2_500);
     }
 
     #[test]

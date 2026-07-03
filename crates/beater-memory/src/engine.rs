@@ -2226,6 +2226,176 @@ mod tests {
     }
 
     #[test]
+    fn known_at_reads_hide_late_known_add_until_ingested() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        let mut event = event_at(
+            MemoryNodeKind::Fact,
+            "The checkout late-known flag is alpha.",
+            1_000,
+        );
+        event.ingested_at_unix_ms = 3_000;
+        engine.ingest_event(&event)?;
+        engine.project_pending(100)?;
+
+        let before_known = engine.query(
+            &MemoryQuery::new(
+                "checkout late-known flag",
+                MemoryScope::new("tenant", "project")
+                    .as_of_unix_ms(1_500)
+                    .known_at_unix_ms(2_500),
+            )
+            .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+        let after_known = engine.query(
+            &MemoryQuery::new(
+                "checkout late-known flag",
+                MemoryScope::new("tenant", "project")
+                    .as_of_unix_ms(1_500)
+                    .known_at_unix_ms(3_500),
+            )
+            .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        assert!(before_known.evidence.is_empty());
+        assert!(
+            after_known
+                .evidence
+                .iter()
+                .any(|item| item.text.contains("late-known flag is alpha"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn known_at_reads_ignore_late_known_update_until_ingested() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct UpdateCheckoutToken;
+
+        impl Distiller for UpdateCheckoutToken {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                let target_node_id = event
+                    .text
+                    .contains("rotated")
+                    .then(|| {
+                        neighbors
+                            .iter()
+                            .find(|node| node.text.contains("legacy token alpha"))
+                            .map(|node| node.id.clone())
+                    })
+                    .flatten();
+                let op = if target_node_id.is_some() {
+                    BeliefRevisionOp::Update
+                } else {
+                    BeliefRevisionOp::Add
+                };
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op,
+                    node_kind: MemoryNodeKind::Fact,
+                    text: event.text.clone(),
+                    target_node_id,
+                    cited_spans: vec![event.cited_span()],
+                }]))
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, UpdateCheckoutToken);
+        let old = "Checkout uses legacy token alpha.";
+        let new = "Checkout uses rotated token alpha instead of legacy token alpha.";
+        engine.ingest_event(&event_at(MemoryNodeKind::Fact, old, 1_000))?;
+        engine.manage_pending(100)?;
+        let mut update = event_at(MemoryNodeKind::Fact, new, 2_000);
+        update.ingested_at_unix_ms = 4_000;
+        engine.ingest_event(&update)?;
+        engine.manage_pending(100)?;
+
+        let before_query = MemoryQuery::new(
+            "legacy token alpha",
+            MemoryScope::new("tenant", "project")
+                .as_of_unix_ms(2_500)
+                .known_at_unix_ms(3_000),
+        )
+        .with_modes(vec![MemoryMode::Semantic]);
+        let after_query = MemoryQuery::new(
+            "legacy token alpha",
+            MemoryScope::new("tenant", "project")
+                .as_of_unix_ms(2_500)
+                .known_at_unix_ms(5_000),
+        )
+        .with_modes(vec![MemoryMode::Semantic]);
+
+        let before = engine.query(&before_query)?;
+        assert!(before.evidence.iter().any(|item| item.text == old));
+        assert!(!before.evidence.iter().any(|item| item.text == new));
+        assert!(before.contradictions.is_empty());
+        assert!(before.stale_assumptions.is_empty());
+
+        let after = engine.query(&after_query)?;
+        assert!(after.evidence.iter().any(|item| item.text == new));
+        assert!(!after.evidence.iter().any(|item| item.text == old));
+        assert!(!after.contradictions.is_empty());
+        assert!(!after.stale_assumptions.is_empty());
+
+        engine.rebuild_projection(100, None)?;
+        let rebuilt = engine.query(&after_query)?;
+        assert_eq!(evidence_texts(&after), evidence_texts(&rebuilt));
+        assert_evidence_scores_close(&after, &rebuilt);
+        assert_eq!(after.stale_assumptions, rebuilt.stale_assumptions);
+        assert_eq!(after.contradictions, rebuilt.contradictions);
+        Ok(())
+    }
+
+    #[test]
+    fn known_at_reads_use_known_source_text_for_mutated_node() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        let source_text = "Checkout payment status is alpha.";
+        engine.ingest_event(&event_at(MemoryNodeKind::Fact, source_text, 1_000))?;
+        engine.project_pending(100)?;
+        let node = engine
+            .store()
+            .all_nodes("tenant", "project", None)?
+            .into_iter()
+            .find(|node| node.text == source_text)
+            .expect("source node should be projected");
+        engine.store().upsert_node_in_family(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            node.family_canonical_key(),
+            "Checkout payment status is alpha. Secret future shard is omega.",
+            1_000,
+            &[],
+        )?;
+
+        let current = engine
+            .store()
+            .node_by_id(&node.id)?
+            .expect("node should still exist");
+        assert!(current.text.contains("Secret future shard"));
+
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "checkout payment status",
+                MemoryScope::new("tenant", "project")
+                    .as_of_unix_ms(1_500)
+                    .known_at_unix_ms(1_500),
+            )
+            .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        assert!(answer.evidence.iter().any(|item| item.text == source_text));
+        assert!(
+            !answer
+                .evidence
+                .iter()
+                .any(|item| item.text.contains("Secret future shard"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn target_only_invalidation_closes_memory_without_replacement() -> MemoryResult<()> {
         #[derive(Clone)]
         struct TargetOnlyInvalidation;

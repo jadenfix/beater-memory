@@ -202,15 +202,29 @@ json_assert "$TMP_DIR/import-jsonl.json" 'assert data["import"]["rows_seen"] == 
 json_assert "$TMP_DIR/query-procedure.json" 'assert data["evidence"] and any(item["kind"] == "procedure" for item in data["evidence"])'
 json_assert "$TMP_DIR/query-procedure.json" 'assert data["routing"]["routed_modes"] == ["procedural"]'
 
-cat > "$TMP_DIR/temporal-spans.jsonl" <<'JSONL'
+cat > "$TMP_DIR/temporal-old-spans.jsonl" <<'JSONL'
 {"tenant_id":"local","project_id":"demo","trace_id":"trace-temporal","span_id":"span-old","seq":1,"name":"fact","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":1000,"payload":{"memory":"Use the legacy API token for deploys."}}
+JSONL
+
+"$BIN" --db "$DB" import-jsonl \
+  --path "$TMP_DIR/temporal-old-spans.jsonl" \
+  > "$TMP_DIR/import-temporal-old-jsonl.json"
+json_assert "$TMP_DIR/import-temporal-old-jsonl.json" 'assert data["import"]["rows_seen"] == 1 and data["import"]["events_inserted"] == 1 and data["project"]["events_projected"] == 1'
+KNOWN_AFTER_TEMPORAL_OLD="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
+sleep 0.02
+
+cat > "$TMP_DIR/temporal-new-spans.jsonl" <<'JSONL'
 {"tenant_id":"local","project_id":"demo","trace_id":"trace-temporal","span_id":"span-new","seq":2,"name":"fact","status":"ok","attributes":{"beater.span.kind":"memory.write"},"start_time_unix_ms":2000,"payload":{"memory":"Do not use the legacy API token; it is deprecated. Use the scoped API token instead."}}
 JSONL
 
 "$BIN" --db "$DB" import-jsonl \
-  --path "$TMP_DIR/temporal-spans.jsonl" \
-  > "$TMP_DIR/import-temporal-jsonl.json"
-json_assert "$TMP_DIR/import-temporal-jsonl.json" 'assert data["import"]["rows_seen"] == 2 and data["import"]["events_inserted"] == 2 and data["project"]["events_projected"] == 2'
+  --path "$TMP_DIR/temporal-new-spans.jsonl" \
+  > "$TMP_DIR/import-temporal-new-jsonl.json"
+json_assert "$TMP_DIR/import-temporal-new-jsonl.json" 'assert data["import"]["rows_seen"] == 1 and data["import"]["events_inserted"] == 1 and data["project"]["events_projected"] == 1'
 
 "$BIN" --db "$DB" query \
   --tenant local \
@@ -250,6 +264,41 @@ json_assert "$TMP_DIR/query-temporal-before.json" 'assert not any("scoped API to
 json_assert "$TMP_DIR/query-temporal-after.json" 'assert data["evidence"] and any("scoped API token" in item["text"] for item in data["evidence"])'
 json_assert "$TMP_DIR/query-temporal-after.json" 'assert not any("for deploys" in item["text"] for item in data["evidence"]) and data["contradictions"] and data["stale_assumptions"]'
 
+"$BIN" --db "$DB" query \
+  --tenant local \
+  --project demo \
+  --modes semantic \
+  --as-of-unix-ms 2500 \
+  --known-at-unix-ms 1500 \
+  --json \
+  "legacy API token" \
+  > "$TMP_DIR/query-temporal-before-known.json"
+json_assert "$TMP_DIR/query-temporal-before-known.json" 'assert not data["evidence"] and not data["contradictions"] and not data["stale_assumptions"]'
+
+"$BIN" --db "$DB" query \
+  --tenant local \
+  --project demo \
+  --modes semantic \
+  --as-of-unix-ms 2500 \
+  --known-at-unix-ms "$KNOWN_AFTER_TEMPORAL_OLD" \
+  --json \
+  "legacy API token" \
+  > "$TMP_DIR/query-temporal-old-known-new-unknown.json"
+json_assert "$TMP_DIR/query-temporal-old-known-new-unknown.json" 'assert data["evidence"] and any("Use the legacy API token" in item["text"] for item in data["evidence"])'
+json_assert "$TMP_DIR/query-temporal-old-known-new-unknown.json" 'assert not any("scoped API token" in item["text"] for item in data["evidence"]) and not data["contradictions"] and not data["stale_assumptions"]'
+
+"$BIN" --db "$DB" query \
+  --tenant local \
+  --project demo \
+  --modes semantic \
+  --as-of-unix-ms 2500 \
+  --known-at-unix-ms 9999999999999 \
+  --json \
+  "legacy API token" \
+  > "$TMP_DIR/query-temporal-after-known.json"
+json_assert "$TMP_DIR/query-temporal-after-known.json" 'assert data["evidence"] and any("scoped API token" in item["text"] for item in data["evidence"])'
+json_assert "$TMP_DIR/query-temporal-after-known.json" 'assert data["contradictions"] and data["stale_assumptions"]'
+
 cat > "$TMP_DIR/eval-suite.json" <<'JSON'
 {
   "name": "lme-v2-shaped-smoke",
@@ -270,6 +319,25 @@ cat > "$TMP_DIR/eval-suite.json" <<'JSON'
         }
       ],
       "expected_evidence_contains": ["https://api.example.test"],
+      "expected_tier": "activation"
+    },
+    {
+      "id": "late-known-hidden",
+      "ability": "dynamic_state_tracking",
+      "question": "what is the late known eval flag?",
+      "modes": ["semantic"],
+      "as_of_unix_ms": 1500,
+      "known_at_unix_ms": 2000,
+      "baseline_full_context_score": 1.0,
+      "events": [
+        {
+          "kind": "fact",
+          "text": "The late known eval flag is beta.",
+          "observed_at_unix_ms": 1000,
+          "ingested_at_unix_ms": 3000
+        }
+      ],
+      "expected_answer_contains": ["No matching memory"],
       "expected_tier": "activation"
     },
     {
@@ -347,13 +415,13 @@ cat > "$TMP_DIR/eval-suite.json" <<'JSON'
 }
 JSON
 "$BIN" eval --suite "$TMP_DIR/eval-suite.json" > "$TMP_DIR/eval-report.json"
-json_assert "$TMP_DIR/eval-report.json" 'assert data["suite"] == "lme-v2-shaped-smoke" and data["cases"] == 5 and data["passed"] == 5 and data["failed"] == 0'
+json_assert "$TMP_DIR/eval-report.json" 'assert data["suite"] == "lme-v2-shaped-smoke" and data["cases"] == 6 and data["passed"] == 6 and data["failed"] == 0'
 json_assert "$TMP_DIR/eval-report.json" 'assert data["score"] == 1.0 and data["context_saturation_gap"] == 0.0'
 json_assert "$TMP_DIR/eval-report.json" 'assert data["source_tokens_per_stored_memory"] > 0 and data["projected_tokens_per_stored_memory"] > 0 and data["tokens_into_context_total"] > 0'
 json_assert "$TMP_DIR/eval-report.json" 'assert any(row["ability"] == "premise_awareness" and row["score"] == 1.0 for row in data["ability_scores"])'
 json_assert "$TMP_DIR/eval-report.json" 'assert any(row["tier"] == "active_reconstruction" and row["requests"] >= 1 for row in data["tier_metrics"])'
 "$BIN" eval --suite "$TMP_DIR/eval-suite.json" --max-reconstruction-steps 1 > "$TMP_DIR/eval-report-step-override.json"
-json_assert "$TMP_DIR/eval-report-step-override.json" 'assert data["passed"] == 5 and any(case["id"] == "workflow" and case["tier_used"] == "active_reconstruction" for case in data["case_reports"])'
+json_assert "$TMP_DIR/eval-report-step-override.json" 'assert data["passed"] == 6 and any(case["id"] == "workflow" and case["tier_used"] == "active_reconstruction" for case in data["case_reports"])'
 
 cat > "$TMP_DIR/eval-failing-suite.json" <<'JSON'
 {

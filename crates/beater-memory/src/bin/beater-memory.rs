@@ -157,6 +157,8 @@ enum Command {
         fresh: bool,
         #[arg(long)]
         as_of_unix_ms: Option<i64>,
+        #[arg(long)]
+        known_at_unix_ms: Option<i64>,
         #[arg(long, value_enum, default_value_t = ReconstructionModeArg::Off)]
         reconstruction_mode: ReconstructionModeArg,
         #[arg(long, default_value_t = 4)]
@@ -504,6 +506,7 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             fresh,
             as_of_unix_ms,
+            known_at_unix_ms,
             reconstruction_mode,
             max_reconstruction_steps,
             max_reconstruction_tokens,
@@ -519,6 +522,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(as_of_unix_ms) = as_of_unix_ms {
                 scope = scope.as_of_unix_ms(as_of_unix_ms);
+            }
+            if let Some(known_at_unix_ms) = known_at_unix_ms {
+                scope = scope.known_at_unix_ms(known_at_unix_ms);
             }
             let mut query = MemoryQuery::new(question, scope)
                 .with_max_tokens(max_tokens)

@@ -27,6 +27,7 @@ pub(crate) fn answer_query(
 ) -> MemoryResult<MemoryAnswer> {
     let now = now_unix_ms();
     let effective_as_of = query.scope.as_of_unix_ms.unwrap_or(now);
+    let effective_known_at = query.scope.known_at_unix_ms;
     let mut routing = route_memory_query(&query.question, &query.modes, query.modes_explicit);
     let mut context = retrieve_with_modes(store, query, weights, effective_as_of, &routing)?;
     if context.selected.is_empty() && routing.routed_modes != routing.allowed_modes {
@@ -66,6 +67,7 @@ pub(crate) fn answer_query(
                 nodes: &nodes,
                 edges: &ranking_edges,
                 as_of_unix_ms: Some(effective_as_of),
+                known_at_unix_ms: effective_known_at,
                 reason,
             },
             reconstructor,
@@ -89,13 +91,17 @@ pub(crate) fn answer_query(
     let selected_ids: BTreeSet<_> = selected.iter().map(|item| item.node_id.clone()).collect();
     let contradictions = contradictions_for(&visible_edges, &selected_ids, &node_by_id);
     let stale_assumptions = stale_assumptions_for(
+        store,
         &selected,
         &contradictions,
         &node_by_id,
         query,
         stale_modes,
-        Some(effective_as_of),
-    );
+        ReadWindow {
+            as_of_unix_ms: Some(effective_as_of),
+            known_at_unix_ms: effective_known_at,
+        },
+    )?;
     let suggested_next_queries = suggested_queries(&query.question, &selected);
     let answer = synthesize_answer(&selected, &contradictions);
     let token_estimate =
@@ -128,6 +134,12 @@ struct RetrievalContext {
     selected: Vec<Evidence>,
 }
 
+#[derive(Clone, Copy)]
+struct ReadWindow {
+    as_of_unix_ms: Option<i64>,
+    known_at_unix_ms: Option<i64>,
+}
+
 fn retrieve_with_modes(
     store: &SqliteMemoryStore,
     query: &MemoryQuery,
@@ -138,30 +150,46 @@ fn retrieve_with_modes(
     let env = query.scope.environment_id.as_deref();
     let query_terms = terms(&query.question);
     let support_kinds = support_kinds_for_modes(&routing.routed_modes);
-    let seeds = store.seed_nodes_observed_by_kinds(
+    let known_at_unix_ms = query.scope.known_at_unix_ms;
+    let seeds = store.seed_nodes_observed_known_by_kinds(
         StoreScope::new(&query.scope.tenant_id, &query.scope.project_id, env),
         &query_terms,
         64,
         Some(effective_as_of),
+        known_at_unix_ms,
         &support_kinds,
     )?;
-    let mut history_nodes = store.all_nodes_observed_by_kinds(
+    let mut raw_history_nodes = store.all_nodes_observed_known_by_kinds(
         &query.scope.tenant_id,
         &query.scope.project_id,
         env,
         effective_as_of,
+        known_at_unix_ms,
         &support_kinds,
     )?;
-    merge_seed_nodes(&mut history_nodes, seeds);
-    let mut nodes = history_nodes.clone();
-    nodes.retain(|node| node.is_active_at(Some(effective_as_of)));
+    merge_seed_nodes(&mut raw_history_nodes, seeds);
+    let mut history_nodes = Vec::new();
+    for node in &raw_history_nodes {
+        if let Some(snapshot) =
+            store.node_snapshot_known_at(node, Some(effective_as_of), known_at_unix_ms)?
+        {
+            history_nodes.push(snapshot);
+        }
+    }
+    let mut nodes = Vec::new();
+    for node in &history_nodes {
+        if store.node_is_visible_at(node, Some(effective_as_of), known_at_unix_ms)? {
+            nodes.push(node.clone());
+        }
+    }
     let active_ids: BTreeSet<_> = nodes.iter().map(|node| node.id.clone()).collect();
     let edges = store.edges_for_scope(&query.scope.tenant_id, &query.scope.project_id, env)?;
     let node_by_id: HashMap<_, _> = history_nodes
         .iter()
         .map(|node| (node.id.clone(), node.clone()))
         .collect();
-    let visible_edges = visible_edges(edges, effective_as_of, &node_by_id);
+    let visible_edges =
+        visible_edges(store, edges, effective_as_of, known_at_unix_ms, &node_by_id)?;
     let ranking_edges: Vec<_> = visible_edges
         .iter()
         .filter(|edge| {
@@ -179,7 +207,9 @@ fn retrieve_with_modes(
         if !modes_accept_kind(&routing.routed_modes, node.kind) {
             continue;
         }
-        if query.require_fresh && !node.is_active_at(Some(effective_as_of)) {
+        if query.require_fresh
+            && !store.node_is_visible_at(node, Some(effective_as_of), known_at_unix_ms)?
+        {
             continue;
         }
         let ppr_score = ppr.get(&node.id).copied().unwrap_or(0.0);
@@ -188,7 +218,7 @@ fn retrieve_with_modes(
             continue;
         }
         let base = base_level(node, effective_as_of);
-        let freshness = freshness(node, effective_as_of, Some(effective_as_of));
+        let freshness = freshness(node, effective_as_of, true);
         let edge_type = edge_strength.get(&node.id).copied().unwrap_or(0.0);
         let score = blend_activation(
             ppr_score.max(lexical * 0.65),
@@ -200,7 +230,11 @@ fn retrieve_with_modes(
         if score <= 0.02 {
             continue;
         }
-        let cited_spans = store.cited_spans_for_node_as_of(&node.id, Some(effective_as_of))?;
+        let cited_spans = store.cited_spans_for_node_read_at(
+            &node.id,
+            Some(effective_as_of),
+            known_at_unix_ms,
+        )?;
         evidence.push(Evidence {
             node_id: node.id.clone(),
             kind: node.kind,
@@ -273,6 +307,7 @@ struct ReconstructionRequest<'a> {
     nodes: &'a [MemoryNode],
     edges: &'a [MemoryEdge],
     as_of_unix_ms: Option<i64>,
+    known_at_unix_ms: Option<i64>,
     reason: ReconstructionReason,
 }
 
@@ -288,6 +323,7 @@ fn reconstruct_active(
         nodes,
         edges,
         as_of_unix_ms,
+        known_at_unix_ms,
         reason,
     } = request;
     let node_by_id: HashMap<_, _> = nodes
@@ -323,6 +359,7 @@ fn reconstruct_active(
 
         let remaining_tokens = query.reconstruction.max_tokens.saturating_sub(tokens_spent);
         let candidates = reconstruction_candidates(CandidateRequest {
+            store,
             query,
             routed_modes,
             expanded_node_id: &expanded_node_id,
@@ -331,7 +368,8 @@ fn reconstruct_active(
             selected_ids: &selected_ids,
             expanded_ids: &expanded,
             as_of_unix_ms,
-        });
+            known_at_unix_ms,
+        })?;
         let (candidates, budget_pruned_node_ids) =
             budget_reconstruction_candidates(candidates, remaining_tokens);
         pruned_node_ids.extend(budget_pruned_node_ids);
@@ -354,7 +392,11 @@ fn reconstruct_active(
                     && let Some(node) = node_by_id.get(&candidate.node_id)
                     && candidate.token_estimate <= remaining_tokens
                 {
-                    let cited_spans = store.cited_spans_for_node_as_of(&node.id, as_of_unix_ms)?;
+                    let cited_spans = store.cited_spans_for_node_read_at(
+                        &node.id,
+                        as_of_unix_ms,
+                        known_at_unix_ms,
+                    )?;
                     tokens_spent += candidate.token_estimate;
                     selected_ids.insert(node.id.clone());
                     accepted_node_ids.push(node.id.clone());
@@ -437,6 +479,7 @@ fn budget_reconstruction_candidates(
 }
 
 struct CandidateRequest<'a> {
+    store: &'a SqliteMemoryStore,
     query: &'a MemoryQuery,
     routed_modes: &'a [MemoryMode],
     expanded_node_id: &'a str,
@@ -445,10 +488,14 @@ struct CandidateRequest<'a> {
     selected_ids: &'a BTreeSet<String>,
     expanded_ids: &'a BTreeSet<String>,
     as_of_unix_ms: Option<i64>,
+    known_at_unix_ms: Option<i64>,
 }
 
-fn reconstruction_candidates(request: CandidateRequest<'_>) -> Vec<ReconstructionCandidate> {
+fn reconstruction_candidates(
+    request: CandidateRequest<'_>,
+) -> MemoryResult<Vec<ReconstructionCandidate>> {
     let CandidateRequest {
+        store,
         query,
         routed_modes,
         expanded_node_id,
@@ -457,6 +504,7 @@ fn reconstruction_candidates(request: CandidateRequest<'_>) -> Vec<Reconstructio
         selected_ids,
         expanded_ids,
         as_of_unix_ms,
+        known_at_unix_ms,
     } = request;
     let mut candidates = BTreeMap::new();
     for edge in edges {
@@ -479,7 +527,9 @@ fn reconstruction_candidates(request: CandidateRequest<'_>) -> Vec<Reconstructio
         if node.kind == MemoryNodeKind::EntityCue || !modes_accept_kind(routed_modes, node.kind) {
             continue;
         }
-        if query.require_fresh && !node.is_active_at(as_of_unix_ms) {
+        if query.require_fresh
+            && !store.node_is_visible_at(node, as_of_unix_ms, known_at_unix_ms)?
+        {
             continue;
         }
         let lexical = overlap_score(&query.question, &node.text);
@@ -499,51 +549,90 @@ fn reconstruction_candidates(request: CandidateRequest<'_>) -> Vec<Reconstructio
             },
         );
     }
-    candidates.into_values().collect()
+    Ok(candidates.into_values().collect())
 }
 
 fn visible_edges(
+    store: &SqliteMemoryStore,
     edges: Vec<MemoryEdge>,
     as_of_unix_ms: i64,
+    known_at_unix_ms: Option<i64>,
     nodes: &HashMap<String, MemoryNode>,
-) -> Vec<MemoryEdge> {
-    edges
-        .into_iter()
-        .filter(|edge| {
-            if matches!(
-                edge.kind,
-                MemoryEdgeKind::Contradicts | MemoryEdgeKind::Supersedes
-            ) {
-                contradiction_edge_visible_at(edge, nodes, as_of_unix_ms)
-            } else {
-                edge.created_at_unix_ms <= as_of_unix_ms
-            }
-        })
-        .collect()
+) -> MemoryResult<Vec<MemoryEdge>> {
+    let mut visible = Vec::new();
+    for edge in edges {
+        let edge_visible = if matches!(
+            edge.kind,
+            MemoryEdgeKind::Contradicts | MemoryEdgeKind::Supersedes
+        ) {
+            contradiction_edge_visible_at(store, &edge, nodes, as_of_unix_ms, known_at_unix_ms)?
+        } else {
+            ordinary_edge_visible_at(store, &edge, nodes, as_of_unix_ms, known_at_unix_ms)?
+        };
+        if edge_visible {
+            visible.push(edge);
+        }
+    }
+    Ok(visible)
 }
 
-fn contradiction_edge_visible_at(
+fn ordinary_edge_visible_at(
+    store: &SqliteMemoryStore,
     edge: &MemoryEdge,
     nodes: &HashMap<String, MemoryNode>,
     as_of_unix_ms: i64,
-) -> bool {
+    known_at_unix_ms: Option<i64>,
+) -> MemoryResult<bool> {
+    if edge.created_at_unix_ms > as_of_unix_ms {
+        return Ok(false);
+    }
+    if known_at_unix_ms.is_none() {
+        return Ok(true);
+    }
+    // Ordinary edges currently have observed time but no source event id. For
+    // known-time reads, hiding them is conservative until edge provenance is
+    // added to the projection schema.
     if !matches!(
         edge.kind,
         MemoryEdgeKind::Contradicts | MemoryEdgeKind::Supersedes
     ) {
-        return false;
+        return Ok(false);
+    }
+    let Some(from_node) = nodes.get(&edge.from_node_id) else {
+        return Ok(false);
+    };
+    let Some(to_node) = nodes.get(&edge.to_node_id) else {
+        return Ok(false);
+    };
+    Ok(
+        store.node_is_visible_at(from_node, Some(as_of_unix_ms), known_at_unix_ms)?
+            && store.node_is_visible_at(to_node, Some(as_of_unix_ms), known_at_unix_ms)?,
+    )
+}
+
+fn contradiction_edge_visible_at(
+    store: &SqliteMemoryStore,
+    edge: &MemoryEdge,
+    nodes: &HashMap<String, MemoryNode>,
+    as_of_unix_ms: i64,
+    known_at_unix_ms: Option<i64>,
+) -> MemoryResult<bool> {
+    if !matches!(
+        edge.kind,
+        MemoryEdgeKind::Contradicts | MemoryEdgeKind::Supersedes
+    ) {
+        return Ok(false);
     }
     let Some(newer) = nodes.get(&edge.from_node_id) else {
-        return false;
+        return Ok(false);
     };
     let Some(older) = nodes.get(&edge.to_node_id) else {
-        return false;
+        return Ok(false);
     };
-    newer.is_active_at(Some(as_of_unix_ms))
-        && older.valid_from_unix_ms <= as_of_unix_ms
-        && older
-            .valid_to_unix_ms
-            .is_some_and(|valid_to| valid_to <= as_of_unix_ms)
+    Ok(
+        store.node_is_visible_at(newer, Some(as_of_unix_ms), known_at_unix_ms)?
+            && store.node_is_stale_at(older, Some(as_of_unix_ms), known_at_unix_ms)?,
+    )
 }
 
 fn merge_seed_nodes(nodes: &mut Vec<MemoryNode>, seeds: Vec<MemoryNode>) {
@@ -662,8 +751,8 @@ fn base_level(node: &MemoryNode, now_unix_ms: i64) -> f32 {
     (count * recency).clamp(0.0, 1.0)
 }
 
-fn freshness(node: &MemoryNode, now_unix_ms: i64, as_of_unix_ms: Option<i64>) -> f32 {
-    if !node.is_active_at(as_of_unix_ms) {
+fn freshness(node: &MemoryNode, now_unix_ms: i64, visible_at_read_time: bool) -> f32 {
+    if !visible_at_read_time {
         return 0.05;
     }
     let age_days = ((now_unix_ms - node.updated_at_unix_ms).max(0) as f32) / 86_400_000.0;
@@ -712,13 +801,14 @@ fn contradictions_for(
 }
 
 fn stale_assumptions_for(
+    store: &SqliteMemoryStore,
     evidence: &[Evidence],
     contradictions: &[Contradiction],
     nodes: &HashMap<String, MemoryNode>,
     query: &MemoryQuery,
     routed_modes: &[MemoryMode],
-    as_of_unix_ms: Option<i64>,
-) -> Vec<StaleAssumption> {
+    window: ReadWindow,
+) -> MemoryResult<Vec<StaleAssumption>> {
     let mut out = BTreeMap::new();
     for node in evidence
         .iter()
@@ -728,45 +818,44 @@ fn stale_assumptions_for(
                 .iter()
                 .filter_map(|item| nodes.get(&item.older_node_id)),
         )
-        .filter(|node| node_is_stale_at(node, as_of_unix_ms))
     {
-        insert_stale_assumption(&mut out, node);
+        if store.node_is_stale_at(node, window.as_of_unix_ms, window.known_at_unix_ms)? {
+            insert_stale_assumption(&mut out, node);
+        }
     }
     for node in nodes
         .values()
         .filter(|node| node.kind != crate::model::MemoryNodeKind::EntityCue)
         .filter(|node| modes_accept_kind(routed_modes, node.kind))
-        .filter(|node| node_is_stale_at(node, as_of_unix_ms))
-        .filter(|node| !has_visible_family_successor(node, nodes, as_of_unix_ms))
         .filter(|node| overlap_score(&query.question, &node.text) > 0.001)
     {
-        insert_stale_assumption(&mut out, node);
-    }
-    out.into_values().collect()
-}
-
-fn node_is_stale_at(node: &MemoryNode, as_of_unix_ms: Option<i64>) -> bool {
-    match as_of_unix_ms {
-        Some(as_of_unix_ms) => {
-            node.valid_from_unix_ms <= as_of_unix_ms
-                && node
-                    .valid_to_unix_ms
-                    .is_some_and(|valid_to| valid_to <= as_of_unix_ms)
+        if store.node_is_stale_at(node, window.as_of_unix_ms, window.known_at_unix_ms)?
+            && !has_visible_family_successor(
+                store,
+                node,
+                nodes,
+                window.as_of_unix_ms,
+                window.known_at_unix_ms,
+            )?
+        {
+            insert_stale_assumption(&mut out, node);
         }
-        None => node.valid_to_unix_ms.is_some() && !node.is_active_at(None),
     }
+    Ok(out.into_values().collect())
 }
 
 fn has_visible_family_successor(
+    store: &SqliteMemoryStore,
     node: &MemoryNode,
     nodes: &HashMap<String, MemoryNode>,
     as_of_unix_ms: Option<i64>,
-) -> bool {
+    known_at_unix_ms: Option<i64>,
+) -> MemoryResult<bool> {
     let Some(valid_to_unix_ms) = node.valid_to_unix_ms else {
-        return false;
+        return Ok(false);
     };
-    nodes.values().any(|candidate| {
-        candidate.id != node.id
+    for candidate in nodes.values() {
+        if candidate.id != node.id
             && candidate.tenant_id == node.tenant_id
             && candidate.project_id == node.project_id
             && candidate.environment_id == node.environment_id
@@ -774,8 +863,12 @@ fn has_visible_family_successor(
             && canonical_family_key(&candidate.canonical_key)
                 == canonical_family_key(&node.canonical_key)
             && candidate.valid_from_unix_ms >= valid_to_unix_ms
-            && candidate.is_active_at(as_of_unix_ms)
-    })
+            && store.node_is_visible_at(candidate, as_of_unix_ms, known_at_unix_ms)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn canonical_family_key(canonical_key: &str) -> &str {
