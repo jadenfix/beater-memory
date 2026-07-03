@@ -45,7 +45,8 @@ expr = code.strip()
 if not expr.startswith("assert "):
     raise SystemExit("json_assert snippets must start with 'assert '")
 expr = expr[len("assert "):].strip()
-if not eval(expr, {"__builtins__": {}}, {"data": data, "any": any, "all": all, "len": len}):
+env = {"data": data, "any": any, "all": all, "len": len, "zip": zip}
+if not eval(expr, {"__builtins__": {}, **env}, env):
     raise SystemExit(f"json assertion failed: {expr}")
 PY
 }
@@ -795,6 +796,79 @@ if [ -s "$TMP_DIR/eval-report-step-override.err" ]; then
   exit 1
 fi
 json_assert "$TMP_DIR/eval-report-step-override.json" 'assert data["passed"] == 6 and any(case["id"] == "workflow" and case["tier_used"] == "active_reconstruction" for case in data["case_reports"])'
+
+cat > "$TMP_DIR/eval-provider-suite.json" <<'JSON'
+{
+  "contract_version": 1,
+  "name": "provider-backed-eval-smoke",
+  "source": {
+    "name": "provider-e2e-smoke",
+    "revision": "local"
+  },
+  "tenant_id": "local",
+  "project_id": "provider-eval",
+  "cases": [
+    {
+      "id": "provider-reconstruction",
+      "ability": "compositional_reasoning",
+      "question": "what fixed quasar42 outage?",
+      "modes": ["semantic"],
+      "max_tokens": 16,
+      "reconstruction": {"mode": "force", "max_steps": 2, "max_tokens": 500},
+      "events": [
+        {
+          "kind": "fact",
+          "text": "Anchor quasar42 provider eval outage marker.",
+          "observed_at_unix_ms": 1000
+        },
+        {
+          "kind": "fact",
+          "text": "Credential nebula73 restored quasar42 service.",
+          "observed_at_unix_ms": 2000
+        }
+      ],
+      "expected_evidence_contains": ["Provider distilled: Credential nebula73 restored service."],
+      "expected_tier": "active_reconstruction"
+    },
+    {
+      "id": "provider-known-at-hidden",
+      "ability": "dynamic_state_tracking",
+      "question": "what is the provider hidden flag?",
+      "modes": ["semantic"],
+      "as_of_unix_ms": 1500,
+      "known_at_unix_ms": 2000,
+      "events": [
+        {
+          "kind": "fact",
+          "text": "The provider hidden flag is omega.",
+          "observed_at_unix_ms": 1000,
+          "ingested_at_unix_ms": 3000
+        }
+      ],
+      "expected_answer_contains": ["No matching memory"],
+      "expected_tier": "activation"
+    }
+  ]
+}
+JSON
+"$BIN" \
+  --distiller provider-command \
+  --distiller-command "$PROVIDER" \
+  --reconstructor provider-command \
+  --reconstructor-command "$RECONSTRUCTOR" \
+  eval --suite "$TMP_DIR/eval-provider-suite.json" \
+  > "$TMP_DIR/eval-provider-report.json" 2> "$TMP_DIR/eval-provider-report.err"
+if [ -s "$TMP_DIR/eval-provider-report.err" ]; then
+  cat "$TMP_DIR/eval-provider-report.err" >&2
+  exit 1
+fi
+json_assert "$TMP_DIR/eval-provider-report.json" 'assert data["suite"] == "provider-backed-eval-smoke" and data["cases"] == 2 and data["passed"] == 2 and data["failed"] == 0'
+json_assert "$TMP_DIR/eval-provider-report.json" 'assert data["project"]["distillation_provider_calls"] == 3 and data["project"]["distillation_provider_errors"] == 0 and data["project"]["distillation_rejections"] == 0 and data["project"]["edges_added"] >= 1'
+json_assert "$TMP_DIR/eval-provider-report.json" 'assert data["project"]["distillation_input_tokens"] > 0 and data["project"]["distillation_output_tokens"] > 0'
+json_assert "$TMP_DIR/eval-provider-report.json" 'assert data["reconstruction_provider_calls"] > 0 and data["reconstruction_provider_errors"] == 0 and data["reconstruction_provider_schema_errors"] == 0'
+json_assert "$TMP_DIR/eval-provider-report.json" 'assert data["reconstruction_provider_input_tokens"] > 0 and data["reconstruction_provider_output_tokens"] > 0'
+json_assert "$TMP_DIR/eval-provider-report.json" 'assert (lambda case: case["tier_used"] == "active_reconstruction" and case["reconstruction_tokens"] > 0 and case["reconstruction_provider_calls"] > 0 and case["reconstruction_provider_input_tokens"] > 0 and case["reconstruction_provider_output_tokens"] > 0 and case["reconstruction_accepted_node_ids"] and any(node_id in case["reconstruction_accepted_node_ids"] and "Credential nebula73 restored service" in text for node_id, text in zip(case["evidence_node_ids"], case["evidence_texts"])))([case for case in data["case_reports"] if case["id"] == "provider-reconstruction"][0])'
+json_assert "$TMP_DIR/eval-provider-report.json" 'assert (lambda case: case["tier_used"] == "activation" and case["answer_excerpt"].startswith("No matching memory"))([case for case in data["case_reports"] if case["id"] == "provider-known-at-hidden"][0])'
 
 cat > "$TMP_DIR/eval-default-version-suite.json" <<'JSON'
 {
