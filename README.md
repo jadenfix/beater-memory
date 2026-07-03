@@ -25,6 +25,8 @@ The current implementation includes:
 - provider-safe distillation boundary with strict JSON schema parsing,
   validation, bounded repair attempts, rejection metrics, and no provider calls
   inside projection write transactions
+- opt-in command-backed provider distillation for CLI and HTTP manage paths,
+  with a per-call timeout and bounded repair attempts
 - memory economics telemetry for projection source/stored-token estimates,
   active stored-token totals, active node counts by kind, and query tier
   latency/token counters
@@ -169,6 +171,69 @@ CLI `remember` and HTTP `/v1/remember` keep their compatibility default of
 managing projections immediately; pass `--no-project` on the CLI or
 `"project": false` over HTTP for a write-only append, then run `manage` or
 `POST /v1/manage` later.
+
+### Provider-backed distillation
+
+Projection commands use the deterministic heuristic distiller by default. To
+run a local provider adapter at manage time, pass global distiller flags before
+the subcommand:
+
+```bash
+cargo run -p beater-memory -- \
+  --distiller provider-command \
+  --distiller-command ./distill-provider \
+  --distiller-timeout-ms 25000 \
+  remember --no-project --tenant local --project demo --kind fact \
+  "Append this first, then manage it with the provider."
+
+cargo run -p beater-memory -- \
+  --distiller provider-command \
+  --distiller-command ./distill-provider \
+  --distiller-arg --model \
+  --distiller-arg gpt-4.1-mini \
+  manage --limit 100
+```
+
+The same flags work for `serve`:
+
+```bash
+BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- \
+  --distiller provider-command \
+  --distiller-command ./distill-provider \
+  serve --bind 127.0.0.1:8765
+```
+
+`--distiller-arg` can pass provider flags that start with `-`; repeating the
+flag passes multiple command arguments. The provider command timeout defaults to
+25s and must be lower than the server DB task timeout when used with `serve`.
+Increase `--db-task-timeout-ms` if a provider, repair budget, or manage batch
+needs more wall-clock time.
+
+The command receives one JSON request on stdin with `request: "distill"` or
+`request: "repair"`, the ledger `event`, `neighbors`, and repair fields for
+malformed output. It must write provider JSON on stdout:
+
+```json
+{
+  "memories": [
+    {
+      "op": "add",
+      "node_kind": "fact",
+      "text": "Distilled memory text",
+      "target_node_id": null,
+      "cited_spans": [
+        {"tenant_id": "local", "project_id": "demo", "trace_id": "trace", "span_id": "span", "seq": 1}
+      ]
+    }
+  ]
+}
+```
+
+Provider projection reports, HTTP metrics, Prometheus metrics, and audit detail
+include provider calls, provider errors, schema errors, repairs, rejections,
+token estimates, and elapsed milliseconds. Projection rebuild is refused when a
+provider-backed distiller is selected, because provider outputs are not yet
+durably batched for replay.
 
 ## Operations
 

@@ -2,10 +2,10 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use beater_memory::{
-    BeaterJsJournal, EvalOptions, EvalSuite, LedgerEvent, MaintenanceOptions, MemoryEngine,
-    MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig, ProjectReport,
-    ReconstructionMode, ReconstructionOptions, SqliteMemoryStore, import_canonical_jsonl,
-    run_eval_suite, serve,
+    BeaterJsJournal, CommandDistillationProviderConfig, DistillerConfig, EvalOptions, EvalSuite,
+    LedgerEvent, MaintenanceOptions, MemoryEngine, MemoryMode, MemoryNodeKind, MemoryQuery,
+    MemoryScope, MemoryServerConfig, ProjectReport, ReconstructionMode, ReconstructionOptions,
+    RuntimeDistiller, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -16,6 +16,21 @@ struct Cli {
     /// Path to the beater-memory SQLite database.
     #[arg(long, global = true, default_value = ".beater-memory/memory.db")]
     db: PathBuf,
+    /// Distiller used by projection commands.
+    #[arg(long, global = true, value_enum, default_value_t = DistillerArg::Heuristic)]
+    distiller: DistillerArg,
+    /// Command to run for `--distiller provider-command`.
+    #[arg(long, global = true)]
+    distiller_command: Option<PathBuf>,
+    /// Extra argument passed to the distillation provider command.
+    #[arg(long = "distiller-arg", global = true, allow_hyphen_values = true)]
+    distiller_args: Vec<String>,
+    /// Provider command timeout in milliseconds.
+    #[arg(long, global = true, default_value_t = 25_000)]
+    distiller_timeout_ms: u64,
+    /// Maximum provider repair attempts after malformed output.
+    #[arg(long, global = true, default_value_t = 1)]
+    distiller_max_repairs: usize,
     #[command(subcommand)]
     command: Command,
 }
@@ -189,6 +204,12 @@ enum Command {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum DistillerArg {
+    Heuristic,
+    ProviderCommand,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum NodeKindArg {
     Episode,
     Fact,
@@ -251,9 +272,66 @@ impl From<ReconstructionModeArg> for ReconstructionMode {
     }
 }
 
+fn distiller_config_from_cli(cli: &Cli) -> anyhow::Result<DistillerConfig> {
+    match cli.distiller {
+        DistillerArg::Heuristic => {
+            if cli.distiller_command.is_some() || !cli.distiller_args.is_empty() {
+                anyhow::bail!(
+                    "--distiller-command and --distiller-arg require --distiller provider-command"
+                );
+            }
+            Ok(DistillerConfig::Heuristic)
+        }
+        DistillerArg::ProviderCommand => {
+            let command = cli
+                .distiller_command
+                .clone()
+                .context("--distiller-command is required when --distiller provider-command")?;
+            let config = CommandDistillationProviderConfig::new(command)
+                .with_args(cli.distiller_args.clone())
+                .with_timeout_ms(cli.distiller_timeout_ms)
+                .with_max_repairs(cli.distiller_max_repairs);
+            config.validate()?;
+            Ok(DistillerConfig::Command(config))
+        }
+    }
+}
+
+fn open_projection_engine(
+    db: &PathBuf,
+    distiller_config: &DistillerConfig,
+) -> anyhow::Result<MemoryEngine<RuntimeDistiller>> {
+    MemoryEngine::open_with_distiller_config(db, distiller_config.clone())
+        .with_context(|| format!("open {}", db.display()))
+}
+
+fn command_uses_projection_distiller(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::ImportBeaterJs { .. }
+            | Command::ImportJsonl { .. }
+            | Command::Remember { .. }
+            | Command::Project { .. }
+            | Command::Manage { .. }
+            | Command::RebuildProjection { .. }
+            | Command::Serve { .. }
+    )
+}
+
+fn projection_distiller_config(config: &Option<DistillerConfig>) -> &DistillerConfig {
+    config
+        .as_ref()
+        .expect("projection distiller config should be built before projection commands")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let distiller_config = if command_uses_projection_distiller(&cli.command) {
+        Some(distiller_config_from_cli(&cli)?)
+    } else {
+        None
+    };
     match cli.command {
         Command::Init => {
             let engine = MemoryEngine::open(&cli.db)
@@ -270,8 +348,8 @@ async fn main() -> anyhow::Result<()> {
             environment,
             project_pending,
         } => {
-            let engine = MemoryEngine::open(&cli.db)
-                .with_context(|| format!("open {}", cli.db.display()))?;
+            let engine =
+                open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
             let report = BeaterJsJournal::new(journal).import_into(
                 engine.store(),
                 &tenant,
@@ -302,8 +380,8 @@ async fn main() -> anyhow::Result<()> {
             environment,
             project_pending,
         } => {
-            let engine = MemoryEngine::open(&cli.db)
-                .with_context(|| format!("open {}", cli.db.display()))?;
+            let engine =
+                open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
             let report = import_canonical_jsonl(
                 path,
                 engine.store(),
@@ -337,8 +415,8 @@ async fn main() -> anyhow::Result<()> {
             no_project,
             text,
         } => {
-            let engine = MemoryEngine::open(&cli.db)
-                .with_context(|| format!("open {}", cli.db.display()))?;
+            let engine =
+                open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
             if idempotency_key
                 .as_deref()
                 .is_some_and(|key| key.trim().is_empty())
@@ -364,14 +442,14 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Project { limit } => {
-            let engine = MemoryEngine::open(&cli.db)
-                .with_context(|| format!("open {}", cli.db.display()))?;
+            let engine =
+                open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
             let report = engine.manage_pending(limit)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Manage { limit } => {
-            let engine = MemoryEngine::open(&cli.db)
-                .with_context(|| format!("open {}", cli.db.display()))?;
+            let engine =
+                open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
             let report = engine.manage_pending(limit)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
@@ -385,8 +463,8 @@ async fn main() -> anyhow::Result<()> {
                     "rebuild clears derived projections; pass --yes-clear-projections to continue"
                 );
             }
-            let engine = MemoryEngine::open(&cli.db)
-                .with_context(|| format!("open {}", cli.db.display()))?;
+            let engine =
+                open_projection_engine(&cli.db, projection_distiller_config(&distiller_config))?;
             let report = engine.rebuild_projection(batch_size, max_events)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
@@ -488,6 +566,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let mut config = MemoryServerConfig::new(&cli.db, bind)
+                .with_distiller_config(projection_distiller_config(&distiller_config).clone())
                 .with_limits(max_body_bytes, max_project_limit, max_query_tokens)
                 .with_audit_limit(max_audit_limit)
                 .with_rate_limit(max_requests_per_minute)

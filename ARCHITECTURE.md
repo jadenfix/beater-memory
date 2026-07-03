@@ -30,7 +30,9 @@ edges are projections that can be rebuilt.
 2. **Distiller**
    - Trait: `Distiller`
    - Current implementations: `HeuristicDistiller` and provider-backed
-     `ProviderDistiller<P>`.
+     `ProviderDistiller<P>`. CLI and server entrypoints select either the
+     heuristic distiller or a command-backed provider adapter with
+     `--distiller provider-command --distiller-command <path>`.
    - Output schema: `DistilledMemory { ADD | UPDATE | INVALIDATE | NOOP }`;
      provider JSON uses the enum's snake_case wire values (`"add"`,
      `"update"`, `"invalidate"`, `"noop"`). Provider output is parsed through a
@@ -47,6 +49,9 @@ edges are projections that can be rebuilt.
      deterministic replay. Provider-backed distillers skip late replay until
      projected provider batches are durable, preserving rebuild consistency and
      avoiding provider failures after a current event commits.
+   - Projection rebuild is also allowed only for replay-safe distillers. The
+     provider-command runtime path rejects rebuild before clearing derived
+     projection tables.
 
 3. **Typed Graph Projection**
    - Nodes: `Episode`, `Fact`, `EntityCue`, `Tag`, `Procedure`, `State`,
@@ -99,11 +104,14 @@ edges are projections that can be rebuilt.
      timeout are configurable at startup. Public request limits must be
      positive; the rate limiter, DB concurrency limiter, and DB timeout keep
      their documented zero-value controls.
+     Provider-command distillation has its own per-call timeout, and server
+     startup rejects provider timeouts greater than or equal to the DB task
+     timeout so a single provider call cannot race the HTTP timeout boundary.
    - Controls: a fixed-window per-actor limiter protects `/v1/*`; in-memory
      JSON and Prometheus service metrics expose request totals, DB saturation,
-     DB timeouts, and query counts/latency/token totals by retrieval tier;
-     durable audit rows record successes, failures, denied auth, and throttled
-     attempts.
+     DB timeouts, distillation provider counters, and query counts/latency/token
+     totals by retrieval tier; durable audit rows record successes, failures,
+     denied auth, throttled attempts, and projection summaries.
    - Economics telemetry: projection reports include source-token estimates,
      projected memory-token estimates, and distillation provider counters;
      store stats expose total/active stored-memory tokens and active node counts
