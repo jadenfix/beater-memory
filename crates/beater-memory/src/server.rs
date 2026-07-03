@@ -289,6 +289,8 @@ pub struct ServiceMetricsSnapshot {
     #[serde(default)]
     pub distillation_rejections: u64,
     #[serde(default)]
+    pub distillation_replayed_batches: u64,
+    #[serde(default)]
     pub distillation_input_tokens: u64,
     #[serde(default)]
     pub distillation_output_tokens: u64,
@@ -343,6 +345,7 @@ impl ServiceMetricsSnapshot {
             distillation_repair_attempts: 0,
             distillation_repair_successes: 0,
             distillation_rejections: 0,
+            distillation_replayed_batches: 0,
             distillation_input_tokens: 0,
             distillation_output_tokens: 0,
             distillation_elapsed_ms: 0,
@@ -378,6 +381,7 @@ impl ServiceMetricsSnapshot {
         self.distillation_repair_attempts += report.distillation_repair_attempts as u64;
         self.distillation_repair_successes += report.distillation_repair_successes as u64;
         self.distillation_rejections += report.distillation_rejections as u64;
+        self.distillation_replayed_batches += report.distillation_replayed_batches as u64;
         self.distillation_input_tokens += u64::from(report.distillation_input_tokens);
         self.distillation_output_tokens += u64::from(report.distillation_output_tokens);
         self.distillation_elapsed_ms += report.distillation_elapsed_ms;
@@ -1327,6 +1331,7 @@ fn project_report_detail(report: &ProjectReport) -> serde_json::Value {
         "distillation_repair_attempts": report.distillation_repair_attempts,
         "distillation_repair_successes": report.distillation_repair_successes,
         "distillation_rejections": report.distillation_rejections,
+        "distillation_replayed_batches": report.distillation_replayed_batches,
         "distillation_input_tokens": report.distillation_input_tokens,
         "distillation_output_tokens": report.distillation_output_tokens,
         "distillation_elapsed_ms": report.distillation_elapsed_ms,
@@ -1524,6 +1529,15 @@ fn render_prometheus_metrics(snapshot: &ServiceMetricsSnapshot, now_unix_ms: i64
         &mut output,
         "beater_memory_distillation_provider_errors_total",
         snapshot.distillation_provider_errors,
+    );
+    output.push_str(
+        "# HELP beater_memory_distillation_replay_batches_total Total durable distillation batches replayed.\n",
+    );
+    output.push_str("# TYPE beater_memory_distillation_replay_batches_total counter\n");
+    push_prometheus_unlabeled_counter(
+        &mut output,
+        "beater_memory_distillation_replay_batches_total",
+        snapshot.distillation_replayed_batches,
     );
     output.push_str("# HELP beater_memory_distillation_schema_total Total distillation schema and repair outcomes.\n");
     output.push_str("# TYPE beater_memory_distillation_schema_total counter\n");
@@ -2694,6 +2708,7 @@ mod tests {
         assert!(text.contains("beater_memory_http_requests_total{category=\"successful\"} 3"));
         assert!(text.contains("beater_memory_http_route_requests_total{route=\"metrics\"} 1"));
         assert!(text.contains("beater_memory_db_requests_total{outcome=\"busy\"} 0"));
+        assert!(text.contains("beater_memory_distillation_replay_batches_total 0"));
         assert!(text.contains("beater_memory_query_tier_requests_total{tier=\"activation\"} 1"));
         assert!(text.contains(
             "beater_memory_query_tier_tokens_total{tier=\"activation\",token_kind=\"answer\"}"

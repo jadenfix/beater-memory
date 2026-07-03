@@ -46,12 +46,19 @@ edges are projections that can be rebuilt.
      Rejected provider output leaves the ledger event pending and reports
      provider, repair, rejection, token, and elapsed counters.
    - Late-arrival replay is enabled only for distillers that opt into
-     deterministic replay. Provider-backed distillers skip late replay until
-     projected provider batches are durable, preserving rebuild consistency and
-     avoiding provider failures after a current event commits.
-   - Projection rebuild is also allowed only for replay-safe distillers. The
-     provider-command runtime path rejects rebuild before clearing derived
-     projection tables.
+     deterministic replay. Provider-backed distillers skip late replay unless
+     they can safely replay a durable accepted batch for the event.
+   - Projection rebuild is allowed for replay-safe distillers and for
+     provider-command projections with complete durable distillation batches for
+     the selected replay fingerprint. Command-provider rebuild checks batch
+     coverage before clearing derived projection tables, then replays stored
+     batches without provider calls. Replayable provider batches require
+     explicit `target_node_id` values for `update` and `invalidate`, preventing
+     rebuild from re-resolving targetless revisions against a different neighbor
+     set. The current fingerprint covers the command path string, JSON args, and
+     effective repair budget; provider binary contents, environment variables,
+     cwd behavior, timeout, and model settings must be represented in args if
+     they should affect replay identity.
 
 3. **Typed Graph Projection**
    - Nodes: `Episode`, `Fact`, `EntityCue`, `Tag`, `Procedure`, `State`,
