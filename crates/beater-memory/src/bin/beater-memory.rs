@@ -2,12 +2,15 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use beater_memory::{
-    BeaterJsJournal, CommandDistillationProviderConfig, DistillerConfig, EvalOptions, EvalSuite,
-    LedgerEvent, MaintenanceOptions, MemoryEngine, MemoryMode, MemoryNodeKind, MemoryQuery,
-    MemoryScope, MemoryServerConfig, ProjectReport, ReconstructionMode, ReconstructionOptions,
-    RuntimeDistiller, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite, serve,
+    BeaterJsJournal, CommandDistillationProviderConfig, CommandReconstructionProviderConfig,
+    DistillerConfig, EvalOptions, EvalSuite, LedgerEvent, MaintenanceOptions, MemoryEngine,
+    MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig, ProjectReport,
+    ReconstructionMode, ReconstructionOptions, ReconstructorConfig, RuntimeDistiller,
+    RuntimeReconstructor, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
+
+const DEFAULT_RECONSTRUCTOR_TIMEOUT_MS: u64 = 25_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "beater-memory")]
@@ -31,6 +34,18 @@ struct Cli {
     /// Maximum provider repair attempts after malformed output.
     #[arg(long, global = true, default_value_t = 1)]
     distiller_max_repairs: usize,
+    /// Active reconstructor used by query and serve commands.
+    #[arg(long, global = true, value_enum, default_value_t = ReconstructorArg::Deterministic)]
+    reconstructor: ReconstructorArg,
+    /// Command to run for `--reconstructor provider-command`.
+    #[arg(long, global = true)]
+    reconstructor_command: Option<PathBuf>,
+    /// Extra argument passed to the active reconstruction provider command.
+    #[arg(long = "reconstructor-arg", global = true, allow_hyphen_values = true)]
+    reconstructor_args: Vec<String>,
+    /// Active reconstruction provider command timeout in milliseconds.
+    #[arg(long, global = true, default_value_t = DEFAULT_RECONSTRUCTOR_TIMEOUT_MS)]
+    reconstructor_timeout_ms: u64,
     #[command(subcommand)]
     command: Command,
 }
@@ -209,6 +224,12 @@ enum DistillerArg {
     ProviderCommand,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReconstructorArg {
+    Deterministic,
+    ProviderCommand,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum NodeKindArg {
     Episode,
@@ -297,12 +318,48 @@ fn distiller_config_from_cli(cli: &Cli) -> anyhow::Result<DistillerConfig> {
     }
 }
 
+fn reconstructor_config_from_cli(cli: &Cli) -> anyhow::Result<ReconstructorConfig> {
+    match cli.reconstructor {
+        ReconstructorArg::Deterministic => {
+            if cli.reconstructor_command.is_some() || !cli.reconstructor_args.is_empty() {
+                anyhow::bail!(
+                    "--reconstructor-command and --reconstructor-arg require --reconstructor provider-command"
+                );
+            }
+            Ok(ReconstructorConfig::Deterministic)
+        }
+        ReconstructorArg::ProviderCommand => {
+            let command = cli.reconstructor_command.clone().context(
+                "--reconstructor-command is required when --reconstructor provider-command",
+            )?;
+            let config = CommandReconstructionProviderConfig::new(command)
+                .with_args(cli.reconstructor_args.clone())
+                .with_timeout_ms(cli.reconstructor_timeout_ms);
+            config.validate()?;
+            Ok(ReconstructorConfig::Command(config))
+        }
+    }
+}
+
 fn open_projection_engine(
     db: &PathBuf,
     distiller_config: &DistillerConfig,
 ) -> anyhow::Result<MemoryEngine<RuntimeDistiller>> {
     MemoryEngine::open_with_distiller_config(db, distiller_config.clone())
         .with_context(|| format!("open {}", db.display()))
+}
+
+fn open_runtime_engine(
+    db: &PathBuf,
+    distiller_config: &DistillerConfig,
+    reconstructor_config: &ReconstructorConfig,
+) -> anyhow::Result<MemoryEngine<RuntimeDistiller, RuntimeReconstructor>> {
+    MemoryEngine::open_with_runtime_config(
+        db,
+        distiller_config.clone(),
+        reconstructor_config.clone(),
+    )
+    .with_context(|| format!("open {}", db.display()))
 }
 
 fn command_uses_projection_distiller(command: &Command) -> bool {
@@ -318,17 +375,42 @@ fn command_uses_projection_distiller(command: &Command) -> bool {
     )
 }
 
+fn command_uses_reconstructor(command: &Command) -> bool {
+    matches!(command, Command::Query { .. } | Command::Serve { .. })
+}
+
+fn reconstructor_flags_present(cli: &Cli) -> bool {
+    cli.reconstructor != ReconstructorArg::Deterministic
+        || cli.reconstructor_command.is_some()
+        || !cli.reconstructor_args.is_empty()
+        || cli.reconstructor_timeout_ms != DEFAULT_RECONSTRUCTOR_TIMEOUT_MS
+}
+
 fn projection_distiller_config(config: &Option<DistillerConfig>) -> &DistillerConfig {
     config
         .as_ref()
         .expect("projection distiller config should be built before projection commands")
 }
 
+fn runtime_reconstructor_config(config: &Option<ReconstructorConfig>) -> &ReconstructorConfig {
+    config
+        .as_ref()
+        .expect("runtime reconstructor config should be built before query commands")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if !command_uses_reconstructor(&cli.command) && reconstructor_flags_present(&cli) {
+        anyhow::bail!("--reconstructor-* flags are only supported by query and serve");
+    }
     let distiller_config = if command_uses_projection_distiller(&cli.command) {
         Some(distiller_config_from_cli(&cli)?)
+    } else {
+        None
+    };
+    let reconstructor_config = if command_uses_reconstructor(&cli.command) {
+        Some(reconstructor_config_from_cli(&cli)?)
     } else {
         None
     };
@@ -567,6 +649,9 @@ async fn main() -> anyhow::Result<()> {
             }
             let mut config = MemoryServerConfig::new(&cli.db, bind)
                 .with_distiller_config(projection_distiller_config(&distiller_config).clone())
+                .with_reconstructor_config(
+                    runtime_reconstructor_config(&reconstructor_config).clone(),
+                )
                 .with_limits(max_body_bytes, max_project_limit, max_query_tokens)
                 .with_audit_limit(max_audit_limit)
                 .with_rate_limit(max_requests_per_minute)
@@ -593,8 +678,11 @@ async fn main() -> anyhow::Result<()> {
             json,
             question,
         } => {
-            let engine = MemoryEngine::open(&cli.db)
-                .with_context(|| format!("open {}", cli.db.display()))?;
+            let engine = open_runtime_engine(
+                &cli.db,
+                &DistillerConfig::default(),
+                runtime_reconstructor_config(&reconstructor_config),
+            )?;
             let mut scope = MemoryScope::new(tenant, project);
             if let Some(environment) = environment {
                 scope = scope.with_environment(environment);

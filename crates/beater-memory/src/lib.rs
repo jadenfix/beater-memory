@@ -39,8 +39,10 @@ pub use model::{
     estimate_tokens,
 };
 pub use reconstruct::{
-    ActiveReconstructor, DeterministicReconstructor, ReconstructionCandidate,
-    ReconstructionDecision, ReconstructionStep,
+    ActiveReconstructor, CommandReconstructionProvider, CommandReconstructionProviderConfig,
+    DeterministicReconstructor, ProviderReconstructor, ReconstructionCandidate,
+    ReconstructionDecision, ReconstructionDecisionOutcome, ReconstructionMetrics,
+    ReconstructionProvider, ReconstructionStep, ReconstructorConfig, RuntimeReconstructor,
 };
 pub use server::{
     AuditHttpQuery, AuditHttpResponse, LiveResponse, MaintenanceHttpRequest, MemoryServerConfig,

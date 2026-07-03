@@ -9,7 +9,9 @@ use crate::{
         ActivationWeights, BeliefRevisionOp, DistilledMemory, MemoryAnswer, MemoryEdgeKind,
         MemoryNodeKind, MemoryQuery,
     },
-    reconstruct::{ActiveReconstructor, DeterministicReconstructor},
+    reconstruct::{
+        ActiveReconstructor, DeterministicReconstructor, ReconstructorConfig, RuntimeReconstructor,
+    },
     store::{LedgerEvent, MemoryNode, ProjectionResetReport, SqliteMemoryStore, StoreScope},
     text::{now_unix_ms, overlap_score, top_terms},
 };
@@ -116,6 +118,31 @@ impl MemoryEngine<RuntimeDistiller, DeterministicReconstructor> {
         Ok(Self::new(
             SqliteMemoryStore::in_memory()?,
             distiller.build()?,
+        ))
+    }
+}
+
+impl MemoryEngine<RuntimeDistiller, RuntimeReconstructor> {
+    pub fn open_with_runtime_config(
+        path: impl AsRef<std::path::Path>,
+        distiller: DistillerConfig,
+        reconstructor: ReconstructorConfig,
+    ) -> MemoryResult<Self> {
+        Ok(Self::new_with_reconstructor(
+            SqliteMemoryStore::open(path)?,
+            distiller.build()?,
+            reconstructor.build()?,
+        ))
+    }
+
+    pub fn in_memory_with_runtime_config(
+        distiller: DistillerConfig,
+        reconstructor: ReconstructorConfig,
+    ) -> MemoryResult<Self> {
+        Ok(Self::new_with_reconstructor(
+            SqliteMemoryStore::in_memory()?,
+            distiller.build()?,
+            reconstructor.build()?,
         ))
     }
 }
@@ -1148,7 +1175,10 @@ mod tests {
             MemoryMode, MemoryScope, MemoryTier, ReconstructionMode, ReconstructionOptions,
             ReconstructionReason, RoutingReason,
         },
-        reconstruct::{ReconstructionDecision, ReconstructionStep},
+        reconstruct::{
+            ProviderReconstructor, ReconstructionDecision, ReconstructionDecisionOutcome,
+            ReconstructionMetrics, ReconstructionProvider, ReconstructionStep,
+        },
     };
 
     use std::sync::{
@@ -1162,10 +1192,14 @@ mod tests {
     struct BadReconstructor;
 
     impl ActiveReconstructor for BadReconstructor {
-        fn decide(&self, _step: &ReconstructionStep) -> ReconstructionDecision {
-            ReconstructionDecision::Accept {
+        fn decide(
+            &self,
+            _step: &ReconstructionStep,
+        ) -> MemoryResult<crate::ReconstructionDecisionOutcome> {
+            Ok(ReconstructionDecision::Accept {
                 node_id: "missing-node".to_string(),
             }
+            .into_outcome())
         }
     }
 
@@ -1173,10 +1207,14 @@ mod tests {
     struct BadPruneReconstructor;
 
     impl ActiveReconstructor for BadPruneReconstructor {
-        fn decide(&self, _step: &ReconstructionStep) -> ReconstructionDecision {
-            ReconstructionDecision::Prune {
+        fn decide(
+            &self,
+            _step: &ReconstructionStep,
+        ) -> MemoryResult<crate::ReconstructionDecisionOutcome> {
+            Ok(ReconstructionDecision::Prune {
                 node_id: "missing-node".to_string(),
             }
+            .into_outcome())
         }
     }
 
@@ -1418,6 +1456,200 @@ mod tests {
         assert_eq!(reconstruction.reason, ReconstructionReason::Forced);
         assert!(reconstruction.accepted_node_ids.contains(&target.id));
         assert!(answer.evidence.iter().any(|item| item.node_id == target.id));
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct MetricsReconstructor;
+
+    impl ActiveReconstructor for MetricsReconstructor {
+        fn decide(&self, step: &ReconstructionStep) -> MemoryResult<ReconstructionDecisionOutcome> {
+            let decision = step
+                .candidates
+                .first()
+                .map(|candidate| ReconstructionDecision::Accept {
+                    node_id: candidate.node_id.clone(),
+                })
+                .unwrap_or(ReconstructionDecision::Stop);
+            Ok(ReconstructionDecisionOutcome {
+                decision,
+                metrics: ReconstructionMetrics {
+                    provider_calls: 1,
+                    provider_errors: 0,
+                    schema_errors: 0,
+                    input_tokens: 11,
+                    output_tokens: 3,
+                    elapsed_ms: 7,
+                },
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct AcceptFirstProvider;
+
+    impl ReconstructionProvider for AcceptFirstProvider {
+        fn decide(&self, step: &ReconstructionStep) -> MemoryResult<String> {
+            Ok(step
+                .candidates
+                .first()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "decision": "accept",
+                        "node_id": candidate.node_id.clone(),
+                    })
+                    .to_string()
+                })
+                .unwrap_or_else(|| serde_json::json!({"decision": "stop"}).to_string()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PruneFirstProvider;
+
+    impl ReconstructionProvider for PruneFirstProvider {
+        fn decide(&self, step: &ReconstructionStep) -> MemoryResult<String> {
+            Ok(step
+                .candidates
+                .first()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "decision": "prune",
+                        "node_id": candidate.node_id.clone(),
+                    })
+                    .to_string()
+                })
+                .unwrap_or_else(|| serde_json::json!({"decision": "stop"}).to_string()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct InvalidJsonProvider;
+
+    impl ReconstructionProvider for InvalidJsonProvider {
+        fn decide(&self, _step: &ReconstructionStep) -> MemoryResult<String> {
+            Ok("not json".to_string())
+        }
+    }
+
+    #[test]
+    fn reconstruction_report_includes_provider_metrics() -> MemoryResult<()> {
+        let engine = MemoryEngine::new_with_reconstructor(
+            SqliteMemoryStore::in_memory()?,
+            HeuristicDistiller::default(),
+            MetricsReconstructor,
+        )
+        .with_activation_weights(ActivationWeights {
+            ppr: 0.0,
+            base_level: 0.0,
+            edge_type: 0.0,
+            freshness: 0.0,
+        });
+        linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic])
+                .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+        let reconstruction = answer.reconstruction.expect("reconstruction report");
+
+        assert_eq!(reconstruction.provider_calls, 2);
+        assert_eq!(reconstruction.provider_errors, 0);
+        assert_eq!(reconstruction.provider_input_tokens, 22);
+        assert_eq!(reconstruction.provider_output_tokens, 6);
+        assert_eq!(reconstruction.provider_elapsed_ms, 14);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_reconstructor_expands_linked_evidence_through_engine() -> MemoryResult<()> {
+        let engine = MemoryEngine::new_with_reconstructor(
+            SqliteMemoryStore::in_memory()?,
+            HeuristicDistiller::default(),
+            ProviderReconstructor::new(AcceptFirstProvider),
+        )
+        .with_activation_weights(ActivationWeights {
+            ppr: 0.0,
+            base_level: 0.0,
+            edge_type: 0.0,
+            freshness: 0.0,
+        });
+        let (_source, target) = linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic])
+                .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+        let reconstruction = answer.reconstruction.expect("reconstruction report");
+
+        assert_eq!(answer.tier_used, MemoryTier::ActiveReconstruction);
+        assert!(answer.evidence.iter().any(|item| item.node_id == target.id));
+        assert!(reconstruction.accepted_node_ids.contains(&target.id));
+        assert!(reconstruction.provider_calls > 0);
+        assert_eq!(reconstruction.provider_errors, 0);
+        assert_eq!(reconstruction.provider_schema_errors, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_reconstructor_prune_records_candidate_without_accepting() -> MemoryResult<()> {
+        let engine = MemoryEngine::new_with_reconstructor(
+            SqliteMemoryStore::in_memory()?,
+            HeuristicDistiller::default(),
+            ProviderReconstructor::new(PruneFirstProvider),
+        )
+        .with_activation_weights(ActivationWeights {
+            ppr: 0.0,
+            base_level: 0.0,
+            edge_type: 0.0,
+            freshness: 0.0,
+        });
+        let (_source, target) = linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic])
+                .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+        let reconstruction = answer.reconstruction.expect("reconstruction report");
+
+        assert!(!answer.evidence.iter().any(|item| item.node_id == target.id));
+        assert!(!reconstruction.accepted_node_ids.contains(&target.id));
+        assert!(reconstruction.pruned_node_ids.contains(&target.id));
+        assert_eq!(reconstruction.provider_errors, 0);
+        assert_eq!(reconstruction.provider_schema_errors, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_reconstructor_schema_failure_stops_without_query_error() -> MemoryResult<()> {
+        let engine = MemoryEngine::new_with_reconstructor(
+            SqliteMemoryStore::in_memory()?,
+            HeuristicDistiller::default(),
+            ProviderReconstructor::new(InvalidJsonProvider),
+        )
+        .with_activation_weights(ActivationWeights {
+            ppr: 0.0,
+            base_level: 0.0,
+            edge_type: 0.0,
+            freshness: 0.0,
+        });
+        let (_source, target) = linked_reconstruction_fixture(&engine, 1_000, 1_001, 1_001)?;
+
+        let answer = engine.query(
+            &MemoryQuery::new("incident alpha", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic])
+                .with_reconstruction(ReconstructionOptions::force()),
+        )?;
+        let reconstruction = answer.reconstruction.expect("reconstruction report");
+
+        assert_eq!(answer.tier_used, MemoryTier::ActiveReconstruction);
+        assert!(!answer.evidence.iter().any(|item| item.node_id == target.id));
+        assert_eq!(reconstruction.provider_calls, 1);
+        assert_eq!(reconstruction.provider_errors, 0);
+        assert_eq!(reconstruction.provider_schema_errors, 1);
         Ok(())
     }
 
