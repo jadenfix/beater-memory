@@ -3,8 +3,9 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use beater_memory::{
     BeaterJsJournal, EvalOptions, EvalSuite, LedgerEvent, MaintenanceOptions, MemoryEngine,
-    MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig, ReconstructionMode,
-    ReconstructionOptions, SqliteMemoryStore, import_canonical_jsonl, run_eval_suite, serve,
+    MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryServerConfig, ProjectReport,
+    ReconstructionMode, ReconstructionOptions, SqliteMemoryStore, import_canonical_jsonl,
+    run_eval_suite, serve,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -61,10 +62,17 @@ enum Command {
         kind: NodeKindArg,
         #[arg(long)]
         idempotency_key: Option<String>,
+        #[arg(long)]
+        no_project: bool,
         text: String,
     },
     /// Project pending ledger events into graph memory.
     Project {
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
+    /// Manage pending ledger events into graph memory.
+    Manage {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
@@ -324,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
             environment,
             kind,
             idempotency_key,
+            no_project,
             text,
         } => {
             let engine = MemoryEngine::open(&cli.db)
@@ -345,13 +354,23 @@ async fn main() -> anyhow::Result<()> {
                 event.apply_idempotency_key(idempotency_key);
             }
             engine.ingest_event(&event)?;
-            let report = engine.project_pending(100)?;
+            let report = if no_project {
+                ProjectReport::default()
+            } else {
+                engine.manage_pending(100)?
+            };
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Project { limit } => {
             let engine = MemoryEngine::open(&cli.db)
                 .with_context(|| format!("open {}", cli.db.display()))?;
-            let report = engine.project_pending(limit)?;
+            let report = engine.manage_pending(limit)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Manage { limit } => {
+            let engine = MemoryEngine::open(&cli.db)
+                .with_context(|| format!("open {}", cli.db.display()))?;
+            let report = engine.manage_pending(limit)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::RebuildProjection {

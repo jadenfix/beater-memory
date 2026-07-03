@@ -663,7 +663,10 @@ impl DistilledMemory {
             validate_required_identifier("target_node_id", target_node_id)?;
         }
         match self.op {
-            BeliefRevisionOp::Add | BeliefRevisionOp::Update => {
+            BeliefRevisionOp::Add => {
+                validate_required_text("text", &self.text)?;
+            }
+            BeliefRevisionOp::Update => {
                 validate_required_text("text", &self.text)?;
             }
             BeliefRevisionOp::Invalidate => {

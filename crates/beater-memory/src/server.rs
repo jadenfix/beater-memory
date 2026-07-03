@@ -250,6 +250,8 @@ pub struct ServiceMetricsSnapshot {
     pub health_requests: u64,
     pub stats_requests: u64,
     pub remember_requests: u64,
+    #[serde(default)]
+    pub manage_requests: u64,
     pub project_requests: u64,
     pub query_requests: u64,
     pub maintenance_requests: u64,
@@ -291,6 +293,7 @@ impl ServiceMetricsSnapshot {
             health_requests: 0,
             stats_requests: 0,
             remember_requests: 0,
+            manage_requests: 0,
             project_requests: 0,
             query_requests: 0,
             maintenance_requests: 0,
@@ -310,6 +313,7 @@ impl ServiceMetricsSnapshot {
             "health" => self.health_requests += 1,
             "stats" => self.stats_requests += 1,
             "remember" => self.remember_requests += 1,
+            "manage" => self.manage_requests += 1,
             "project" => self.project_requests += 1,
             "query" => self.query_requests += 1,
             "maintenance" => self.maintenance_requests += 1,
@@ -555,6 +559,7 @@ pub fn try_memory_router(config: MemoryServerConfig) -> MemoryResult<Router> {
         .route("/v1/metrics/prometheus", get(metrics_prometheus))
         .route("/v1/audit", get(audit))
         .route("/v1/remember", post(remember))
+        .route("/v1/manage", post(manage))
         .route("/v1/project", post(project))
         .route("/v1/query", post(query))
         .route("/v1/maintenance", post(maintenance))
@@ -837,13 +842,31 @@ async fn project(
     headers: HeaderMap,
     Json(request): Json<ProjectHttpRequest>,
 ) -> Result<Json<ProjectReport>, ApiError> {
-    let ctx = begin_request(&state, &headers, "project", "/v1/project").await?;
+    manage_request(state, headers, request, "project", "/v1/project").await
+}
+
+async fn manage(
+    State(state): State<MemoryServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ProjectHttpRequest>,
+) -> Result<Json<ProjectReport>, ApiError> {
+    manage_request(state, headers, request, "manage", "/v1/manage").await
+}
+
+async fn manage_request(
+    state: MemoryServerState,
+    headers: HeaderMap,
+    request: ProjectHttpRequest,
+    action: &'static str,
+    route: &'static str,
+) -> Result<Json<ProjectReport>, ApiError> {
+    let ctx = begin_request(&state, &headers, action, route).await?;
     let limit = request.limit.unwrap_or(1000);
     if limit == 0 {
         return fail_request(
             &state,
             &ctx,
-            ApiError::bad_request("project limit must be greater than 0"),
+            ApiError::bad_request(format!("{action} limit must be greater than 0")),
         )
         .await;
     }
@@ -852,13 +875,13 @@ async fn project(
             &state,
             &ctx,
             ApiError::bad_request(format!(
-                "project limit {limit} exceeds configured max {}",
+                "{action} limit {limit} exceeds configured max {}",
                 state.config.max_project_limit
             )),
         )
         .await;
     }
-    let result = with_engine(state.clone(), move |engine| engine.project_pending(limit)).await;
+    let result = with_engine(state.clone(), move |engine| engine.manage_pending(limit)).await;
     finish_request(state, ctx, result, serde_json::json!({ "limit": limit })).await
 }
 
@@ -1305,6 +1328,13 @@ fn render_prometheus_metrics(snapshot: &ServiceMetricsSnapshot, now_unix_ms: i64
         "route",
         "remember",
         snapshot.remember_requests,
+    );
+    push_prometheus_counter(
+        &mut output,
+        "beater_memory_http_route_requests_total",
+        "route",
+        "manage",
+        snapshot.manage_requests,
     );
     push_prometheus_counter(
         &mut output,
@@ -1929,6 +1959,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manage_alias_projects_write_only_remembered_events() {
+        let app = memory_router(test_config().with_bearer_token("secret"));
+        let remember = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "kind": "fact",
+            "text": "Checkout uses DATABASE_URL.",
+            "project": false
+        });
+
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/remember", remember))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let remembered: RememberHttpResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert!(remembered.ingested);
+        assert!(remembered.project.is_none());
+
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/manage", serde_json::json!({"limit": 10})))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let report: ProjectReport =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(report.events_projected, 1);
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/v1/stats"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let stats: StoreStats = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(stats.pending_events, 0);
+        assert!(stats.active_nodes > 0);
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/v1/metrics"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let metrics: ServiceMetricsSnapshot =
+            serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(metrics.manage_requests, 1);
+
+        let response = app
+            .oneshot(get_request("/v1/metrics/prometheus"))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let prometheus = String::from_utf8(body.to_vec()).unwrap_or_else(|err| panic!("{err}"));
+        assert!(prometheus.contains("route=\"manage\""));
+    }
+
+    #[tokio::test]
     async fn remember_rejects_empty_idempotency_key() {
         let app = memory_router(test_config().with_bearer_token("secret"));
         let remember = serde_json::json!({
@@ -1964,6 +2070,46 @@ mod tests {
         let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(error.error.code, "bad_request");
         assert!(error.error.message.contains("project limit"));
+    }
+
+    #[tokio::test]
+    async fn manage_rejects_invalid_limits_over_http() {
+        let app = memory_router(
+            test_config()
+                .with_bearer_token("secret")
+                .with_limits(4096, 10, 100),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/manage",
+                serde_json::json!({ "limit": 0 }),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "bad_request");
+        assert!(error.error.message.contains("manage limit"));
+
+        let response = app
+            .oneshot(json_request(
+                "/v1/manage",
+                serde_json::json!({ "limit": 11 }),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let error: ErrorBody = serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(error.error.code, "bad_request");
+        assert!(error.error.message.contains("manage limit 11"));
     }
 
     #[tokio::test]

@@ -111,6 +111,21 @@ json_assert "$TMP_DIR/init.json" 'assert data["ledger_events"] == 0'
 "$BIN" --db "$DB" remember \
   --tenant local \
   --project demo \
+  --kind fact \
+  --no-project \
+  "Write-only memory marker beta." \
+  > "$TMP_DIR/remember-write-only.json"
+json_assert "$TMP_DIR/remember-write-only.json" 'assert data["events_projected"] == 0 and data["memories_added"] == 0'
+"$BIN" --db "$DB" stats > "$TMP_DIR/stats-write-only.json"
+json_assert "$TMP_DIR/stats-write-only.json" 'assert data["ledger_events"] == 1 and data["pending_events"] == 1 and data["nodes"] == 0'
+"$BIN" --db "$DB" manage --limit 1 > "$TMP_DIR/manage-write-only.json"
+json_assert "$TMP_DIR/manage-write-only.json" 'assert data["events_projected"] == 1 and data["memories_added"] >= 1'
+"$BIN" --db "$DB" stats > "$TMP_DIR/stats-managed.json"
+json_assert "$TMP_DIR/stats-managed.json" 'assert data["pending_events"] == 0 and data["nodes"] > 0'
+
+"$BIN" --db "$DB" remember \
+  --tenant local \
+  --project demo \
   --kind gotcha \
   --idempotency-key checkout-db \
   "Checkout fails when DATABASE_URL is missing. Fix by setting DATABASE_URL." \

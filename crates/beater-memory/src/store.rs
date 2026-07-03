@@ -184,6 +184,11 @@ impl MemoryNode {
                 .map(|valid_to| valid_to > as_of)
                 .unwrap_or(true)
     }
+
+    #[must_use]
+    pub(crate) fn family_canonical_key(&self) -> &str {
+        family_canonical_key(&self.canonical_key)
+    }
 }
 
 /// A typed relationship between projected nodes.
@@ -215,6 +220,16 @@ impl<'a> StoreScope<'a> {
             environment_id,
         }
     }
+}
+
+struct NodeUpsert<'a> {
+    scope: StoreScope<'a>,
+    kind: MemoryNodeKind,
+    base_key: &'a str,
+    text: &'a str,
+    valid_from_unix_ms: i64,
+    cited_spans: &'a [CitedSpan],
+    allow_same_timestamp_successor: bool,
 }
 
 /// Operational counts for the memory database.
@@ -1020,6 +1035,47 @@ impl SqliteMemoryStore {
         } else {
             canonical_key(kind.as_str(), text)
         };
+        self.upsert_node_with_base_key(NodeUpsert {
+            scope,
+            kind,
+            base_key: &base_key,
+            text,
+            valid_from_unix_ms,
+            cited_spans,
+            allow_same_timestamp_successor: false,
+        })
+    }
+
+    pub(crate) fn upsert_node_in_family(
+        &self,
+        scope: StoreScope<'_>,
+        kind: MemoryNodeKind,
+        family_canonical_key: &str,
+        text: &str,
+        valid_from_unix_ms: i64,
+        cited_spans: &[CitedSpan],
+    ) -> MemoryResult<(MemoryNode, bool)> {
+        self.upsert_node_with_base_key(NodeUpsert {
+            scope,
+            kind,
+            base_key: family_canonical_key,
+            text,
+            valid_from_unix_ms,
+            cited_spans,
+            allow_same_timestamp_successor: true,
+        })
+    }
+
+    fn upsert_node_with_base_key(&self, input: NodeUpsert<'_>) -> MemoryResult<(MemoryNode, bool)> {
+        let NodeUpsert {
+            scope,
+            kind,
+            base_key,
+            text,
+            valid_from_unix_ms,
+            cited_spans,
+            allow_same_timestamp_successor,
+        } = input;
         let now = now_unix_ms();
         let token_estimate = estimate_tokens(text);
         let family = self.node_family_by_scope_key(
@@ -1027,7 +1083,7 @@ impl SqliteMemoryStore {
             scope.project_id,
             scope.environment_id,
             kind,
-            &base_key,
+            base_key,
         )?;
         let projection_event_id = self.event_id_for_spans(cited_spans)?;
         let existing = family
@@ -1041,6 +1097,79 @@ impl SqliteMemoryStore {
                     .zip(first_event_id)
                     .is_some_and(|(current, first)| current > first)
                 {
+                    if allow_same_timestamp_successor
+                        && kind != MemoryNodeKind::Episode
+                        && let Some(current_event_id) = projection_event_id
+                    {
+                        let future_successor = family
+                            .iter()
+                            .filter(|node| node.valid_from_unix_ms > valid_from_unix_ms)
+                            .min_by_key(|node| node.valid_from_unix_ms);
+                        let valid_to_unix_ms = future_successor.map(|node| node.valid_from_unix_ms);
+                        let valid_to_event_id = if let Some(node) = future_successor {
+                            self.first_event_id_for_node(&node.id)?
+                        } else {
+                            None
+                        };
+                        self.invalidate_node(&node.id, valid_from_unix_ms, projection_event_id)?;
+                        let key =
+                            event_revision_key(base_key, valid_from_unix_ms, current_event_id);
+                        let id = stable_id(
+                            "node",
+                            &[
+                                scope.tenant_id,
+                                scope.project_id,
+                                scope.environment_id.unwrap_or(""),
+                                kind.as_str(),
+                                &key,
+                            ],
+                        );
+                        self.conn.execute(
+                            "
+                            INSERT INTO memory_nodes(
+                                id, tenant_id, project_id, environment_id, kind, text, canonical_key,
+                                created_at_unix_ms, updated_at_unix_ms, valid_from_unix_ms,
+                                valid_to_unix_ms, valid_to_event_id, confidence, token_estimate,
+                                observation_count
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12, ?13, 1)
+                            ",
+                            params![
+                                id,
+                                scope.tenant_id,
+                                scope.project_id,
+                                scope.environment_id,
+                                kind.as_str(),
+                                text,
+                                key,
+                                now,
+                                valid_from_unix_ms,
+                                valid_to_unix_ms,
+                                valid_to_event_id,
+                                0.65_f32,
+                                token_estimate,
+                            ],
+                        )?;
+                        let successor = MemoryNode {
+                            id,
+                            tenant_id: scope.tenant_id.to_string(),
+                            project_id: scope.project_id.to_string(),
+                            environment_id: scope.environment_id.map(str::to_string),
+                            kind,
+                            text: text.to_string(),
+                            canonical_key: key,
+                            created_at_unix_ms: now,
+                            updated_at_unix_ms: now,
+                            valid_from_unix_ms,
+                            valid_to_unix_ms,
+                            valid_to_event_id,
+                            confidence: 0.65,
+                            token_estimate,
+                            observation_count: 1,
+                        };
+                        self.attach_spans(&successor.id, cited_spans)?;
+                        self.reindex_node(&successor)?;
+                        return Ok((successor, true));
+                    }
                     self.attach_spans(&node.id, cited_spans)?;
                     return Ok((node, false));
                 }
@@ -1081,14 +1210,14 @@ impl SqliteMemoryStore {
                 self.close_previous_family_versions(
                     scope,
                     kind,
-                    &base_key,
+                    base_key,
                     valid_from_unix_ms,
                     projection_event_id,
                 )?;
                 let key = if kind == MemoryNodeKind::Episode {
-                    base_key
+                    base_key.to_string()
                 } else {
-                    revision_key(&base_key, valid_from_unix_ms)
+                    revision_key(base_key, valid_from_unix_ms)
                 };
                 let id = stable_id(
                     "node",
@@ -2191,6 +2320,16 @@ fn merge_node_text(existing: &str, incoming: &str) -> String {
 
 fn revision_key(canonical_key: &str, valid_from_unix_ms: i64) -> String {
     format!("{canonical_key}|rev:{valid_from_unix_ms}")
+}
+
+fn event_revision_key(canonical_key: &str, valid_from_unix_ms: i64, event_id: i64) -> String {
+    format!("{canonical_key}|rev:{valid_from_unix_ms}:event:{event_id}")
+}
+
+fn family_canonical_key(canonical_key: &str) -> &str {
+    canonical_key
+        .split_once("|rev:")
+        .map_or(canonical_key, |(base, _)| base)
 }
 
 fn validate_required_identifier(field: &str, value: &str) -> MemoryResult<()> {

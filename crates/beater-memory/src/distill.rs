@@ -162,10 +162,10 @@ impl Distiller for HeuristicDistiller {
 
         let kind = classify_memory_kind(event, &body);
         let op = classify_op(&body);
-        let target_node_id = if op == BeliefRevisionOp::Invalidate {
-            best_target(&body, kind, neighbors)
-        } else {
-            None
+        let target_node_id = match op {
+            BeliefRevisionOp::Update => best_target(&body, kind, neighbors, 0.35),
+            BeliefRevisionOp::Invalidate => best_target(&body, kind, neighbors, 0.12),
+            BeliefRevisionOp::Add | BeliefRevisionOp::Noop => None,
         };
 
         out.push(DistilledMemory {
@@ -382,16 +382,23 @@ fn classify_op(text: &str) -> BeliefRevisionOp {
     }
 }
 
-fn best_target(text: &str, kind: MemoryNodeKind, neighbors: &[MemoryNode]) -> Option<String> {
+fn best_target(
+    text: &str,
+    kind: MemoryNodeKind,
+    neighbors: &[MemoryNode],
+    min_overlap: f32,
+) -> Option<String> {
     neighbors
         .iter()
-        .filter(|node| node.kind != MemoryNodeKind::Episode)
-        .filter(|node| node.kind != MemoryNodeKind::EntityCue)
-        .map(|node| {
-            let kind_bonus = if node.kind == kind { 0.08 } else { 0.0 };
-            (overlap_score(text, &node.text) + kind_bonus, node)
+        .filter(|node| node.kind == kind)
+        .filter(|node| {
+            !matches!(
+                node.kind,
+                MemoryNodeKind::Episode | MemoryNodeKind::EntityCue
+            )
         })
-        .filter(|(score, _)| *score >= 0.12)
+        .map(|node| (overlap_score(text, &node.text), node))
+        .filter(|(score, _)| *score >= min_overlap)
         .max_by(|left, right| left.0.total_cmp(&right.0))
         .map(|(_, node)| node.id.clone())
 }
