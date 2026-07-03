@@ -16,7 +16,10 @@ mod server;
 mod store;
 mod text;
 
-pub use distill::{Distiller, HeuristicDistiller};
+pub use distill::{
+    DistillMetrics, DistillOutcome, DistillationPrompt, DistillationProvider,
+    DistillationRepairPrompt, Distiller, HeuristicDistiller, ProviderDistiller,
+};
 pub use engine::{MemoryEngine, ProjectReport, ProjectionRebuildReport};
 pub use error::{MemoryError, MemoryResult};
 pub use imports::{

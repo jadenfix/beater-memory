@@ -116,6 +116,7 @@ json_assert "$TMP_DIR/init.json" 'assert data["ledger_events"] == 0'
   "Checkout fails when DATABASE_URL is missing. Fix by setting DATABASE_URL." \
   > "$TMP_DIR/remember-gotcha.json"
 json_assert "$TMP_DIR/remember-gotcha.json" 'assert data["events_projected"] == 1 and data["memories_added"] >= 2'
+json_assert "$TMP_DIR/remember-gotcha.json" 'assert data["distillation_outputs"] >= 2 and data["distillation_provider_calls"] == 0 and data["distillation_rejections"] == 0'
 
 "$BIN" --db "$DB" remember \
   --tenant local \
@@ -132,6 +133,7 @@ json_assert "$TMP_DIR/remember-old-token.json" 'assert data["events_projected"] 
   "Do not use the old checkout token; it is deprecated. Use the scoped deploy token instead of the old token." \
   > "$TMP_DIR/remember-new-token.json"
 json_assert "$TMP_DIR/remember-new-token.json" 'assert data["events_projected"] == 1 and data["memories_invalidated"] >= 1'
+json_assert "$TMP_DIR/remember-new-token.json" 'assert "distillation_schema_errors" in data and "distillation_elapsed_ms" in data'
 
 "$BIN" --db "$DB" query \
   --tenant local \
@@ -238,6 +240,7 @@ json_assert "$TMP_DIR/readyz.json" 'assert data["status"] == "ok" and data["data
 api_post "/v1/remember" '{"tenant_id":"local","project_id":"demo","kind":"gotcha","idempotency_key":"http-checkout-db","text":"HTTP checkout fails unless DATABASE_URL is configured before migrations."}' \
   > "$TMP_DIR/http-remember.json"
 json_assert "$TMP_DIR/http-remember.json" 'assert data["ingested"] is True and data["project"]["events_projected"] == 1'
+json_assert "$TMP_DIR/http-remember.json" 'assert data["project"]["distillation_outputs"] >= 2 and data["project"]["distillation_provider_calls"] == 0'
 
 api_post "/v1/remember" '{"tenant_id":"local","project_id":"demo","kind":"gotcha","idempotency_key":"http-checkout-db","text":"HTTP checkout fails unless DATABASE_URL is configured before migrations."}' \
   > "$TMP_DIR/http-remember-duplicate.json"

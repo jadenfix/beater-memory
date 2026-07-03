@@ -22,6 +22,9 @@ The current implementation includes:
 
 - SQLite ledger/projection store
 - deterministic `ADD / UPDATE / INVALIDATE / NOOP` distiller
+- provider-safe distillation boundary with strict JSON schema parsing,
+  validation, bounded repair attempts, rejection metrics, and no provider calls
+  inside projection write transactions
 - distiller output validation before graph projection writes
 - typed nodes and edges for facts, episodes, procedures, state, gotchas, and
   anti-memory
@@ -217,7 +220,9 @@ The public API exports:
   `AuditEvent`
 - `LiveResponse`, `ReadyResponse`, and `ServiceMetricsSnapshot`
 - `LedgerEvent`
-- `Distiller` and `HeuristicDistiller`
+- `Distiller`, `HeuristicDistiller`, `ProviderDistiller`,
+  `DistillationProvider`, `DistillationPrompt`, `DistillationRepairPrompt`,
+  `DistillOutcome`, and `DistillMetrics`
 - `ActiveReconstructor`, `DeterministicReconstructor`,
   `ReconstructionCandidate`, `ReconstructionDecision`, and
   `ReconstructionStep`
@@ -241,8 +246,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - Memory is `write / manage / read`, not just `retrieve`.
 - The write hot path should stay append-only and robust.
-- LLM distillation, when added, must happen off-path and use constrained schemas
-  before writing projections.
+- Provider-backed distillation must happen outside projection write
+  transactions, use constrained schemas with snake_case JSON values such as
+  `"add"` and `"invalidate"`, repair or reject malformed output, and emit
+  provider/repair/rejection counters before writing projections.
 - Retrieval returns an answer-shaped evidence bundle, not raw chunks.
 - Token cost, read latency, write amplification, and context pollution are
   first-class metrics.

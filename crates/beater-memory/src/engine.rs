@@ -1,5 +1,5 @@
 use crate::{
-    distill::{Distiller, HeuristicDistiller},
+    distill::{DistillMetrics, DistillOutcome, Distiller, HeuristicDistiller},
     error::{MemoryError, MemoryResult},
     graph::answer_query,
     model::{
@@ -18,6 +18,26 @@ pub struct ProjectReport {
     pub events_seen: usize,
     pub events_projected: usize,
     pub events_skipped: usize,
+    #[serde(default)]
+    pub distillation_outputs: usize,
+    #[serde(default)]
+    pub distillation_provider_calls: usize,
+    #[serde(default)]
+    pub distillation_provider_errors: usize,
+    #[serde(default)]
+    pub distillation_schema_errors: usize,
+    #[serde(default)]
+    pub distillation_repair_attempts: usize,
+    #[serde(default)]
+    pub distillation_repair_successes: usize,
+    #[serde(default)]
+    pub distillation_rejections: usize,
+    #[serde(default)]
+    pub distillation_input_tokens: u32,
+    #[serde(default)]
+    pub distillation_output_tokens: u32,
+    #[serde(default)]
+    pub distillation_elapsed_ms: u64,
     pub memories_added: usize,
     pub memories_updated: usize,
     pub memories_invalidated: usize,
@@ -103,60 +123,78 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         let events = self.store.pending_events(limit)?;
         let mut report = ProjectReport::default();
         for event in events {
-            let event_report = self.store.with_immediate_transaction(|store| {
-                let mut event_report = ProjectReport {
-                    events_seen: 1,
-                    ..ProjectReport::default()
-                };
-                let Some(event_id) = event.id else {
-                    event_report.events_skipped = 1;
-                    return Ok(event_report);
-                };
-                if !store.event_is_pending(event_id)? {
-                    event_report.events_skipped = 1;
-                    return Ok(event_report);
-                }
+            let mut event_report = ProjectReport {
+                events_seen: 1,
+                ..ProjectReport::default()
+            };
+            let Some(event_id) = event.id else {
+                event_report.events_skipped = 1;
+                report.absorb(event_report);
+                continue;
+            };
+            if !self.store.event_is_pending(event_id)? {
+                event_report.events_skipped = 1;
+                report.absorb(event_report);
+                continue;
+            }
 
-                let neighbors = store.active_neighbors(
-                    &event.tenant_id,
-                    &event.project_id,
-                    event.environment_id.as_deref(),
-                    &event.text,
-                    24,
-                    event.observed_at_unix_ms,
-                )?;
-                let memories = self.distiller.distill(&event, &neighbors);
-                let mut projected_nodes = Vec::new();
-                for memory in memories {
-                    memory.validate().map_err(|err| {
-                        MemoryError::invalid(format!(
-                            "invalid distilled memory for event trace_id={} span_id={} seq={}: {err}",
-                            event.trace_id, event.span_id, event.seq
-                        ))
-                    })?;
-                    match self.apply_distilled(&event, memory, &neighbors)? {
-                        ApplyOutcome::Added(node) => {
-                            event_report.memories_added += 1;
-                            projected_nodes.push(node);
-                        }
-                        ApplyOutcome::Updated(node) => {
-                            event_report.memories_updated += 1;
-                            projected_nodes.push(node);
-                        }
-                        ApplyOutcome::Invalidated { replacement } => {
-                            event_report.memories_invalidated += 1;
-                            if let Some(node) = replacement {
+            let neighbors = self.store.active_neighbors(
+                &event.tenant_id,
+                &event.project_id,
+                event.environment_id.as_deref(),
+                &event.text,
+                24,
+                event.observed_at_unix_ms,
+            )?;
+            let outcome = self.distill_and_validate(&event, &neighbors, "distilled memory")?;
+            event_report.absorb_distill_metrics(outcome.metrics);
+            if outcome.rejected {
+                event_report.events_skipped = 1;
+                report.absorb(event_report);
+                continue;
+            }
+            event_report.distillation_outputs += outcome.memories.len();
+            let memories = outcome.memories;
+
+            let (mut event_report, projected_nodes) =
+                self.store.with_immediate_transaction(|store| {
+                    let mut event_report = event_report;
+                    if !store.event_is_pending(event_id)? {
+                        event_report.events_skipped = 1;
+                        return Ok((event_report, Vec::new()));
+                    }
+
+                    let mut projected_nodes = Vec::new();
+                    for memory in memories {
+                        match self.apply_distilled(&event, memory, &neighbors)? {
+                            ApplyOutcome::Added(node) => {
+                                event_report.memories_added += 1;
                                 projected_nodes.push(node);
                             }
+                            ApplyOutcome::Updated(node) => {
+                                event_report.memories_updated += 1;
+                                projected_nodes.push(node);
+                            }
+                            ApplyOutcome::Invalidated { replacement } => {
+                                event_report.memories_invalidated += 1;
+                                if let Some(node) = replacement {
+                                    projected_nodes.push(node);
+                                }
+                            }
+                            ApplyOutcome::Noop => event_report.memories_nooped += 1,
                         }
-                        ApplyOutcome::Noop => event_report.memories_nooped += 1,
                     }
-                }
-                event_report.edges_added += self.link_projected_nodes(&event, &projected_nodes)?;
-                store.mark_projected(event_id, now_unix_ms())?;
-                event_report.events_projected = 1;
-                Ok(event_report)
-            })?;
+                    event_report.edges_added +=
+                        self.link_projected_nodes(&event, &projected_nodes)?;
+                    store.mark_projected(event_id, now_unix_ms())?;
+                    event_report.events_projected = 1;
+                    Ok((event_report, projected_nodes))
+                })?;
+            if event_report.events_projected == 1 {
+                let late_report =
+                    self.apply_projected_invalidations_for_late_nodes(&event, &projected_nodes)?;
+                event_report.absorb(late_report);
+            }
             report.absorb(event_report);
         }
         Ok(report)
@@ -187,7 +225,7 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             let projected = batch.events_projected;
             project.absorb(batch);
             if projected == 0 {
-                completed = true;
+                completed = self.store.stats()?.pending_events == 0;
                 break;
             }
             remaining = remaining.saturating_sub(projected);
@@ -232,7 +270,6 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                     &memory.cited_spans,
                 )?;
                 self.ensure_entity_cues(event, &node)?;
-                self.apply_projected_invalidations_for_late_node(event, &node)?;
                 if created {
                     Ok(ApplyOutcome::Added(node))
                 } else {
@@ -275,12 +312,98 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                         )?;
                     }
                 }
-                if let Some(node) = replacement.as_ref() {
-                    self.apply_projected_invalidations_for_late_node(event, node)?;
-                }
                 Ok(ApplyOutcome::Invalidated { replacement })
             }
         }
+    }
+
+    fn distill_and_validate(
+        &self,
+        event: &LedgerEvent,
+        neighbors: &[MemoryNode],
+        context: &str,
+    ) -> MemoryResult<DistillOutcome> {
+        let outcome = self.distiller.distill(event, neighbors)?;
+        self.validate_distill_outcome(event, neighbors, context, outcome)
+    }
+
+    fn validate_distill_outcome(
+        &self,
+        event: &LedgerEvent,
+        neighbors: &[MemoryNode],
+        context: &str,
+        mut outcome: DistillOutcome,
+    ) -> MemoryResult<DistillOutcome> {
+        if outcome.rejected {
+            return Ok(outcome);
+        }
+        for memory in &mut outcome.memories {
+            self.validate_distilled_memory(event, memory, neighbors, context)?;
+            if memory.op == BeliefRevisionOp::Invalidate
+                && self
+                    .invalidation_targets(memory, neighbors, None)
+                    .is_empty()
+            {
+                memory.op = BeliefRevisionOp::Add;
+                outcome.metrics.repair_attempts += 1;
+                outcome.metrics.repair_successes += 1;
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn validate_distilled_memory(
+        &self,
+        event: &LedgerEvent,
+        memory: &DistilledMemory,
+        neighbors: &[MemoryNode],
+        context: &str,
+    ) -> MemoryResult<()> {
+        memory.validate().map_err(|err| {
+            MemoryError::invalid(format!(
+                "invalid {context} for event trace_id={} span_id={} seq={}: {err}",
+                event.trace_id, event.span_id, event.seq
+            ))
+        })?;
+        let cited_span = event.cited_span();
+        if !memory.cited_spans.iter().any(|span| span == &cited_span) {
+            return Err(MemoryError::invalid(format!(
+                "invalid {context} for event trace_id={} span_id={} seq={}: cited_spans must include the projected event",
+                event.trace_id, event.span_id, event.seq
+            )));
+        }
+        if let Some(target_node_id) = memory.target_node_id.as_deref() {
+            if memory.text.trim().is_empty() {
+                return Err(MemoryError::invalid(format!(
+                    "invalid {context} for event trace_id={} span_id={} seq={}: targeted invalidation must include text for semantic validation",
+                    event.trace_id, event.span_id, event.seq
+                )));
+            }
+            let target = neighbors.iter().find(|node| node.id == target_node_id);
+            let Some(target) = target else {
+                return Err(MemoryError::invalid(format!(
+                    "invalid {context} for event trace_id={} span_id={} seq={}: target_node_id {target_node_id:?} is not in scoped neighbors",
+                    event.trace_id, event.span_id, event.seq
+                )));
+            };
+            if matches!(
+                target.kind,
+                MemoryNodeKind::Episode | MemoryNodeKind::EntityCue
+            ) || target.kind != memory.node_kind
+            {
+                return Err(MemoryError::invalid(format!(
+                    "invalid {context} for event trace_id={} span_id={} seq={}: target_node_id {target_node_id:?} must reference a matching typed memory node",
+                    event.trace_id, event.span_id, event.seq
+                )));
+            }
+            if !memory.text.trim().is_empty() && overlap_score(&memory.text, &target.text) < 0.12 {
+                return Err(MemoryError::invalid(format!(
+                    "invalid {context} for event trace_id={} span_id={} seq={}: target_node_id {target_node_id:?} does not overlap the distilled memory text",
+                    event.trace_id, event.span_id, event.seq
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn invalidation_targets(
@@ -341,16 +464,32 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         Ok(Some(node))
     }
 
+    fn apply_projected_invalidations_for_late_nodes(
+        &self,
+        event: &LedgerEvent,
+        nodes: &[MemoryNode],
+    ) -> MemoryResult<ProjectReport> {
+        let mut report = ProjectReport::default();
+        if !self.distiller.supports_late_replay() {
+            return Ok(report);
+        }
+        for node in nodes {
+            report.absorb(self.apply_projected_invalidations_for_late_node(event, node)?);
+        }
+        Ok(report)
+    }
+
     fn apply_projected_invalidations_for_late_node(
         &self,
         event: &LedgerEvent,
         node: &MemoryNode,
-    ) -> MemoryResult<()> {
+    ) -> MemoryResult<ProjectReport> {
+        let mut report = ProjectReport::default();
         if matches!(
             node.kind,
             MemoryNodeKind::Episode | MemoryNodeKind::EntityCue
         ) {
-            return Ok(());
+            return Ok(report);
         }
         let projected_events = self.store.projected_events_after(
             StoreScope::new(
@@ -372,14 +511,19 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 continue;
             }
 
-            let memories = self.distiller.distill(&projected_event, &neighbors);
-            for memory in memories {
-                memory.validate().map_err(|err| {
-                    MemoryError::invalid(format!(
-                        "invalid late distilled memory for event trace_id={} span_id={} seq={}: {err}",
-                        projected_event.trace_id, projected_event.span_id, projected_event.seq
-                    ))
-                })?;
+            let outcome = self.distiller.distill(&projected_event, &neighbors)?;
+            let outcome = self.validate_distill_outcome(
+                &projected_event,
+                &neighbors,
+                "late distilled memory",
+                outcome,
+            )?;
+            report.absorb_distill_metrics(outcome.metrics);
+            if outcome.rejected {
+                continue;
+            }
+            report.distillation_outputs += outcome.memories.len();
+            for memory in outcome.memories {
                 if memory.op != BeliefRevisionOp::Invalidate {
                     continue;
                 }
@@ -387,12 +531,15 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 if !targets.iter().any(|target| target.id == node.id) {
                     continue;
                 }
-                if self.apply_late_invalidation(&projected_event, memory, node)? {
-                    return Ok(());
+                let invalidated = self.store.with_immediate_transaction(|_| {
+                    self.apply_late_invalidation(&projected_event, memory, node)
+                })?;
+                if invalidated {
+                    return Ok(report);
                 }
             }
         }
-        Ok(())
+        Ok(report)
     }
 
     fn apply_late_invalidation(
@@ -430,9 +577,6 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 0.8,
                 event.observed_at_unix_ms,
             )?;
-        }
-        if let Some(node) = replacement.as_ref() {
-            self.apply_projected_invalidations_for_late_node(event, node)?;
         }
         Ok(invalidated)
     }
@@ -516,11 +660,33 @@ impl ProjectReport {
         self.events_seen += other.events_seen;
         self.events_projected += other.events_projected;
         self.events_skipped += other.events_skipped;
+        self.distillation_outputs += other.distillation_outputs;
+        self.distillation_provider_calls += other.distillation_provider_calls;
+        self.distillation_provider_errors += other.distillation_provider_errors;
+        self.distillation_schema_errors += other.distillation_schema_errors;
+        self.distillation_repair_attempts += other.distillation_repair_attempts;
+        self.distillation_repair_successes += other.distillation_repair_successes;
+        self.distillation_rejections += other.distillation_rejections;
+        self.distillation_input_tokens += other.distillation_input_tokens;
+        self.distillation_output_tokens += other.distillation_output_tokens;
+        self.distillation_elapsed_ms += other.distillation_elapsed_ms;
         self.memories_added += other.memories_added;
         self.memories_updated += other.memories_updated;
         self.memories_invalidated += other.memories_invalidated;
         self.memories_nooped += other.memories_nooped;
         self.edges_added += other.edges_added;
+    }
+
+    fn absorb_distill_metrics(&mut self, metrics: DistillMetrics) {
+        self.distillation_provider_calls += metrics.provider_calls;
+        self.distillation_provider_errors += metrics.provider_errors;
+        self.distillation_schema_errors += metrics.schema_errors;
+        self.distillation_repair_attempts += metrics.repair_attempts;
+        self.distillation_repair_successes += metrics.repair_successes;
+        self.distillation_rejections += metrics.rejected_outputs;
+        self.distillation_input_tokens += metrics.input_tokens;
+        self.distillation_output_tokens += metrics.output_tokens;
+        self.distillation_elapsed_ms += metrics.elapsed_ms;
     }
 }
 
@@ -534,6 +700,9 @@ enum ApplyOutcome {
 #[cfg(test)]
 mod tests {
     use crate::{
+        distill::{
+            DistillationPrompt, DistillationProvider, DistillationRepairPrompt, ProviderDistiller,
+        },
         model::{
             MemoryMode, MemoryScope, MemoryTier, ReconstructionMode, ReconstructionOptions,
             ReconstructionReason, RoutingReason,
@@ -982,15 +1151,15 @@ mod tests {
                 &self,
                 event: &LedgerEvent,
                 _neighbors: &[MemoryNode],
-            ) -> Vec<DistilledMemory> {
-                vec![
+            ) -> MemoryResult<DistillOutcome> {
+                Ok(DistillOutcome::accepted(vec![
                     DistilledMemory::add(
                         MemoryNodeKind::Fact,
                         "Checkout uses DATABASE_URL.",
                         event.cited_span(),
                     ),
                     DistilledMemory::add(MemoryNodeKind::Fact, " ", event.cited_span()),
-                ]
+                ]))
             }
         }
 
@@ -1010,6 +1179,390 @@ mod tests {
         assert_eq!(stats.nodes, 0);
         assert_eq!(stats.edges, 0);
         Ok(())
+    }
+
+    #[derive(Clone)]
+    struct FakeProvider {
+        raw: Result<String, String>,
+        repaired: Option<String>,
+    }
+
+    impl DistillationProvider for FakeProvider {
+        fn distill(&self, _prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+            self.raw
+                .clone()
+                .map_err(|err| MemoryError::invalid(format!("provider failed: {err}")))
+        }
+
+        fn repair(&self, _prompt: DistillationRepairPrompt<'_>) -> MemoryResult<String> {
+            self.repaired
+                .clone()
+                .ok_or_else(|| MemoryError::invalid("repair unavailable"))
+        }
+    }
+
+    fn provider_memory_json(
+        event: &LedgerEvent,
+        op: BeliefRevisionOp,
+        kind: MemoryNodeKind,
+        text: &str,
+        target_node_id: Option<&str>,
+    ) -> String {
+        serde_json::json!({
+            "memories": [{
+                "op": op,
+                "node_kind": kind,
+                "text": text,
+                "target_node_id": target_node_id,
+                "cited_spans": [event.cited_span()]
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn project_pending_provider_error_leaves_event_pending() -> MemoryResult<()> {
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(FakeProvider {
+                raw: Err("timeout".to_string()),
+                repaired: None,
+            }),
+        );
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        ))?;
+
+        let report = engine.project_pending(100)?;
+        let stats = engine.store().stats()?;
+
+        assert_eq!(report.events_seen, 1);
+        assert_eq!(report.events_projected, 0);
+        assert_eq!(report.events_skipped, 1);
+        assert_eq!(report.distillation_outputs, 0);
+        assert_eq!(report.distillation_provider_calls, 1);
+        assert_eq!(report.distillation_provider_errors, 1);
+        assert_eq!(report.distillation_rejections, 1);
+        assert_eq!(stats.pending_events, 1);
+        assert_eq!(stats.nodes, 0);
+        assert_eq!(stats.edges, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn project_pending_provider_repair_metrics_are_reported() -> MemoryResult<()> {
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        let repaired = provider_memory_json(
+            &event,
+            BeliefRevisionOp::Add,
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            None,
+        );
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(FakeProvider {
+                raw: Ok("{\"memories\":".to_string()),
+                repaired: Some(repaired),
+            }),
+        );
+        engine.ingest_event(&event)?;
+
+        let report = engine.project_pending(100)?;
+
+        assert_eq!(report.events_projected, 1);
+        assert_eq!(report.distillation_outputs, 1);
+        assert_eq!(report.memories_added, 1);
+        assert_eq!(report.distillation_provider_calls, 2);
+        assert_eq!(report.distillation_schema_errors, 1);
+        assert_eq!(report.distillation_repair_attempts, 1);
+        assert_eq!(report.distillation_repair_successes, 1);
+        assert!(report.distillation_input_tokens > 0);
+        assert!(report.distillation_output_tokens > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn project_pending_rejects_bogus_provider_target_and_rolls_back() -> MemoryResult<()> {
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Do not use the old checkout token.",
+        );
+        let raw = provider_memory_json(
+            &event,
+            BeliefRevisionOp::Invalidate,
+            MemoryNodeKind::Fact,
+            "Do not use the old checkout token.",
+            Some("missing-node"),
+        );
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(FakeProvider {
+                raw: Ok(raw),
+                repaired: None,
+            }),
+        );
+        engine.ingest_event(&event)?;
+
+        let err = engine.project_pending(100).unwrap_err();
+        let stats = engine.store().stats()?;
+
+        assert!(err.to_string().contains("target_node_id"));
+        assert_eq!(stats.pending_events, 1);
+        assert_eq!(stats.nodes, 0);
+        assert_eq!(stats.edges, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn project_pending_rejects_wrong_kind_provider_target_and_rolls_back() -> MemoryResult<()> {
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Do not use the old checkout token.",
+        );
+        let store = SqliteMemoryStore::in_memory()?;
+        let (episode, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Episode,
+            "The old checkout token appeared in a trace.",
+            1,
+            &[event.cited_span()],
+        )?;
+        let raw = provider_memory_json(
+            &event,
+            BeliefRevisionOp::Invalidate,
+            MemoryNodeKind::Fact,
+            "Do not use the old checkout token.",
+            Some(&episode.id),
+        );
+        let engine = MemoryEngine::new(
+            store,
+            ProviderDistiller::new(FakeProvider {
+                raw: Ok(raw),
+                repaired: None,
+            }),
+        );
+        engine.ingest_event(&event)?;
+
+        let err = engine.project_pending(100).unwrap_err();
+        let stats = engine.store().stats()?;
+
+        assert!(err.to_string().contains("matching typed memory node"));
+        assert_eq!(stats.pending_events, 1);
+        assert_eq!(stats.nodes, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn project_pending_rejects_target_only_provider_invalidation() -> MemoryResult<()> {
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Do not use the old checkout token.",
+        );
+        let store = SqliteMemoryStore::in_memory()?;
+        let (fact, _) = store.upsert_node(
+            StoreScope::new("tenant", "project", None),
+            MemoryNodeKind::Fact,
+            "Use the old checkout token.",
+            1,
+            &[event.cited_span()],
+        )?;
+        let raw = provider_memory_json(
+            &event,
+            BeliefRevisionOp::Invalidate,
+            MemoryNodeKind::Fact,
+            "",
+            Some(&fact.id),
+        );
+        let engine = MemoryEngine::new(
+            store,
+            ProviderDistiller::new(FakeProvider {
+                raw: Ok(raw),
+                repaired: None,
+            }),
+        );
+        engine.ingest_event(&event)?;
+
+        let err = engine.project_pending(100).unwrap_err();
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let fact = nodes
+            .iter()
+            .find(|node| node.text == "Use the old checkout token.")
+            .expect("fact still exists");
+
+        assert!(err.to_string().contains("targeted invalidation"));
+        assert_eq!(fact.valid_to_unix_ms, None);
+        assert_eq!(engine.store().stats()?.pending_events, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn targetless_invalidation_without_neighbors_is_normalized_to_add() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct TargetlessInvalidationDistiller;
+
+        impl Distiller for TargetlessInvalidationDistiller {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                _neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op: BeliefRevisionOp::Invalidate,
+                    node_kind: MemoryNodeKind::AntiMemory,
+                    text: "Do not use the stale checkout token.".to_string(),
+                    target_node_id: None,
+                    cited_spans: vec![event.cited_span()],
+                }]))
+            }
+        }
+
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            TargetlessInvalidationDistiller,
+        );
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::AntiMemory,
+            "Do not use the stale checkout token.",
+        ))?;
+
+        let report = engine.project_pending(100)?;
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+
+        assert_eq!(report.events_projected, 1);
+        assert_eq!(report.distillation_outputs, 1);
+        assert_eq!(report.memories_added, 1);
+        assert_eq!(report.memories_invalidated, 0);
+        assert_eq!(report.distillation_repair_attempts, 1);
+        assert_eq!(report.distillation_repair_successes, 1);
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.kind == MemoryNodeKind::AntiMemory)
+        );
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct EchoAddProvider;
+
+    impl DistillationProvider for EchoAddProvider {
+        fn distill(&self, prompt: DistillationPrompt<'_>) -> MemoryResult<String> {
+            Ok(provider_memory_json(
+                prompt.event,
+                BeliefRevisionOp::Add,
+                MemoryNodeKind::Fact,
+                &prompt.event.text,
+                None,
+            ))
+        }
+    }
+
+    #[test]
+    fn provider_distiller_skips_late_replay_to_preserve_rebuild_convergence() -> MemoryResult<()> {
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(EchoAddProvider),
+        );
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Do not use late checkout token; it is deprecated.",
+            2_000,
+        ))?;
+        let first = engine.project_pending(100)?;
+        assert_eq!(first.events_projected, 1);
+        assert_eq!(first.distillation_provider_calls, 1);
+
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Use late checkout token.",
+            1_000,
+        ))?;
+        let second = engine.project_pending(100)?;
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let old = nodes
+            .iter()
+            .find(|node| node.text == "Use late checkout token.")
+            .expect("old node exists");
+
+        assert_eq!(second.events_projected, 1);
+        assert_eq!(second.distillation_provider_calls, 1);
+        assert_eq!(old.valid_to_unix_ms, None);
+
+        let incremental = engine.query(
+            &MemoryQuery::new("late checkout token", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+        engine.rebuild_projection(100, None)?;
+        let rebuilt = engine.query(
+            &MemoryQuery::new("late checkout token", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        assert_eq!(evidence_texts(&incremental), evidence_texts(&rebuilt));
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_reports_incomplete_when_provider_rejects_pending_event()
+    -> MemoryResult<()> {
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(FakeProvider {
+                raw: Err("timeout".to_string()),
+                repaired: None,
+            }),
+        );
+        engine.ingest_event(&LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        ))?;
+
+        let report = engine.rebuild_projection(10, None)?;
+
+        assert!(!report.completed);
+        assert_eq!(report.project.events_seen, 1);
+        assert_eq!(report.project.events_projected, 0);
+        assert_eq!(report.project.events_skipped, 1);
+        assert_eq!(engine.store().stats()?.pending_events, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn project_report_deserializes_without_distillation_metrics() {
+        let report: ProjectReport = serde_json::from_value(serde_json::json!({
+            "events_seen": 1,
+            "events_projected": 1,
+            "events_skipped": 0,
+            "memories_added": 1,
+            "memories_updated": 0,
+            "memories_invalidated": 0,
+            "memories_nooped": 0,
+            "edges_added": 0
+        }))
+        .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(report.distillation_outputs, 0);
+        assert_eq!(report.distillation_provider_calls, 0);
+        assert_eq!(report.distillation_schema_errors, 0);
     }
 
     #[test]
