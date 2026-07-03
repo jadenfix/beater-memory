@@ -362,25 +362,28 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         batch_size: usize,
         max_events: Option<usize>,
     ) -> MemoryResult<ProjectionRebuildReport> {
-        let reset = self.store.reset_projection()?;
-        let mut project = ProjectReport::default();
-        let mut remaining = max_events.unwrap_or(usize::MAX);
-        let completed;
-        loop {
-            if remaining == 0 {
-                completed = self.store.stats()?.pending_events == 0;
-                break;
+        let (reset, project, completed) = self.store.with_immediate_transaction(|store| {
+            let reset = store.reset_projection_in_transaction()?;
+            let mut project = ProjectReport::default();
+            let mut remaining = max_events.unwrap_or(usize::MAX);
+            let completed;
+            loop {
+                if remaining == 0 {
+                    completed = store.stats()?.pending_events == 0;
+                    break;
+                }
+                let limit = batch_size.min(remaining);
+                let batch = self.project_pending_for_rebuild_in_transaction(limit)?;
+                let projected = batch.events_projected;
+                project.absorb(batch);
+                if projected == 0 {
+                    completed = store.stats()?.pending_events == 0;
+                    break;
+                }
+                remaining = remaining.saturating_sub(projected);
             }
-            let limit = batch_size.min(remaining);
-            let batch = self.project_pending(limit)?;
-            let projected = batch.events_projected;
-            project.absorb(batch);
-            if projected == 0 {
-                completed = self.store.stats()?.pending_events == 0;
-                break;
-            }
-            remaining = remaining.saturating_sub(projected);
-        }
+            Ok((reset, project, completed))
+        })?;
         Ok(ProjectionRebuildReport {
             reset,
             project,
@@ -388,6 +391,62 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             max_events,
             completed,
         })
+    }
+
+    fn project_pending_for_rebuild_in_transaction(
+        &self,
+        limit: usize,
+    ) -> MemoryResult<ProjectReport> {
+        let events = self.store.pending_events(limit)?;
+        let mut report = ProjectReport::default();
+        for event in events {
+            let mut event_report = ProjectReport {
+                events_seen: 1,
+                ..ProjectReport::default()
+            };
+            event_report.record_source_tokens(&event);
+            let Some(event_id) = event.id else {
+                event_report.events_skipped = 1;
+                report.absorb(event_report);
+                continue;
+            };
+            if !self.store.event_is_pending(event_id)? {
+                event_report.events_skipped = 1;
+                report.absorb(event_report);
+                continue;
+            }
+
+            let neighbors = self.store.active_neighbors(
+                &event.tenant_id,
+                &event.project_id,
+                event.environment_id.as_deref(),
+                &event.text,
+                24,
+                event.observed_at_unix_ms,
+            )?;
+            let outcome = self.distill_and_validate(&event, &neighbors, "distilled memory")?;
+            event_report.absorb_distill_metrics(outcome.metrics);
+            if outcome.rejected {
+                event_report.events_skipped = 1;
+                report.absorb(event_report);
+                continue;
+            }
+            event_report.distillation_outputs += outcome.memories.len();
+            let memories = outcome.memories;
+            let replay_key = self.distiller.distillation_replay_key();
+            let (event_report, _projected_nodes) =
+                self.project_event_memories_in_transaction(EventProjection {
+                    event: &event,
+                    event_id,
+                    report: event_report,
+                    neighbors: &neighbors,
+                    memories,
+                    replay_key: replay_key.as_ref(),
+                    replayed_batch: false,
+                })?;
+            report.absorb(event_report);
+        }
+        Ok(report)
     }
 
     fn rebuild_projection_from_distillation_batches(
@@ -2567,6 +2626,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailingLiveRebuildDistiller {
+        calls: Arc<AtomicUsize>,
+        fail_on_call: usize,
+    }
+
+    impl Distiller for FailingLiveRebuildDistiller {
+        fn distill(
+            &self,
+            event: &LedgerEvent,
+            _neighbors: &[MemoryNode],
+        ) -> MemoryResult<DistillOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let text = if call == self.fail_on_call {
+                " "
+            } else {
+                event.text.as_str()
+            };
+            Ok(DistillOutcome::accepted(vec![DistilledMemory::add(
+                MemoryNodeKind::Fact,
+                text,
+                event.cited_span(),
+            )]))
+        }
+
+        fn supports_projection_rebuild(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn provider_distiller_skips_late_replay_and_rejects_rebuild() -> MemoryResult<()> {
         let engine = MemoryEngine::new(
@@ -2801,6 +2890,51 @@ mod tests {
         assert_eq!(after.nodes, before.nodes);
         assert_eq!(after.edges, before.edges);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_projection_live_error_rolls_back_reset() -> MemoryResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            FailingLiveRebuildDistiller {
+                calls: Arc::clone(&calls),
+                fail_on_call: 4,
+            },
+        );
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "First deploy step sets DATABASE_URL.",
+            1_000,
+        ))?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Second deploy step runs migrations.",
+            2_000,
+        ))?;
+        let initial = engine.project_pending(100)?;
+        let before = engine.store().stats()?;
+        let before_answer = engine.query(
+            &MemoryQuery::new("deploy migrations", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        let err = engine.rebuild_projection(1, None).unwrap_err();
+        let after = engine.store().stats()?;
+        let after_answer = engine.query(
+            &MemoryQuery::new("deploy migrations", MemoryScope::new("tenant", "project"))
+                .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        assert_eq!(initial.events_projected, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(err.to_string().contains("invalid distilled memory"));
+        assert_eq!(after, before);
+        assert_eq!(
+            evidence_texts(&after_answer),
+            evidence_texts(&before_answer)
+        );
         Ok(())
     }
 
