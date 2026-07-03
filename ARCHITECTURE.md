@@ -88,7 +88,7 @@ edges are projections that can be rebuilt.
    - CLI command: `beater-memory serve`
    - Public endpoints: `GET /livez`, `GET /readyz`
    - Authenticated endpoints: `/v1/health`, `/v1/stats`, `/v1/remember`,
-     `/v1/project`, `/v1/query`, `/v1/maintenance`, `/v1/metrics`,
+     `/v1/manage`, `/v1/project`, `/v1/query`, `/v1/maintenance`, `/v1/metrics`,
      `/v1/metrics/prometheus`, `/v1/audit`
    - Auth: bearer token from `--bearer-token` or `BEATER_MEMORY_TOKEN` by
      default; configured tokens are trimmed, blank tokens are rejected, and
@@ -110,7 +110,10 @@ edges are projections that can be rebuilt.
    - Correlation: every HTTP response carries `x-request-id`; valid incoming
      request IDs are echoed and audit details include the same ID.
    - Writes: direct `remember` calls can carry an idempotency key so client
-     retries map to the same ledger event.
+     retries map to the same ledger event. The compatibility default still
+     manages projections immediately, but CLI `--no-project` and HTTP
+     `"project": false` keep the operation append-only until an explicit
+     `manage`/`project` call.
    - Shutdown: `serve` uses Axum graceful shutdown on Ctrl-C and SIGTERM on
      Unix; `serve_with_shutdown` exposes the same server loop with an injected
      shutdown future for embedding and tests.
@@ -206,6 +209,9 @@ Production safeguards:
 cargo run -p beater-memory -- init
 cargo run -p beater-memory -- remember --tenant local --project demo --kind gotcha \
   "Checkout fails when DATABASE_URL is missing. Fix by setting DATABASE_URL."
+cargo run -p beater-memory -- remember --no-project --tenant local --project demo --kind fact \
+  "Append this observation without managing projections yet."
+cargo run -p beater-memory -- manage --limit 100
 cargo run -p beater-memory -- query --tenant local --project demo \
   "How do I fix checkout database failures?"
 cargo run -p beater-memory -- query --tenant local --project demo \

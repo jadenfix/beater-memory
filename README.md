@@ -37,7 +37,8 @@ The current implementation includes:
 - `beater.js` journal import from `.beater/journal.db`
 - canonical span JSONL import aligned with `beater-agents` span kinds
 - atomic imports that roll back malformed batches and report the bad source row
-- CLI commands for `init`, `remember`, `project`, `query`, and import flows
+- CLI commands for `init`, `remember`, `manage`, `project`, `query`, and import
+  flows
 - authenticated HTTP API for service deployments
 - optional idempotency keys for retry-safe direct `remember` writes
 - production operations for schema/integrity health checks and SQLite
@@ -83,6 +84,12 @@ cargo run -p beater-memory -- remember \
   --idempotency-key demo-checkout-db-gotcha \
   --tenant local --project demo --kind gotcha \
   "Checkout fails when DATABASE_URL is missing. Fix by setting DATABASE_URL."
+
+cargo run -p beater-memory -- remember --no-project \
+  --tenant local --project demo --kind fact \
+  "Append this observation without managing projections yet."
+
+cargo run -p beater-memory -- manage --limit 100
 
 cargo run -p beater-memory -- query \
   --tenant local --project demo \
@@ -151,13 +158,17 @@ For retryable direct writes, pass an idempotency key. Reusing the same key in
 the same tenant, project, environment, and memory kind maps the write to the same
 ledger event; repeated submissions return `ingested: false` over HTTP instead of
 appending duplicate ledger work.
+CLI `remember` and HTTP `/v1/remember` keep their compatibility default of
+managing projections immediately; pass `--no-project` on the CLI or
+`"project": false` over HTTP for a write-only append, then run `manage` or
+`POST /v1/manage` later.
 
 ## Operations
 
-Projection is atomic per ledger event. The engine uses an immediate SQLite
-transaction, rechecks that the event is still pending inside the transaction,
-then commits the memory nodes, edges, cue index, citations, and projected marker
-together. New databases are stamped with the Beater Memory SQLite
+Manage/projection is atomic per ledger event. The engine uses an immediate
+SQLite transaction, rechecks that the event is still pending inside the
+transaction, then commits the memory nodes, edges, cue index, citations, and
+projected marker together. New databases are stamped with the Beater Memory SQLite
 `application_id`; existing databases must already carry that identity before
 schema migration runs.
 
@@ -263,6 +274,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - Memory is `write / manage / read`, not just `retrieve`.
 - The write hot path should stay append-only and robust.
+- `project` remains a compatibility alias for manage-time projection; new code
+  should prefer `manage` when it is intentionally distilling pending ledger
+  observations.
 - Provider-backed distillation must happen outside projection write
   transactions, use constrained schemas with snake_case JSON values such as
   `"add"` and `"invalidate"`, repair or reject malformed output, and emit

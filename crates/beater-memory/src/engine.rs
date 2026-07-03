@@ -215,6 +215,13 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
         Ok(report)
     }
 
+    pub fn manage_pending(&self, limit: usize) -> MemoryResult<ProjectReport> {
+        if limit == 0 {
+            return Err(MemoryError::invalid("manage limit must be greater than 0"));
+        }
+        self.project_pending(limit)
+    }
+
     pub fn rebuild_projection(
         &self,
         batch_size: usize,
@@ -272,7 +279,7 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
     ) -> MemoryResult<ApplyOutcome> {
         match memory.op {
             BeliefRevisionOp::Noop => Ok(ApplyOutcome::Noop),
-            BeliefRevisionOp::Add | BeliefRevisionOp::Update => {
+            BeliefRevisionOp::Add => {
                 let (node, created) = self.store.upsert_node(
                     StoreScope::new(
                         &event.tenant_id,
@@ -290,6 +297,36 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
                 } else {
                     Ok(ApplyOutcome::Updated(node))
                 }
+            }
+            BeliefRevisionOp::Update => {
+                let Some(target) = self.revision_target(&memory, neighbors) else {
+                    return Ok(ApplyOutcome::Noop);
+                };
+                let scope = StoreScope::new(
+                    &event.tenant_id,
+                    &event.project_id,
+                    event.environment_id.as_deref(),
+                );
+                let (node, created) = self.store.upsert_node_in_family(
+                    scope,
+                    memory.node_kind,
+                    target.family_canonical_key(),
+                    &memory.text,
+                    event.observed_at_unix_ms,
+                    &memory.cited_spans,
+                )?;
+                if created {
+                    self.ensure_entity_cues(event, &node)?;
+                }
+                self.store.insert_edge(
+                    scope,
+                    &node.id,
+                    &target.id,
+                    MemoryEdgeKind::Supersedes,
+                    1.0,
+                    event.observed_at_unix_ms,
+                )?;
+                Ok(ApplyOutcome::Updated(node))
             }
             BeliefRevisionOp::Invalidate => {
                 let replacement = self.replacement_for_invalidation(event, &memory)?;
@@ -360,11 +397,21 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             return Ok(outcome);
         }
         for memory in &mut outcome.memories {
+            if memory.op == BeliefRevisionOp::Add {
+                memory.target_node_id = None;
+            }
             self.validate_distilled_memory(event, memory, neighbors, context)?;
             if memory.op == BeliefRevisionOp::Invalidate
                 && self
                     .invalidation_targets(memory, neighbors, None)
                     .is_empty()
+            {
+                memory.op = BeliefRevisionOp::Add;
+                outcome.metrics.repair_attempts += 1;
+                outcome.metrics.repair_successes += 1;
+            }
+            if memory.op == BeliefRevisionOp::Update
+                && self.revision_target(memory, neighbors).is_none()
             {
                 memory.op = BeliefRevisionOp::Add;
                 outcome.metrics.repair_attempts += 1;
@@ -395,9 +442,9 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             )));
         }
         if let Some(target_node_id) = memory.target_node_id.as_deref() {
-            if memory.text.trim().is_empty() {
+            if memory.op == BeliefRevisionOp::Update && memory.text.trim().is_empty() {
                 return Err(MemoryError::invalid(format!(
-                    "invalid {context} for event trace_id={} span_id={} seq={}: targeted invalidation must include text for semantic validation",
+                    "invalid {context} for event trace_id={} span_id={} seq={}: targeted belief revision must include text for semantic validation",
                     event.trace_id, event.span_id, event.seq
                 )));
             }
@@ -426,6 +473,39 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             }
         }
         Ok(())
+    }
+
+    fn revision_target(
+        &self,
+        memory: &DistilledMemory,
+        neighbors: &[MemoryNode],
+    ) -> Option<MemoryNode> {
+        if let Some(target_id) = memory.target_node_id.as_deref() {
+            return neighbors.iter().find(|node| node.id == target_id).cloned();
+        }
+        let mut best = None::<(f32, &MemoryNode)>;
+        for node in neighbors
+            .iter()
+            .filter(|node| node.kind == memory.node_kind)
+            .filter(|node| {
+                !matches!(
+                    node.kind,
+                    MemoryNodeKind::Episode | MemoryNodeKind::EntityCue
+                )
+            })
+        {
+            let score = overlap_score(&memory.text, &node.text);
+            if score < 0.35 {
+                continue;
+            }
+            if best
+                .map(|(best_score, _)| score > best_score)
+                .unwrap_or(true)
+            {
+                best = Some((score, node));
+            }
+        }
+        best.map(|(_, node)| node.clone())
     }
 
     fn invalidation_targets(
@@ -546,20 +626,38 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             }
             report.distillation_outputs += outcome.memories.len();
             for memory in outcome.memories {
-                if memory.op != BeliefRevisionOp::Invalidate {
-                    continue;
-                }
-                let targets = self.invalidation_targets(&memory, &neighbors, None);
-                if !targets.iter().any(|target| target.id == node.id) {
-                    continue;
-                }
-                let invalidated = self.store.with_immediate_transaction(|_| {
-                    self.apply_late_invalidation(&projected_event, memory, node)
-                })?;
-                if invalidated {
-                    report.memories_invalidated += 1;
-                    report.stored_memories_touched += 1;
-                    return Ok(report);
+                match memory.op {
+                    BeliefRevisionOp::Invalidate => {
+                        let targets = self.invalidation_targets(&memory, &neighbors, None);
+                        if !targets.iter().any(|target| target.id == node.id) {
+                            continue;
+                        }
+                        let invalidated = self.store.with_immediate_transaction(|_| {
+                            self.apply_late_invalidation(&projected_event, memory, node)
+                        })?;
+                        if invalidated {
+                            report.memories_invalidated += 1;
+                            report.stored_memories_touched += 1;
+                            return Ok(report);
+                        }
+                    }
+                    BeliefRevisionOp::Update => {
+                        let Some(target) = self.revision_target(&memory, &neighbors) else {
+                            continue;
+                        };
+                        if target.id != node.id {
+                            continue;
+                        }
+                        let updated = self.store.with_immediate_transaction(|_| {
+                            self.apply_late_update(&projected_event, memory, node)
+                        })?;
+                        if updated {
+                            report.memories_updated += 1;
+                            report.stored_memories_touched += 1;
+                            return Ok(report);
+                        }
+                    }
+                    BeliefRevisionOp::Add | BeliefRevisionOp::Noop => {}
                 }
             }
         }
@@ -603,6 +701,78 @@ impl<D: Distiller, R: ActiveReconstructor> MemoryEngine<D, R> {
             )?;
         }
         Ok(invalidated)
+    }
+
+    fn apply_late_update(
+        &self,
+        event: &LedgerEvent,
+        memory: DistilledMemory,
+        target: &MemoryNode,
+    ) -> MemoryResult<bool> {
+        let scope = StoreScope::new(
+            &event.tenant_id,
+            &event.project_id,
+            event.environment_id.as_deref(),
+        );
+        let updated =
+            self.store()
+                .invalidate_node(&target.id, event.observed_at_unix_ms, event.id)?;
+        let mut duplicate_successor_id = None;
+        let successor = if let Some(existing) = self.store.node_version_by_text(
+            scope,
+            memory.node_kind,
+            &memory.text,
+            event.observed_at_unix_ms,
+        )? {
+            if existing.family_canonical_key() == target.family_canonical_key() {
+                existing
+            } else {
+                duplicate_successor_id = Some(existing.id);
+                let (node, created) = self.store.upsert_node_in_family(
+                    scope,
+                    memory.node_kind,
+                    target.family_canonical_key(),
+                    &memory.text,
+                    event.observed_at_unix_ms,
+                    &memory.cited_spans,
+                )?;
+                if created {
+                    self.ensure_entity_cues(event, &node)?;
+                }
+                node
+            }
+        } else {
+            let (node, created) = self.store.upsert_node_in_family(
+                scope,
+                memory.node_kind,
+                target.family_canonical_key(),
+                &memory.text,
+                event.observed_at_unix_ms,
+                &memory.cited_spans,
+            )?;
+            if created {
+                self.ensure_entity_cues(event, &node)?;
+            }
+            node
+        };
+        if updated {
+            if let Some(duplicate_successor_id) = duplicate_successor_id {
+                self.store.invalidate_node(
+                    &duplicate_successor_id,
+                    event.observed_at_unix_ms,
+                    event.id,
+                )?;
+            }
+            self.store.insert_edge(
+                scope,
+                &successor.id,
+                &target.id,
+                MemoryEdgeKind::Supersedes,
+                1.0,
+                event.observed_at_unix_ms,
+            )?;
+        }
+        Ok(updated)
     }
 
     fn link_projected_nodes(
@@ -1408,7 +1578,39 @@ mod tests {
     }
 
     #[test]
-    fn project_pending_rejects_target_only_provider_invalidation() -> MemoryResult<()> {
+    fn project_pending_ignores_advisory_provider_add_target() -> MemoryResult<()> {
+        let event = LedgerEvent::direct_memory_write(
+            "tenant",
+            "project",
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+        );
+        let raw = provider_memory_json(
+            &event,
+            BeliefRevisionOp::Add,
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            Some("provider-advisory-target"),
+        );
+        let engine = MemoryEngine::new(
+            SqliteMemoryStore::in_memory()?,
+            ProviderDistiller::new(FakeProvider {
+                raw: Ok(raw),
+                repaired: None,
+            }),
+        );
+        engine.ingest_event(&event)?;
+
+        let report = engine.project_pending(100)?;
+
+        assert_eq!(report.events_projected, 1);
+        assert_eq!(report.memories_added, 1);
+        assert_eq!(engine.store().stats()?.pending_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn project_pending_accepts_target_only_provider_invalidation() -> MemoryResult<()> {
         let event = LedgerEvent::direct_memory_write(
             "tenant",
             "project",
@@ -1439,16 +1641,17 @@ mod tests {
         );
         engine.ingest_event(&event)?;
 
-        let err = engine.project_pending(100).unwrap_err();
+        let report = engine.project_pending(100)?;
         let nodes = engine.store().all_nodes("tenant", "project", None)?;
         let fact = nodes
             .iter()
             .find(|node| node.text == "Use the old checkout token.")
-            .expect("fact still exists");
+            .expect("fact remains as closed history");
 
-        assert!(err.to_string().contains("targeted invalidation"));
-        assert_eq!(fact.valid_to_unix_ms, None);
-        assert_eq!(engine.store().stats()?.pending_events, 1);
+        assert_eq!(report.memories_invalidated, 1);
+        assert_eq!(report.memories_added, 0);
+        assert_eq!(fact.valid_to_unix_ms, Some(event.observed_at_unix_ms));
+        assert_eq!(engine.store().stats()?.pending_events, 0);
         Ok(())
     }
 
@@ -1727,6 +1930,361 @@ mod tests {
 
         assert!(!answer.contradictions.is_empty());
         assert!(!answer.stale_assumptions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_update_creates_temporal_successor_without_contradiction() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct UpdateCheckoutApi;
+
+        impl Distiller for UpdateCheckoutApi {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                let op = if neighbors.iter().any(|node| {
+                    node.kind == MemoryNodeKind::Fact && node.text.contains("old.example")
+                }) {
+                    BeliefRevisionOp::Update
+                } else {
+                    BeliefRevisionOp::Add
+                };
+                let target_node_id = (op == BeliefRevisionOp::Update)
+                    .then(|| {
+                        neighbors
+                            .iter()
+                            .find(|node| {
+                                node.kind == MemoryNodeKind::Fact
+                                    && node.text.contains("old.example")
+                            })
+                            .map(|node| node.id.clone())
+                    })
+                    .flatten();
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op,
+                    node_kind: MemoryNodeKind::Fact,
+                    text: event.text.clone(),
+                    target_node_id,
+                    cited_spans: vec![event.cited_span()],
+                }]))
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, UpdateCheckoutApi);
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Checkout API base URL is https://old.example.",
+            1_000,
+        ))?;
+        engine.manage_pending(100)?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Checkout API base URL changed from https://old.example to https://new.example.",
+            2_000,
+        ))?;
+
+        let report = engine.manage_pending(100)?;
+
+        assert_eq!(report.memories_updated, 1);
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let old = nodes
+            .iter()
+            .find(|node| node.text == "Checkout API base URL is https://old.example.")
+            .expect("old node should remain queryable historically");
+        let new = nodes
+            .iter()
+            .find(|node| node.text.contains("https://new.example"))
+            .expect("new node should be inserted");
+        assert_eq!(old.valid_to_unix_ms, Some(2_000));
+        assert_eq!(new.valid_to_unix_ms, None);
+        assert_eq!(new.family_canonical_key(), old.family_canonical_key());
+
+        let edges = engine.store().edges_for_scope("tenant", "project", None)?;
+        assert!(edges.iter().any(|edge| {
+            edge.kind == MemoryEdgeKind::Supersedes
+                && edge.from_node_id == new.id
+                && edge.to_node_id == old.id
+        }));
+        assert!(
+            !edges
+                .iter()
+                .any(|edge| edge.kind == MemoryEdgeKind::Contradicts)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn heuristic_update_does_not_supersede_unrelated_new_fact() -> MemoryResult<()> {
+        let engine = MemoryEngine::in_memory()?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Checkout uses DATABASE_URL.",
+            1_000,
+        ))?;
+        engine.manage_pending(100)?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "New billing service uses STRIPE_KEY.",
+            2_000,
+        ))?;
+        let report = engine.manage_pending(100)?;
+
+        assert_eq!(report.memories_invalidated, 0);
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let checkout = nodes
+            .iter()
+            .find(|node| node.text == "Checkout uses DATABASE_URL.")
+            .expect("checkout fact should still exist");
+        assert_eq!(checkout.valid_to_unix_ms, None);
+
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "checkout database_url",
+                MemoryScope::new("tenant", "project"),
+            )
+            .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        assert!(
+            answer
+                .evidence
+                .iter()
+                .any(|item| item.text.contains("DATABASE_URL"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_update_at_same_timestamp_creates_ordered_successor() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct UpdateCheckoutApi;
+
+        impl Distiller for UpdateCheckoutApi {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                let target_node_id = neighbors
+                    .iter()
+                    .find(|node| {
+                        node.kind == MemoryNodeKind::Fact
+                            && node.text == "Checkout API base URL is https://old.example."
+                    })
+                    .map(|node| node.id.clone());
+                let op = if target_node_id.is_some() {
+                    BeliefRevisionOp::Update
+                } else {
+                    BeliefRevisionOp::Add
+                };
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op,
+                    node_kind: MemoryNodeKind::Fact,
+                    text: event.text.clone(),
+                    target_node_id,
+                    cited_spans: vec![event.cited_span()],
+                }]))
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, UpdateCheckoutApi);
+        let mut first = event_at(
+            MemoryNodeKind::Fact,
+            "Checkout API base URL is https://old.example.",
+            1_000,
+        );
+        first.trace_id = "trace-1000-old".to_string();
+        first.span_id = "span-1000-old".to_string();
+        let mut second = event_at(
+            MemoryNodeKind::Fact,
+            "Checkout API base URL changed from https://old.example to https://new.example.",
+            1_000,
+        );
+        second.trace_id = "trace-1000-new".to_string();
+        second.span_id = "span-1000-new".to_string();
+
+        engine.ingest_event(&first)?;
+        engine.manage_pending(100)?;
+        engine.ingest_event(&second)?;
+        let report = engine.manage_pending(100)?;
+
+        assert_eq!(report.memories_updated, 1);
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let old = nodes
+            .iter()
+            .find(|node| node.text == "Checkout API base URL is https://old.example.")
+            .expect("old node should remain as closed history");
+        let new = nodes
+            .iter()
+            .find(|node| node.text.contains("https://new.example"))
+            .expect("new node should be inserted");
+        assert_ne!(old.id, new.id);
+        assert_eq!(old.valid_to_unix_ms, Some(1_000));
+        assert_eq!(new.valid_to_unix_ms, None);
+        assert_eq!(new.family_canonical_key(), old.family_canonical_key());
+        Ok(())
+    }
+
+    #[test]
+    fn late_arrival_update_closes_older_fact_incrementally() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct UpdateCheckoutApi;
+
+        impl Distiller for UpdateCheckoutApi {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                let target_node_id = (event.text.contains("new.example"))
+                    .then(|| {
+                        neighbors
+                            .iter()
+                            .find(|node| {
+                                node.kind == MemoryNodeKind::Fact
+                                    && node.text.contains("old.example")
+                            })
+                            .map(|node| node.id.clone())
+                    })
+                    .flatten();
+                let op = if target_node_id.is_some() {
+                    BeliefRevisionOp::Update
+                } else {
+                    BeliefRevisionOp::Add
+                };
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op,
+                    node_kind: MemoryNodeKind::Fact,
+                    text: event.text.clone(),
+                    target_node_id,
+                    cited_spans: vec![event.cited_span()],
+                }]))
+            }
+
+            fn supports_late_replay(&self) -> bool {
+                true
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, UpdateCheckoutApi);
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Checkout API base URL changed from https://old.example to https://new.example.",
+            2_000,
+        ))?;
+        engine.manage_pending(100)?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Checkout API base URL is https://old.example.",
+            1_000,
+        ))?;
+
+        let report = engine.manage_pending(100)?;
+
+        assert_eq!(report.memories_updated, 1);
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let old = nodes
+            .iter()
+            .find(|node| node.text == "Checkout API base URL is https://old.example.")
+            .expect("late old node should remain as closed history");
+        assert_eq!(old.valid_to_unix_ms, Some(2_000));
+        let active_new = nodes
+            .iter()
+            .filter(|node| {
+                node.text.contains("https://new.example") && node.is_active_at(Some(2_500))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(active_new.len(), 1);
+        assert_eq!(
+            active_new[0].family_canonical_key(),
+            old.family_canonical_key()
+        );
+
+        let answer = engine.query(
+            &MemoryQuery::new(
+                "checkout api base url",
+                MemoryScope::new("tenant", "project").as_of_unix_ms(2_500),
+            )
+            .with_modes(vec![MemoryMode::Semantic]),
+        )?;
+
+        assert!(
+            answer
+                .evidence
+                .iter()
+                .any(|item| item.text.contains("https://new.example"))
+        );
+        assert!(
+            !answer
+                .evidence
+                .iter()
+                .any(|item| item.text == "Checkout API base URL is https://old.example.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_only_invalidation_closes_memory_without_replacement() -> MemoryResult<()> {
+        #[derive(Clone)]
+        struct TargetOnlyInvalidation;
+
+        impl Distiller for TargetOnlyInvalidation {
+            fn distill(
+                &self,
+                event: &LedgerEvent,
+                neighbors: &[MemoryNode],
+            ) -> MemoryResult<DistillOutcome> {
+                let target_node_id = neighbors
+                    .iter()
+                    .find(|node| {
+                        node.kind == MemoryNodeKind::Fact && node.text.contains("legacy token")
+                    })
+                    .map(|node| node.id.clone());
+                let (op, text) = if target_node_id.is_some() {
+                    (BeliefRevisionOp::Invalidate, String::new())
+                } else {
+                    (BeliefRevisionOp::Add, event.text.clone())
+                };
+                Ok(DistillOutcome::accepted(vec![DistilledMemory {
+                    op,
+                    node_kind: MemoryNodeKind::Fact,
+                    text,
+                    target_node_id,
+                    cited_spans: vec![event.cited_span()],
+                }]))
+            }
+        }
+
+        let engine = MemoryEngine::new(SqliteMemoryStore::in_memory()?, TargetOnlyInvalidation);
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Use the legacy token for deploys.",
+            1_000,
+        ))?;
+        engine.manage_pending(100)?;
+        engine.ingest_event(&event_at(
+            MemoryNodeKind::Fact,
+            "Retire the legacy token.",
+            2_000,
+        ))?;
+
+        let report = engine.manage_pending(100)?;
+
+        assert_eq!(report.memories_invalidated, 1);
+        assert_eq!(report.memories_added, 0);
+        let nodes = engine.store().all_nodes("tenant", "project", None)?;
+        let old = nodes
+            .iter()
+            .find(|node| node.text.contains("legacy token"))
+            .expect("old node should remain available for stale assumptions");
+        assert_eq!(old.valid_to_unix_ms, Some(2_000));
+        assert!(
+            nodes
+                .iter()
+                .all(|node| !node.text.contains("Retire the legacy token"))
+        );
         Ok(())
     }
 
