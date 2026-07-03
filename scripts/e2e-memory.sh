@@ -117,6 +117,7 @@ json_assert "$TMP_DIR/init.json" 'assert data["ledger_events"] == 0'
   > "$TMP_DIR/remember-gotcha.json"
 json_assert "$TMP_DIR/remember-gotcha.json" 'assert data["events_projected"] == 1 and data["memories_added"] >= 2'
 json_assert "$TMP_DIR/remember-gotcha.json" 'assert data["distillation_outputs"] >= 2 and data["distillation_provider_calls"] == 0 and data["distillation_rejections"] == 0'
+json_assert "$TMP_DIR/remember-gotcha.json" 'assert data["source_token_estimate"] > 0 and data["projected_memory_token_estimate"] > 0 and data["stored_memories_touched"] >= data["memories_added"]'
 
 "$BIN" --db "$DB" remember \
   --tenant local \
@@ -299,8 +300,26 @@ json_assert "$TMP_DIR/http-audit.json" 'assert any(event["action"] == "maintenan
 
 api_get "/v1/stats" > "$TMP_DIR/http-stats.json"
 json_assert "$TMP_DIR/http-stats.json" 'assert data["ledger_events"] >= 5 and data["nodes"] > 0 and data["audit_events"] > 0'
+json_assert "$TMP_DIR/http-stats.json" 'assert data["total_node_tokens"] > 0 and data["active_node_tokens"] > 0 and data["active_fact_nodes"] >= 1'
 
 api_get "/v1/metrics/prometheus" > "$TMP_DIR/prometheus.txt"
 grep -q "beater_memory_http_requests_total" "$TMP_DIR/prometheus.txt"
+python3 - "$TMP_DIR/prometheus.txt" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    text = handle.read()
+
+def value(metric: str, labels: str) -> float:
+    match = re.search(rf'^{re.escape(metric)}\{{{re.escape(labels)}\}} ([0-9.]+)$', text, re.M)
+    if not match:
+        raise SystemExit(f"missing {metric}{{{labels}}}")
+    return float(match.group(1))
+
+assert value("beater_memory_query_tier_requests_total", 'tier="activation"') > 0
+assert value("beater_memory_query_tier_requests_total", 'tier="active_reconstruction"') > 0
+assert value("beater_memory_query_tier_tokens_total", 'tier="activation",token_kind="answer"') > 0
+PY
 
 echo "beater-memory e2e passed"

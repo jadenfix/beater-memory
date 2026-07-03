@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use axum::{
@@ -25,8 +26,8 @@ use crate::{
     MemoryEngine, ProjectReport,
     error::{MemoryError, MemoryResult},
     model::{
-        MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, ReconstructionMode,
-        ReconstructionOptions,
+        MemoryAnswer, MemoryMode, MemoryNodeKind, MemoryQuery, MemoryScope, MemoryTier,
+        ReconstructionMode, ReconstructionOptions, estimate_tokens,
     },
     store::{
         AuditEvent, AuditRecord, LedgerEvent, MaintenanceOptions, MaintenanceReport, StoreHealth,
@@ -233,6 +234,7 @@ pub struct AuditHttpResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ServiceMetricsSnapshot {
     pub started_at_unix_ms: i64,
     pub total_requests: u64,
@@ -253,6 +255,23 @@ pub struct ServiceMetricsSnapshot {
     pub maintenance_requests: u64,
     pub metrics_requests: u64,
     pub audit_requests: u64,
+    #[serde(default)]
+    pub query_cue_seed: QueryTierMetrics,
+    #[serde(default)]
+    pub query_activation: QueryTierMetrics,
+    #[serde(default)]
+    pub query_active_reconstruction: QueryTierMetrics,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct QueryTierMetrics {
+    pub requests: u64,
+    pub latency_ms_count: u64,
+    pub latency_ms_sum: u64,
+    pub answer_tokens: u64,
+    pub evidence_tokens: u64,
+    pub reconstruction_tokens: u64,
 }
 
 impl ServiceMetricsSnapshot {
@@ -277,6 +296,9 @@ impl ServiceMetricsSnapshot {
             maintenance_requests: 0,
             metrics_requests: 0,
             audit_requests: 0,
+            query_cue_seed: QueryTierMetrics::default(),
+            query_activation: QueryTierMetrics::default(),
+            query_active_reconstruction: QueryTierMetrics::default(),
         }
     }
 
@@ -295,6 +317,28 @@ impl ServiceMetricsSnapshot {
             "audit" => self.audit_requests += 1,
             _ => {}
         }
+    }
+
+    fn record_query_answer(&mut self, answer: &MemoryAnswer, latency_ms: u64) {
+        let metrics = match answer.tier_used {
+            MemoryTier::CueSeed => &mut self.query_cue_seed,
+            MemoryTier::Activation => &mut self.query_activation,
+            MemoryTier::ActiveReconstruction => &mut self.query_active_reconstruction,
+        };
+        metrics.requests += 1;
+        metrics.latency_ms_count += 1;
+        metrics.latency_ms_sum += latency_ms;
+        metrics.answer_tokens += u64::from(estimate_tokens(&answer.answer));
+        metrics.evidence_tokens += answer
+            .evidence
+            .iter()
+            .map(|item| u64::from(item.token_estimate))
+            .sum::<u64>();
+        metrics.reconstruction_tokens += answer
+            .reconstruction
+            .as_ref()
+            .map(|report| u64::from(report.tokens_spent))
+            .unwrap_or(0);
     }
 }
 
@@ -872,7 +916,12 @@ async fn query(
     let reconstruction_mode = query.reconstruction.mode.as_str();
     let max_reconstruction_steps = query.reconstruction.max_steps;
     let max_reconstruction_tokens = query.reconstruction.max_tokens;
+    let started = Instant::now();
     let result = run_db_task(state.clone(), move |engine| engine.query(&query)).await;
+    let elapsed_ms = elapsed_ms(started);
+    if let Ok(answer) = result.as_ref() {
+        record_query_answer(&state, answer, elapsed_ms);
+    }
     let audit_reconstruction = result
         .as_ref()
         .ok()
@@ -885,6 +934,10 @@ async fn query(
         "tenant_id": tenant_id,
         "project_id": project_id,
         "max_tokens": max_tokens,
+        "tier_used": result.as_ref().ok().map(|answer| tier_label(answer.tier_used)),
+        "token_estimate": result.as_ref().ok().map(|answer| answer.token_estimate),
+        "evidence_count": result.as_ref().ok().map(|answer| answer.evidence.len()),
+        "elapsed_ms": elapsed_ms,
         "routing": audit_routing,
         "reconstruction_mode": reconstruction_mode,
         "max_reconstruction_steps": max_reconstruction_steps,
@@ -1304,7 +1357,90 @@ fn render_prometheus_metrics(snapshot: &ServiceMetricsSnapshot, now_unix_ms: i64
         "timeout",
         snapshot.db_timeout_requests,
     );
+    output.push_str("# HELP beater_memory_query_tier_requests_total Successful query answers by retrieval tier.\n");
+    output.push_str("# TYPE beater_memory_query_tier_requests_total counter\n");
+    push_query_tier_prometheus_counter(
+        &mut output,
+        "beater_memory_query_tier_requests_total",
+        &snapshot.query_cue_seed,
+        "cue_seed",
+        |metrics| metrics.requests,
+    );
+    push_query_tier_prometheus_counter(
+        &mut output,
+        "beater_memory_query_tier_requests_total",
+        &snapshot.query_activation,
+        "activation",
+        |metrics| metrics.requests,
+    );
+    push_query_tier_prometheus_counter(
+        &mut output,
+        "beater_memory_query_tier_requests_total",
+        &snapshot.query_active_reconstruction,
+        "active_reconstruction",
+        |metrics| metrics.requests,
+    );
+    output.push_str("# HELP beater_memory_query_tier_latency_ms_total Total successful query latency in milliseconds by retrieval tier.\n");
+    output.push_str("# TYPE beater_memory_query_tier_latency_ms_total counter\n");
+    push_query_tier_prometheus_counter(
+        &mut output,
+        "beater_memory_query_tier_latency_ms_total",
+        &snapshot.query_cue_seed,
+        "cue_seed",
+        |metrics| metrics.latency_ms_sum,
+    );
+    push_query_tier_prometheus_counter(
+        &mut output,
+        "beater_memory_query_tier_latency_ms_total",
+        &snapshot.query_activation,
+        "activation",
+        |metrics| metrics.latency_ms_sum,
+    );
+    push_query_tier_prometheus_counter(
+        &mut output,
+        "beater_memory_query_tier_latency_ms_total",
+        &snapshot.query_active_reconstruction,
+        "active_reconstruction",
+        |metrics| metrics.latency_ms_sum,
+    );
+    output.push_str("# HELP beater_memory_query_tier_tokens_total Total answer, evidence, and reconstruction tokens by retrieval tier.\n");
+    output.push_str("# TYPE beater_memory_query_tier_tokens_total counter\n");
+    for (tier, metrics) in [
+        ("cue_seed", &snapshot.query_cue_seed),
+        ("activation", &snapshot.query_activation),
+        (
+            "active_reconstruction",
+            &snapshot.query_active_reconstruction,
+        ),
+    ] {
+        push_query_token_counter(&mut output, tier, "answer", metrics.answer_tokens);
+        push_query_token_counter(&mut output, tier, "evidence", metrics.evidence_tokens);
+        push_query_token_counter(
+            &mut output,
+            tier,
+            "reconstruction",
+            metrics.reconstruction_tokens,
+        );
+    }
     output
+}
+
+fn push_query_tier_prometheus_counter(
+    output: &mut String,
+    name: &str,
+    metrics: &QueryTierMetrics,
+    tier: &str,
+    value: impl Fn(&QueryTierMetrics) -> u64,
+) {
+    push_prometheus_counter(output, name, "tier", tier, value(metrics));
+}
+
+fn push_query_token_counter(output: &mut String, tier: &str, token_kind: &str, value: u64) {
+    output.push_str(&format!(
+        "beater_memory_query_tier_tokens_total{{tier=\"{}\",token_kind=\"{}\"}} {value}\n",
+        escape_prometheus_label(tier),
+        escape_prometheus_label(token_kind)
+    ));
 }
 
 fn push_prometheus_counter(
@@ -1384,6 +1520,26 @@ fn record_db_timeout(state: &MemoryServerState) {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .db_timeout_requests += 1;
+}
+
+fn record_query_answer(state: &MemoryServerState, answer: &MemoryAnswer, latency_ms: u64) {
+    state
+        .metrics
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .record_query_answer(answer, latency_ms);
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn tier_label(tier: MemoryTier) -> &'static str {
+    match tier {
+        MemoryTier::CueSeed => "cue_seed",
+        MemoryTier::Activation => "activation",
+        MemoryTier::ActiveReconstruction => "active_reconstruction",
+    }
 }
 
 fn health_is_ready(health: &StoreHealth) -> bool {
@@ -1964,6 +2120,10 @@ mod tests {
             query_event.detail["routing"]["routed_modes"],
             serde_json::json!(["procedural"])
         );
+        assert_eq!(query_event.detail["tier_used"], "activation");
+        assert!(query_event.detail["token_estimate"].as_u64().unwrap_or(0) > 0);
+        assert!(query_event.detail["evidence_count"].as_u64().unwrap_or(0) > 0);
+        assert!(query_event.detail["elapsed_ms"].as_u64().is_some());
     }
 
     #[tokio::test]
@@ -2073,6 +2233,17 @@ mod tests {
             .await
             .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(response.status(), StatusCode::OK);
+        let query = serde_json::json!({
+            "question": "public health route",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "modes": ["semantic"]
+        });
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .clone()
@@ -2086,8 +2257,13 @@ mod tests {
         let metrics: ServiceMetricsSnapshot =
             serde_json::from_slice(&body).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(metrics.remember_requests, 1);
+        assert_eq!(metrics.query_requests, 1);
         assert_eq!(metrics.metrics_requests, 1);
-        assert_eq!(metrics.successful_requests, 2);
+        assert_eq!(metrics.successful_requests, 3);
+        assert_eq!(metrics.query_activation.requests, 1);
+        assert_eq!(metrics.query_activation.latency_ms_count, 1);
+        assert!(metrics.query_activation.answer_tokens > 0);
+        assert!(metrics.query_activation.evidence_tokens > 0);
 
         let response = app
             .oneshot(get_request("/v1/audit?limit=10"))
@@ -2109,6 +2285,29 @@ mod tests {
     #[tokio::test]
     async fn prometheus_metrics_are_available_over_http() {
         let app = memory_router(test_config().with_bearer_token("secret"));
+        let remember = serde_json::json!({
+            "tenant_id": "tenant",
+            "project_id": "project",
+            "kind": "fact",
+            "text": "The public health route is /livez."
+        });
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/remember", remember))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let query = serde_json::json!({
+            "question": "public health route",
+            "scope": {"tenant_id": "tenant", "project_id": "project", "environment_id": null, "as_of_unix_ms": null},
+            "modes": ["semantic"]
+        });
+        let response = app
+            .clone()
+            .oneshot(json_request("/v1/query", query))
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .oneshot(get_request("/v1/metrics/prometheus"))
@@ -2128,11 +2327,15 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap_or_else(|err| panic!("{err}"));
 
         assert!(text.contains("# TYPE beater_memory_http_requests_total counter"));
-        assert!(text.contains("beater_memory_http_requests_total{category=\"all\"} 1"));
-        assert!(text.contains("beater_memory_http_requests_total{category=\"authorized\"} 1"));
-        assert!(text.contains("beater_memory_http_requests_total{category=\"successful\"} 1"));
+        assert!(text.contains("beater_memory_http_requests_total{category=\"all\"} 3"));
+        assert!(text.contains("beater_memory_http_requests_total{category=\"authorized\"} 3"));
+        assert!(text.contains("beater_memory_http_requests_total{category=\"successful\"} 3"));
         assert!(text.contains("beater_memory_http_route_requests_total{route=\"metrics\"} 1"));
         assert!(text.contains("beater_memory_db_requests_total{outcome=\"busy\"} 0"));
+        assert!(text.contains("beater_memory_query_tier_requests_total{tier=\"activation\"} 1"));
+        assert!(text.contains(
+            "beater_memory_query_tier_tokens_total{tier=\"activation\",token_kind=\"answer\"}"
+        ));
     }
 
     #[tokio::test]

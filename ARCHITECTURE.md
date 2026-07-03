@@ -100,8 +100,13 @@ edges are projections that can be rebuilt.
      their documented zero-value controls.
    - Controls: a fixed-window per-actor limiter protects `/v1/*`; in-memory
      JSON and Prometheus service metrics expose request totals, DB saturation,
-     and DB timeouts; durable audit rows record successes, failures, denied
-     auth, and throttled attempts.
+     DB timeouts, and query counts/latency/token totals by retrieval tier;
+     durable audit rows record successes, failures, denied auth, and throttled
+     attempts.
+   - Economics telemetry: projection reports include source-token estimates,
+     projected memory-token estimates, and distillation provider counters;
+     store stats expose total/active stored-memory tokens and active node counts
+     by kind.
    - Correlation: every HTTP response carries `x-request-id`; valid incoming
      request IDs are echoed and audit details include the same ID.
    - Writes: direct `remember` calls can carry an idempotency key so client

@@ -25,6 +25,9 @@ The current implementation includes:
 - provider-safe distillation boundary with strict JSON schema parsing,
   validation, bounded repair attempts, rejection metrics, and no provider calls
   inside projection write transactions
+- memory economics telemetry for projection source/stored-token estimates,
+  active stored-token totals, active node counts by kind, and query tier
+  latency/token counters
 - distiller output validation before graph projection writes
 - typed nodes and edges for facts, episodes, procedures, state, gotchas, and
   anti-memory
@@ -218,7 +221,8 @@ The public API exports:
   `GraphIntegrityReport`, `GraphRepairReport`, `AuditPruneReport`,
   `ProjectionResetReport`, `BackupReport`, `RestoreReport`, `AuditRecord`, and
   `AuditEvent`
-- `LiveResponse`, `ReadyResponse`, and `ServiceMetricsSnapshot`
+- `LiveResponse`, `ReadyResponse`, `ServiceMetricsSnapshot`, and
+  `QueryTierMetrics`
 - `LedgerEvent`
 - `Distiller`, `HeuristicDistiller`, `ProviderDistiller`,
   `DistillationProvider`, `DistillationPrompt`, `DistillationRepairPrompt`,
