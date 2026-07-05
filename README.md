@@ -502,3 +502,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 For each coherent feature slice: implement, self-review the diff, run focused
 tests plus the workspace checks, commit only intended files, open a PR, and
 merge only after local checks and GitHub CI are clean.
+
+## Ecosystem
+
+beater-memory is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: a local Rust app and library that turns any ledgered agent traces into typed temporal memory with provenance. Within the family it can connect for:
+
+- importing [beater.js](https://github.com/jadenfix/beater.js) journals (`.beater/journal.db`) and canonical span JSONL — this integration exists today
+- serving as the memory backend for agents running in beater.js or under [beaterOS](https://github.com/jadenfix/beaterOS), where its provenance model backs the kernel's memory-provenance requirement
