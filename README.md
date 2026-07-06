@@ -505,7 +505,8 @@ merge only after local checks and GitHub CI are clean.
 
 ## Ecosystem
 
-beater-memory is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: a local Rust app and library that turns any ledgered agent traces into typed temporal memory with provenance. Within the family it can connect for:
+beater-memory is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: a local Rust app and library that turns any ledgered agent traces into typed temporal memory with provenance. Within the family its shipped protocol boundary is:
 
 - importing [beater.js](https://github.com/jadenfix/beater.js) journals (`.beater/journal.db`) and canonical span JSONL — this integration exists today
-- serving as the memory backend for agents running in beater.js or under [beaterOS](https://github.com/jadenfix/beaterOS), where its provenance model backs the kernel's memory-provenance requirement
+
+It is designed to serve as a memory backend for agents running in beater.js or under [beaterOS](https://github.com/jadenfix/beaterOS) once a real consumer lands on both sides; that future connection stays over protocol/API boundaries, not shared internal crates.
