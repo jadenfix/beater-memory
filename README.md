@@ -128,19 +128,20 @@ cargo run -p beater-memory -- health --json
 Run the HTTP API:
 
 ```bash
-export BEATER_MEMORY_TOKEN='dev-secret'
+export REMI_TOKEN='dev-secret'
 cargo run -p beater-memory -- serve --bind 127.0.0.1:8765
 ```
 
 The server refuses to start without a bearer token unless `--allow-no-auth` is
-passed, trims configured bearer tokens, and rejects blank tokens. Public request
-limits for body size, projection batch size, query token budget, and audit page
-size must be greater than zero. It drains with Axum graceful shutdown on Ctrl-C
-and on SIGTERM for Unix process managers. All `/v1/*` routes require
-`Authorization: Bearer <token>`; `/livez` is the unauthenticated liveness
-endpoint, and `/readyz` is the unauthenticated readiness endpoint for DB-backed
-traffic. The service defaults to 600 authenticated requests per actor per
-minute; use
+passed. Auth is read in this order: `--token`, `--token-file`, then
+`REMI_TOKEN`. Configured bearer tokens are trimmed, and blank tokens are
+rejected. Public request limits for body size, projection batch size, query token
+budget, and audit page size must be greater than zero. It drains with Axum
+graceful shutdown on Ctrl-C and on SIGTERM for Unix process managers. All
+`/v1/*` routes require `Authorization: Bearer <token>`; `/livez` is the
+unauthenticated liveness endpoint, and `/readyz` is the unauthenticated readiness
+endpoint for DB-backed traffic. The service defaults to 600 authenticated
+requests per actor per minute; use
 `--max-requests-per-minute 0` to disable the fixed-window limiter for a trusted
 local deployment. Every response includes `x-request-id`; client-supplied valid
 request IDs are echoed, and generated IDs are written into durable audit detail.
@@ -234,7 +235,7 @@ cargo run -p beater-memory -- \
 The same flags work for `serve`:
 
 ```bash
-BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- \
+REMI_TOKEN=dev-secret cargo run -p beater-memory -- \
   --distiller provider-command \
   --distiller-command ./distill-provider \
   serve --bind 127.0.0.1:8765
@@ -307,7 +308,7 @@ cargo run -p beater-memory -- \
   --reconstruction-mode force \
   "incident alpha"
 
-BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- \
+REMI_TOKEN=dev-secret cargo run -p beater-memory -- \
   --reconstructor provider-command \
   --reconstructor-command ./reconstruct-provider \
   --reconstructor-timeout-ms 5000 \
@@ -401,31 +402,31 @@ applied to the remaining audit trail.
 HTTP equivalents:
 
 ```bash
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+curl -H "Authorization: Bearer $REMI_TOKEN" \
   http://127.0.0.1:8765/v1/health
 
 curl http://127.0.0.1:8765/readyz
 
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+curl -H "Authorization: Bearer $REMI_TOKEN" \
   http://127.0.0.1:8765/v1/metrics
 
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+curl -H "Authorization: Bearer $REMI_TOKEN" \
   http://127.0.0.1:8765/v1/metrics/prometheus
 
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+curl -H "Authorization: Bearer $REMI_TOKEN" \
   'http://127.0.0.1:8765/v1/audit?limit=50'
 
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+curl -H "Authorization: Bearer $REMI_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"repair_orphans":true,"retain_latest_audit_events":10000}' \
   http://127.0.0.1:8765/v1/maintenance
 
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+curl -H "Authorization: Bearer $REMI_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"local","project_id":"demo","kind":"gotcha","idempotency_key":"demo-checkout-db-gotcha","text":"Checkout fails when DATABASE_URL is missing."}' \
   http://127.0.0.1:8765/v1/remember
 
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" \
+curl -H "Authorization: Bearer $REMI_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"question":"checkout database failure","scope":{"tenant_id":"local","project_id":"demo","environment_id":null,"as_of_unix_ms":null,"known_at_unix_ms":null},"reconstruction_mode":"auto","max_reconstruction_steps":4,"max_reconstruction_tokens":2000}' \
   http://127.0.0.1:8765/v1/query

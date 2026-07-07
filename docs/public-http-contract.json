@@ -14,14 +14,15 @@
     "token_field": "token",
     "timeout_field": "timeout_ms",
     "output_modes": ["json", "text"],
-    "request_id_header": "x-request-id"
+    "request_id_header": "x-request-id",
+    "auth_precedence": ["flag", "token_file", "env"]
   },
   "auth": {
     "scheme": "bearer",
     "header": "Authorization",
     "format": "Bearer <token>",
-    "env": "BEATER_MEMORY_TOKEN",
-    "cli_flags": ["--bearer-token", "--bearer-token-env", "--allow-no-auth"],
+    "env": "REMI_TOKEN",
+    "cli_flags": ["--token", "--token-file", "--token-env", "--allow-no-auth"],
     "notes": [
       "The serve command refuses to start without auth unless --allow-no-auth is passed.",
       "All /v1 routes require Authorization: Bearer <token> when a token is configured.",

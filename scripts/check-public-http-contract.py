@@ -105,9 +105,10 @@ def main() -> int:
             violations.append(f"server missing public contract snippet: {snippet}")
 
     required_cli_snippets = [
-        "bearer_token",
-        "bearer_token_env",
-        "BEATER_MEMORY_TOKEN",
+        "token: Option<String>",
+        "token_file: Option<PathBuf>",
+        'default_value = "REMI_TOKEN"',
+        "read_to_string",
         "allow_no_auth",
         "refusing to start without auth",
     ]
@@ -121,6 +122,16 @@ def main() -> int:
     auth = manifest["auth"]
     if auth.get("scheme") != "bearer" or auth.get("format") != "Bearer <token>":
         violations.append("manifest auth must use Bearer token shape")
+    if auth.get("env") != "REMI_TOKEN":
+        violations.append("manifest auth env must be REMI_TOKEN")
+    expected_flags = ["--token", "--token-file", "--token-env", "--allow-no-auth"]
+    if auth.get("cli_flags") != expected_flags:
+        violations.append(f"manifest auth cli_flags must be {expected_flags}")
+    expected_precedence = ["flag", "token_file", "env"]
+    if manifest["client_shape"].get("auth_precedence") != expected_precedence:
+        violations.append(
+            f"manifest client auth_precedence must be {expected_precedence}"
+        )
     if manifest["client_shape"].get("token_field") != "token":
         violations.append("manifest client token field must be token")
     if manifest["sdk"].get("status") != "not_published":

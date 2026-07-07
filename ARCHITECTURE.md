@@ -115,7 +115,7 @@ edges are projections that can be rebuilt.
    - Authenticated endpoints: `/v1/health`, `/v1/stats`, `/v1/remember`,
      `/v1/manage`, `/v1/project`, `/v1/query`, `/v1/maintenance`, `/v1/metrics`,
      `/v1/metrics/prometheus`, `/v1/audit`
-   - Auth: bearer token from `--bearer-token` or `BEATER_MEMORY_TOKEN` by
+   - Auth: bearer token from `--token`, `--token-file`, or `REMI_TOKEN` by
      default; configured tokens are trimmed, blank tokens are rejected, and
      unauthenticated serving requires explicit `--allow-no-auth`
    - Limits: max request body bytes, max projection batch size, max query token
@@ -270,15 +270,15 @@ cargo run -p beater-memory -- maintenance --retain-audit-events 10000
 cargo run -p beater-memory -- rebuild-projection --yes-clear-projections
 cargo run -p beater-memory -- backup --path ./backups/memory.db
 cargo run -p beater-memory -- eval --suite ./memory-eval.json
-BEATER_MEMORY_TOKEN=dev-secret cargo run -p beater-memory -- serve
+REMI_TOKEN=dev-secret cargo run -p beater-memory -- serve
 curl http://127.0.0.1:8765/readyz
 ```
 
 Useful service reads:
 
 ```bash
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" http://127.0.0.1:8765/v1/metrics
-curl -H "Authorization: Bearer $BEATER_MEMORY_TOKEN" 'http://127.0.0.1:8765/v1/audit?limit=50'
+curl -H "Authorization: Bearer $REMI_TOKEN" http://127.0.0.1:8765/v1/metrics
+curl -H "Authorization: Bearer $REMI_TOKEN" 'http://127.0.0.1:8765/v1/audit?limit=50'
 ```
 
 Import sibling repo data:
