@@ -153,6 +153,12 @@ checks pass. Each DB-backed task also has a 30s wall-time budget by default;
 adjust it with `--db-task-timeout-ms`. Timed-out DB routes return
 `504 service_timeout` and increment `db_timeout_requests`.
 
+The committed public route/auth/client shape is
+[`docs/public-http-contract.json`](docs/public-http-contract.json). Keep it in
+sync with `crates/beater-memory/src/server.rs`, CLI serve auth flags, and the
+HTTP examples by running `python3 scripts/check-public-http-contract.py` before
+changing routes, auth, request IDs, error bodies, or future SDK/MCP projections.
+
 Import a `beater.js` journal:
 
 ```bash
@@ -468,6 +474,7 @@ Run checks:
 
 ```bash
 cargo fmt --all --check
+python3 scripts/check-public-http-contract.py
 cargo test
 scripts/e2e-memory.sh
 cargo clippy --workspace --all-targets -- -D warnings

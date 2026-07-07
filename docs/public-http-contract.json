@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "service": "remi",
+  "legacy_names": ["beater-memory"],
+  "default_base_url": "http://127.0.0.1:8765",
+  "contract_kind": "http-route-manifest",
+  "source_of_truth": {
+    "router": "crates/beater-memory/src/server.rs",
+    "cli": "crates/beater-memory/src/bin/beater-memory.rs",
+    "readme": "README.md"
+  },
+  "client_shape": {
+    "base_url_field": "base_url",
+    "token_field": "token",
+    "timeout_field": "timeout_ms",
+    "output_modes": ["json", "text"],
+    "request_id_header": "x-request-id"
+  },
+  "auth": {
+    "scheme": "bearer",
+    "header": "Authorization",
+    "format": "Bearer <token>",
+    "env": "BEATER_MEMORY_TOKEN",
+    "cli_flags": ["--bearer-token", "--bearer-token-env", "--allow-no-auth"],
+    "notes": [
+      "The serve command refuses to start without auth unless --allow-no-auth is passed.",
+      "All /v1 routes require Authorization: Bearer <token> when a token is configured.",
+      "/livez and /readyz are unauthenticated process/readiness probes."
+    ]
+  },
+  "error_shape": {
+    "content_type": "application/json",
+    "schema": "ErrorBody",
+    "fields": ["error.code", "error.message"],
+    "status_header_semantics": {
+      "401": "WWW-Authenticate: Bearer",
+      "429": "Retry-After",
+      "503": "Retry-After",
+      "504": "Retry-After"
+    },
+    "codes": [
+      "unauthorized",
+      "rate_limited",
+      "service_busy",
+      "service_timeout",
+      "bad_request",
+      "internal_error"
+    ]
+  },
+  "endpoints": [
+    {
+      "operation": "getLivez",
+      "method": "GET",
+      "path": "/livez",
+      "auth": "public",
+      "response_schema": "LiveResponse"
+    },
+    {
+      "operation": "getReadyz",
+      "method": "GET",
+      "path": "/readyz",
+      "auth": "public",
+      "response_schema": "ReadyResponse"
+    },
+    {
+      "operation": "getHealth",
+      "method": "GET",
+      "path": "/v1/health",
+      "auth": "bearer",
+      "response_schema": "StoreHealth"
+    },
+    {
+      "operation": "getStats",
+      "method": "GET",
+      "path": "/v1/stats",
+      "auth": "bearer",
+      "response_schema": "StoreStats"
+    },
+    {
+      "operation": "getMetrics",
+      "method": "GET",
+      "path": "/v1/metrics",
+      "auth": "bearer",
+      "response_schema": "ServiceMetricsSnapshot"
+    },
+    {
+      "operation": "getPrometheusMetrics",
+      "method": "GET",
+      "path": "/v1/metrics/prometheus",
+      "auth": "bearer",
+      "response_schema": "PrometheusText"
+    },
+    {
+      "operation": "listAuditEvents",
+      "method": "GET",
+      "path": "/v1/audit",
+      "auth": "bearer",
+      "query_schema": "AuditHttpQuery",
+      "response_schema": "AuditHttpResponse"
+    },
+    {
+      "operation": "remember",
+      "method": "POST",
+      "path": "/v1/remember",
+      "auth": "bearer",
+      "request_schema": "RememberHttpRequest",
+      "response_schema": "RememberHttpResponse",
+      "idempotency_field": "idempotency_key"
+    },
+    {
+      "operation": "manage",
+      "method": "POST",
+      "path": "/v1/manage",
+      "auth": "bearer",
+      "request_schema": "ProjectHttpRequest",
+      "response_schema": "ProjectReport"
+    },
+    {
+      "operation": "project",
+      "method": "POST",
+      "path": "/v1/project",
+      "auth": "bearer",
+      "request_schema": "ProjectHttpRequest",
+      "response_schema": "ProjectReport",
+      "alias_of": "manage"
+    },
+    {
+      "operation": "query",
+      "method": "POST",
+      "path": "/v1/query",
+      "auth": "bearer",
+      "request_schema": "QueryHttpRequest",
+      "response_schema": "MemoryAnswer"
+    },
+    {
+      "operation": "runMaintenance",
+      "method": "POST",
+      "path": "/v1/maintenance",
+      "auth": "bearer",
+      "request_schema": "MaintenanceHttpRequest",
+      "response_schema": "MaintenanceReport"
+    }
+  ],
+  "sdk": {
+    "status": "not_published",
+    "future_shared_core": {
+      "base_url": "base_url",
+      "auth": {"scheme": "bearer", "field": "token"},
+      "timeout": "timeout_ms",
+      "error": "ErrorBody",
+      "operations_from": "endpoints"
+    }
+  },
+  "mcp": {
+    "status": "not_exposed",
+    "projection_rule": "If remi exposes MCP later, tools/list should project from this manifest or its generated OpenAPI successor."
+  }
+}
