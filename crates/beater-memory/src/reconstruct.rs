@@ -4,7 +4,7 @@ use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
     env, fs,
     fs::{File, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -311,7 +311,11 @@ impl ReconstructionProvider for CommandReconstructionProvider {
 
         let deadline = Instant::now() + Duration::from_millis(self.config.timeout_ms);
         let writer = thread::spawn(move || -> MemoryResult<()> {
-            stdin.write_all(&input)?;
+            match stdin.write_all(&input) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::BrokenPipe => {}
+                Err(err) => return Err(err.into()),
+            }
             drop(stdin);
             Ok(())
         });

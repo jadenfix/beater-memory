@@ -75,7 +75,7 @@ start_server() {
       command+=("$@")
     fi
     command+=("serve" "--bind" "127.0.0.1:$PORT")
-    BEATER_MEMORY_TOKEN="$TOKEN" "${command[@]}" \
+    REMI_TOKEN="$TOKEN" "${command[@]}" \
       > "$TMP_DIR/server.log" 2>&1 &
     SERVER_PID="$!"
 

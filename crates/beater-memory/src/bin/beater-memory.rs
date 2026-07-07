@@ -156,10 +156,12 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: SocketAddr,
+        #[arg(long, alias = "bearer-token")]
+        token: Option<String>,
         #[arg(long)]
-        bearer_token: Option<String>,
-        #[arg(long, default_value = "BEATER_MEMORY_TOKEN")]
-        bearer_token_env: String,
+        token_file: Option<PathBuf>,
+        #[arg(long, alias = "bearer-token-env", default_value = "REMI_TOKEN")]
+        token_env: String,
         #[arg(long)]
         allow_no_auth: bool,
         #[arg(long, default_value_t = 1024 * 1024)]
@@ -641,8 +643,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve {
             bind,
-            bearer_token,
-            bearer_token_env,
+            token,
+            token_file,
+            token_env,
             allow_no_auth,
             max_body_bytes,
             max_project_limit,
@@ -652,13 +655,21 @@ async fn main() -> anyhow::Result<()> {
             max_concurrent_db_tasks,
             db_task_timeout_ms,
         } => {
-            let token = bearer_token
-                .or_else(|| std::env::var(&bearer_token_env).ok())
+            let token_from_file = match token_file {
+                Some(path) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("read token file {}", path.display()))?,
+                ),
+                None => None,
+            };
+            let token = token
+                .or(token_from_file)
+                .or_else(|| std::env::var(&token_env).ok())
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty());
             if token.is_none() && !allow_no_auth {
                 anyhow::bail!(
-                    "refusing to start without auth; set --bearer-token, set {bearer_token_env}, or pass --allow-no-auth"
+                    "refusing to start without auth; set --token, set --token-file, set {token_env}, or pass --allow-no-auth"
                 );
             }
             let mut config = MemoryServerConfig::new(&cli.db, bind)
